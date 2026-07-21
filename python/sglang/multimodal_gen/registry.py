@@ -92,8 +92,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+    CausalForcingWanT2V480PConfig,
     FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
+    RollingForcingWanT2V480PConfig,
     TurboWanI2V720Config,
     TurboWanT2V1_3B480PConfig,
     TurboWanT2V480PConfig,
@@ -158,7 +160,9 @@ from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
     StableDiffusion3SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.wan import (
+    CausalForcingT2VSamplingParams,
     FastWanT2V480PConfig,
+    RollingForcingT2VSamplingParams,
     Turbo_Wan2_2_I2V_A14B_SamplingParam,
     Wan2_1_Fun_1_3B_InP_SamplingParams,
     Wan2_2_I2V_A14B_SamplingParam,
@@ -809,6 +813,36 @@ def _register_configs():
         pipeline_config_cls=FastWan2_1_T2V_480P_Config,
         hf_model_paths=[
             "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
+        ],
+    )
+    # Causal Forcing (thu-ml/Causal-Forcing) — Wan2.1-T2V-1.3B causal DMD.
+    # Checkpoints are local dirs produced by tools/convert_forcing_to_diffusers.py;
+    # block size (chunk-wise vs frame-wise) comes from transformer/config.json.
+    # The registered paths' basenames match the conversion tool's recommended
+    # output names so longest-substring resolution wins over the base Wan repo.
+    register_configs(
+        sampling_param_cls=CausalForcingT2VSamplingParams,
+        pipeline_config_cls=CausalForcingWanT2V480PConfig,
+        hf_model_paths=[
+            "zhuhz22/CausalForcing-Wan2.1-T2V-1.3B-chunkwise-Diffusers",
+            "zhuhz22/CausalForcing-Wan2.1-T2V-1.3B-framewise-Diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: "causal-forcing" in hf_id.lower()
+            or "causalforcing" in hf_id.lower(),
+        ],
+    )
+    # Rolling Forcing (TencentARC/RollingForcing) — Wan2.1-T2V-1.3B streaming
+    # generator with rolling-window joint denoising and an attention sink.
+    register_configs(
+        sampling_param_cls=RollingForcingT2VSamplingParams,
+        pipeline_config_cls=RollingForcingWanT2V480PConfig,
+        hf_model_paths=[
+            "TencentARC/RollingForcing-Wan2.1-T2V-1.3B-Diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: "rolling-forcing" in hf_id.lower()
+            or "rollingforcing" in hf_id.lower(),
         ],
     )
     # MOVA

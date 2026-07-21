@@ -1156,6 +1156,11 @@ class CausalDMDDenoisingStage(DenoisingStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
+        # Report the DiT use-site so the residency manager onloads it when
+        # component CPU offload is active (the base DenoisingStage does this
+        # per-step via _select_and_manage_model, which we bypass).
+        if self._component_residency_manager is not None:
+            self._manage_dit_use_site(self.transformer, "transformer", batch)
         ctx = self._prepare_causal_dmd_forward_context(batch, server_args)
         target_dtype = ctx.target_dtype
         autocast_enabled = ctx.autocast_enabled
@@ -1165,6 +1170,12 @@ class CausalDMDDenoisingStage(DenoisingStage):
         image_kwargs = ctx.image_kwargs
         pos_cond_kwargs = ctx.pos_cond_kwargs
         latents = ctx.latents
+        if latents.is_inference() and not torch.is_inference_mode_enabled():
+            # With DiT CPU offload the executor runs this stage outside
+            # inference mode (offload hooks need tensor version counters), so
+            # the inference-mode latents from the prep stage cannot be updated
+            # in place below.
+            latents = latents.clone()
         prompt_embeds = ctx.prompt_embeds
         t, h, w = ctx.num_frames, ctx.height, ctx.width
 

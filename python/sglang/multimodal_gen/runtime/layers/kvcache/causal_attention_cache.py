@@ -513,6 +513,35 @@ class CausalSelfAttentionKVCache:
 
 
 @dataclass(slots=True)
+class RollingForcingSelfAttentionKVCache(CausalSelfAttentionKVCache):
+    """Causal KV cache with per-forward Rolling Forcing state.
+
+    Rolling Forcing (TencentARC/RollingForcing) caches only the first block of
+    each denoising window, pins the first-ever block as an un-RoPE'd attention
+    sink, and re-ropes it to a relative position at attention time. The write
+    layout is identical for every transformer layer of one DiT forward, so the
+    model computes it once and stashes it here (together with the anchor RoPE
+    table) for the per-layer attention modules to consume.
+
+    ``rolling_layout`` / ``rolling_anchor_freqs`` are set by
+    ``RollingForcingWanTransformer3DModel`` before each cached forward.
+    """
+
+    rolling_layout: object | None = None
+    rolling_block_tokens: int = 0
+    rolling_anchor_freqs: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def read_indices(self) -> tuple[int, int]:
+        """Public accessor for (global_end_index, local_end_index)."""
+        return self._read_indices()
+
+    def write_indices(self, *, global_end_index: int, local_end_index: int) -> None:
+        self._write_indices(
+            global_end_index=global_end_index, local_end_index=local_end_index
+        )
+
+
+@dataclass(slots=True)
 class CrossAttentionKVCache:
     """one transformer block's cross-attn condition K/V cache"""
 

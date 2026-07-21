@@ -285,3 +285,21 @@ class Turbo_Wan2_2_I2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
 @dataclass
 class SelfForcingWanT2V480PConfig(WanT2V_1_3B_SamplingParams):
     pass
+
+
+@dataclass
+class CausalForcingT2VSamplingParams(WanT2V_1_3B_SamplingParams):
+    """Causal Forcing — 4-step distilled causal generator, no CFG."""
+
+    num_inference_steps: int = 4
+    guidance_scale: float = 1.0
+    negative_prompt: str | None = None
+    num_frames: int = 81
+    fps: int = 16
+
+
+@dataclass
+class RollingForcingT2VSamplingParams(CausalForcingT2VSamplingParams):
+    """Rolling Forcing — 5-step rolling-window distilled generator, no CFG."""
+
+    num_inference_steps: int = 5

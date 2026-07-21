@@ -203,6 +203,10 @@ class CausalWanSelfAttention(nn.Module):
 
 
 class CausalWanTransformerBlock(nn.Module):
+    # Subclasses (e.g. Rolling Forcing) may swap the self-attention module while
+    # keeping the block structure.
+    _self_attn_cls: type[nn.Module] = CausalWanSelfAttention
+
     def __init__(
         self,
         dim: int,
@@ -274,7 +278,7 @@ class CausalWanTransformerBlock(nn.Module):
             self.local_num_heads = num_heads
             head_start = 0
         dim_head = dim // num_heads
-        self.attn1 = CausalWanSelfAttention(
+        self.attn1 = self._self_attn_cls(
             dim,
             self.local_num_heads,
             local_attn_size=local_attn_size,
@@ -330,6 +334,44 @@ class CausalWanTransformerBlock(nn.Module):
         self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+
+    def _cross_attn_with_cache(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        crossattn_cache: CrossAttentionKVCache | None,
+    ) -> torch.Tensor:
+        """Cross-attention where the text K/V is computed once per request and
+        reused from ``crossattn_cache`` on subsequent denoising steps."""
+        attn2 = self.attn2
+        q, _ = attn2.to_q(hidden_states)
+        if attn2.tp_rmsnorm:
+            q = tensor_parallel_rms_norm(q, attn2.norm_q)
+        else:
+            q = attn2.norm_q(q)
+        q = q.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
+
+        if crossattn_cache is not None and crossattn_cache.is_init:
+            k = crossattn_cache.k
+            v = crossattn_cache.v
+        else:
+            k, _ = attn2.to_k(encoder_hidden_states)
+            if attn2.tp_rmsnorm:
+                k = tensor_parallel_rms_norm(k, attn2.norm_k)
+            else:
+                k = attn2.norm_k(k)
+            k = k.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
+
+            v, _ = attn2.to_v(encoder_hidden_states)
+            v = v.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
+
+            if crossattn_cache is not None:
+                crossattn_cache.store(k, v)
+
+        out = attn2.attn(q, k, v)
+        out = out.flatten(2)
+        out, _ = attn2.to_out(out)
+        return out
 
     def forward(
         self,
@@ -416,12 +458,11 @@ class CausalWanTransformerBlock(nn.Module):
             orig_dtype
         ), hidden_states.to(orig_dtype)
 
-        # 2. Cross-attention
-        attn_output = self.attn2(
+        # 2. Cross-attention (text K/V cached across denoising steps)
+        attn_output = self._cross_attn_with_cache(
             norm_hidden_states,
-            context=encoder_hidden_states,
-            context_lens=None,
-            crossattn_cache=crossattn_cache,
+            encoder_hidden_states,
+            crossattn_cache,
         )
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
@@ -439,6 +480,9 @@ class CausalWanTransformerBlock(nn.Module):
 
 
 class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
+    # Subclasses (e.g. Rolling Forcing) may swap the transformer block class.
+    _block_cls: type[nn.Module] = CausalWanTransformerBlock
+
     _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
     _compile_conditions = WanVideoConfig()._compile_conditions
     _supported_attention_backends = WanVideoConfig()._supported_attention_backends
@@ -484,7 +528,7 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         # 3. Transformer blocks
         self.blocks = nn.ModuleList(
             [
-                CausalWanTransformerBlock(
+                self._block_cls(
                     inner_dim,
                     config.ffn_dim,
                     config.num_attention_heads,

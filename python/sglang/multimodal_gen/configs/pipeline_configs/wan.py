@@ -8,6 +8,9 @@ import torch
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
+from sglang.multimodal_gen.configs.models.dits.rolling_forcing_wanvideo import (
+    RollingForcingWanVideoConfig,
+)
 from sglang.multimodal_gen.configs.models.encoders import (
     BaseEncoderOutput,
     CLIPVisionConfig,
@@ -279,3 +282,35 @@ class SelfForcingWanT2V480PConfig(WanT2V480PConfig):
         default_factory=lambda: [1000, 750, 500, 250]
     )
     warp_denoising_step: bool = True
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # 1.3B realtime-oriented causal generator: keep the DiT resident when
+        # memory allows instead of the generic Wan layerwise-offload default.
+        return ModelDeploymentConfig(
+            keep_resident_components=("dit", "vae"),
+        )
+
+
+@dataclass
+class CausalForcingWanT2V480PConfig(SelfForcingWanT2V480PConfig):
+    """Causal Forcing (thu-ml/Causal-Forcing), chunk-wise and frame-wise.
+
+    Inference-identical to Self-Forcing (block-wise causal DMD, 4 warped
+    denoising steps, shift-5 flow matching, no CFG). The block size
+    (``num_frames_per_block``: 3 chunk-wise, 1 frame-wise) comes from the
+    converted checkpoint's ``transformer/config.json``.
+    """
+
+
+@dataclass
+class RollingForcingWanT2V480PConfig(SelfForcingWanT2V480PConfig):
+    """Rolling Forcing (TencentARC/RollingForcing).
+
+    Joint denoising over a rolling window of 5 blocks at staggered noise
+    levels, with an attention-sink KV cache for long-horizon streaming.
+    """
+
+    dmd_denoising_steps: list[int] | None = field(
+        default_factory=lambda: [1000, 800, 600, 400, 200]
+    )
+    dit_config: DiTConfig = field(default_factory=RollingForcingWanVideoConfig)
