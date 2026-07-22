@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from collections.abc import Callable
 from typing import Any, TypeVar, cast
 
 from sglang.multimodal_gen.runtime.realtime.session import (
@@ -21,8 +22,15 @@ class RealtimeCausalDiTState(BaseRealtimeState):
         self.chunk_indices: list[int] = [0]
         self.latents: Any = None
         self.scheduler: Any = None
+        # Run once when the session ends. Set by the denoising stage while the
+        # attention-map probe is on, so a session's chunks are written as one
+        # dump instead of one per request; ``None`` in normal serving.
+        self.on_dispose: Callable[[], None] | None = None
 
     def dispose(self) -> None:
+        if self.on_dispose is not None:
+            self.on_dispose()
+            self.on_dispose = None
         self.kv_cache = None
         self.crossattn_cache = None
         self.runtime_cache.clear()

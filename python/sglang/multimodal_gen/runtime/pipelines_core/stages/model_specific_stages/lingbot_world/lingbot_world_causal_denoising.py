@@ -670,10 +670,12 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         # Output denoised latents for decoder
         batch.latents = current_latents
         batch.raw_latent_shape = current_latents.shape
-        if not cache_ctx.persist_state:
-            # this stage runs once per chunk, so the probe can only be flushed
-            # when the causal state is being torn down — otherwise every chunk
-            # would land in its own run directory
+        # this stage runs once per chunk, so the probe is flushed when the causal
+        # state is torn down — otherwise every chunk would land in its own run
+        # directory. A realtime session tears down when the client disconnects.
+        if cache_ctx.persist_state:
+            self._defer_attention_map_flush(cache_ctx.cache_state, batch)
+        else:
             self._flush_attention_maps(batch)
             cache_ctx.cache_state.dispose()
         return batch

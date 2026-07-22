@@ -59,6 +59,9 @@ from sglang.multimodal_gen.runtime.platforms import (
 )
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+from sglang.multimodal_gen.runtime.utils.attention_map_probe import (
+    get_attention_map_recorder,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
@@ -347,6 +350,10 @@ class WanTransformerBlock(nn.Module):
         quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
+        # Set by the transformer after the block list is built; only read by the
+        # attention-map probe. Side networks that reuse this block (LongVie 2's
+        # control towers) leave it at -1 and are therefore never recorded.
+        self.layer_index = -1
 
         # 1. Self-attention
         self.norm1 = LayerNormScaleShift(
@@ -576,6 +583,16 @@ class WanTransformerBlock(nn.Module):
             query, key = _apply_rotary_emb(
                 query, cos, sin, is_neox_style=False
             ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+        recorder = get_attention_map_recorder()
+        if recorder is not None and self.layer_index >= 0:
+            # full attention: every key is a plain video token, so the visible
+            # range is the whole sequence starting at global token 0
+            recorder.record(
+                layer_index=self.layer_index,
+                query=query,
+                key=key,
+                key_segments=[(0, key.shape[1])],
+            )
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -924,6 +941,8 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 for i in range(config.num_layers)
             ]
         )
+        for layer_index, block in enumerate(self.blocks):
+            block.layer_index = layer_index
 
         # 4. Output norm & projection
         self.norm_out = LayerNormScaleShift(
@@ -1155,9 +1174,27 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
+            recorder = get_attention_map_recorder()
+            if recorder is not None and not sequence_shard_enabled:
+                # Attention is full and un-cached here, so the key layout is
+                # shared by every layer and every key is a plain video token.
+                # The probe's "chunk" axis is the *query* grouping, and a full
+                # attention pass has no blocks to mirror — group by latent frame
+                # so the dump is a frame-to-everything map. Grouping the whole
+                # pass into one row instead would average away the temporal
+                # structure entirely.
+                recorder.begin_forward(
+                    frame_seqlen=post_patch_height * post_patch_width,
+                    num_frames_per_block=1,
+                    query_token_start=0,
+                    grid_height=post_patch_height,
+                    grid_width=post_patch_width,
+                )
             hidden_states = self._run_transformer_blocks(
                 hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
             )
+            if recorder is not None:
+                recorder.end_forward()
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)

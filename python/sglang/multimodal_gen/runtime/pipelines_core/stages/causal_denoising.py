@@ -958,6 +958,15 @@ class CausalDMDDenoisingStage(DenoisingStage):
         )
         return current_latents
 
+    def _attention_map_meta(self, batch: Req) -> dict:
+        return {
+            "prompt": batch.prompt,
+            "seed": batch.seed,
+            "num_frames": batch.num_frames,
+            "num_frames_per_block": self.num_frames_per_block,
+            "num_token_per_frame": self.num_token_per_frame,
+        }
+
     def _flush_attention_maps(self, batch: Req) -> None:
         """Write the per-chunk attention maps of this request, if probing."""
         recorder = get_attention_map_recorder()
@@ -965,14 +974,23 @@ class CausalDMDDenoisingStage(DenoisingStage):
             return
         recorder.flush(
             model_tag=type(self.transformer).__name__,
-            meta={
-                "prompt": batch.prompt,
-                "seed": batch.seed,
-                "num_frames": batch.num_frames,
-                "num_frames_per_block": self.num_frames_per_block,
-                "num_token_per_frame": self.num_token_per_frame,
-            },
+            meta=self._attention_map_meta(batch),
         )
+
+    def _defer_attention_map_flush(
+        self, state: RealtimeCausalDiTState, batch: Req
+    ) -> None:
+        """Flush when the realtime session ends rather than after this chunk.
+
+        A realtime session generates one chunk per request, so flushing per
+        request would scatter a single video over one run directory per chunk.
+        """
+        recorder = get_attention_map_recorder()
+        if recorder is None:
+            return
+        model_tag = type(self.transformer).__name__
+        meta = self._attention_map_meta(batch)
+        state.on_dispose = lambda: recorder.flush(model_tag=model_tag, meta=meta)
 
     def _get_max_text_len(self, server_args: ServerArgs) -> int:
         return server_args.pipeline_config.text_encoder_configs[0].arch_config.text_len

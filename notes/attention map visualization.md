@@ -3,7 +3,10 @@
 Date: 2026-07-21
 Scope: visualize, per generated chunk and per transformer layer, how a
 block-causal Wan DiT distributes its self-attention over all chunks of the
-video. Companion to [`baseline integration.md`](baseline%20integration.md).
+video. Companion to [`baseline integration.md`](baseline%20integration.md);
+[`token attention maps.md`](token%20attention%20maps.md) renders the same probe's
+unreduced key axis at latent-token resolution and extends it to full-attention
+Wan DiTs.
 
 ## Why it needs runtime support
 

@@ -362,7 +362,12 @@ class ChunkAttentionRecorder:
         self.spatial_min_chunk = spatial_min_chunk
         self.token_scores = token_scores
         self.current_pass_kind = DENOISE_PASS
+        self.enabled = True
         self._scope: ForwardScope | None = None
+        # geometry of the last recorded forward, so the plotter can fold the
+        # token axis back into frames without knowing the model's layout
+        self._grid: tuple[int, int] | None = None
+        self._frames_per_block = 0
         self._events: list[ChunkAttentionEvent] = []
         self._step_counter: dict[tuple[str, int, int], int] = {}
         # [layers, heads, buckets, 2*grid_h-1, 2*grid_w-1], built on first record
@@ -387,6 +392,20 @@ class ChunkAttentionRecorder:
         finally:
             self.current_pass_kind = previous
 
+    @contextmanager
+    def recording_scope(self, enabled: bool):
+        """Gate the forwards run inside the block (e.g. the CFG negative branch).
+
+        Nested scopes only ever narrow, so an outer ``False`` (a warmup run)
+        cannot be re-enabled by an inner ``True`` (its conditional branch).
+        """
+        previous = self.enabled
+        self.enabled = previous and enabled
+        try:
+            yield
+        finally:
+            self.enabled = previous
+
     def begin_forward(
         self,
         *,
@@ -397,6 +416,9 @@ class ChunkAttentionRecorder:
         grid_height: int = 0,
         grid_width: int = 0,
     ) -> None:
+        if not self.enabled:
+            self._scope = None
+            return
         self._scope = ForwardScope(
             frame_seqlen=frame_seqlen,
             num_frames_per_block=num_frames_per_block,
@@ -405,6 +427,9 @@ class ChunkAttentionRecorder:
             grid_height=grid_height,
             grid_width=grid_width,
         )
+        self._frames_per_block = num_frames_per_block
+        if grid_height and grid_width:
+            self._grid = (grid_height, grid_width)
 
     def end_forward(self) -> None:
         self._scope = None
@@ -631,6 +656,10 @@ class ChunkAttentionRecorder:
         token_mass = self._token_mass
         token_counts = self._token_counts
         token_visible = self._token_visible
+        grid = self._grid
+        frames_per_block = self._frames_per_block
+        self._grid = None
+        self._frames_per_block = 0
         self._token_mass = None
         self._token_counts = None
         self._token_visible = None
@@ -704,6 +733,12 @@ class ChunkAttentionRecorder:
                 token_scores=scores.cpu().numpy().astype(np.float32),
             )
             spatial_meta["token_scores_layout"] = "[chunks, layers, heads, tokens]"
+        if grid is not None:
+            spatial_meta["grid_height"], spatial_meta["grid_width"] = grid
+        if frames_per_block:
+            # callers that know their own blocking (the causal stages) override
+            # this via `meta`, which is merged last
+            spatial_meta["num_frames_per_block"] = frames_per_block
 
         (run_dir / "meta.json").write_text(
             json.dumps(
@@ -769,3 +804,19 @@ def get_attention_map_recorder() -> ChunkAttentionRecorder | None:
         _recorder.spatial,
     )
     return _recorder
+
+
+@contextmanager
+def recording_scope(enabled: bool):
+    """Gate the probe over a block of forwards, whether or not it is enabled.
+
+    Used to keep warmup passes and the unconditional branch of classifier-free
+    guidance out of the dumps: both run the same DiT over the same geometry, so
+    recording them would only halve the probe's throughput.
+    """
+    recorder = get_attention_map_recorder()
+    if recorder is None:
+        yield
+        return
+    with recorder.recording_scope(enabled):
+        yield

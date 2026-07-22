@@ -105,6 +105,10 @@ from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import 
     RolloutDenoisingMixin,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.attention_map_probe import (
+    get_attention_map_recorder,
+    recording_scope,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -1239,6 +1243,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     ) -> None:
         """Finalize the shared loop by handing state to post-denoising processing."""
         self._log_cfg_gate_summary(ctx, batch)
+        self._flush_attention_maps(batch)
         self._post_denoising_loop(
             batch=batch,
             latents=ctx.latents,
@@ -1246,6 +1251,20 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             trajectory_timesteps=ctx.trajectory_timesteps,
             server_args=server_args,
             is_warmup=ctx.is_warmup,
+        )
+
+    def _flush_attention_maps(self, batch: Req) -> None:
+        """Write the attention maps of this request, if probing."""
+        recorder = get_attention_map_recorder()
+        if recorder is None:
+            return
+        recorder.flush(
+            model_tag=type(self.transformer).__name__,
+            meta={
+                "prompt": batch.prompt,
+                "seed": batch.seed,
+                "num_frames": batch.num_frames,
+            },
         )
 
     def _log_cfg_gate_summary(self, ctx: DenoisingContext, batch: Req) -> None:
@@ -1580,6 +1599,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 enabled=ctx.autocast_enabled,
             ),
             maybe_nvtx_range("denoising_loop", use_nvtx),
+            recording_scope(not ctx.is_warmup),
         ):
             with self.progress_bar(
                 total=ctx.num_inference_steps, batch=batch
@@ -1724,10 +1744,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         def predict_fn(branch):
             branch.configure_batch(batch)
-            with set_forward_context(
-                current_timestep=timestep_index,
-                attn_metadata=attn_metadata,
-                forward_batch=batch,
+            with (
+                recording_scope(branch.is_conditional),
+                set_forward_context(
+                    current_timestep=timestep_index,
+                    attn_metadata=attn_metadata,
+                    forward_batch=batch,
+                ),
             ):
                 raw = self._predict_noise(
                     current_model=current_model,
