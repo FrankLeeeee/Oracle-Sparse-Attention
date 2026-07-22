@@ -223,6 +223,12 @@ class Req:
     realtime_causal_sink_size: int | None = None
     realtime_causal_kv_cache_num_frames: int | None = None
     realtime_causal_kv_sample_tokens: int | None = None
+    # LongVie 2 dual-control signals, encoded to 36-channel latents by
+    # LongVie2ControlEncodingStage and consumed inside the transformer
+    longvie_dense_video: str | None = None
+    longvie_sparse_video: str | None = None
+    longvie_dense_latents: torch.Tensor | None = None
+    longvie_sparse_latents: torch.Tensor | None = None
     # return websocket-friendly raw RGB frame bytes instead of rwa tensors
     return_raw_frames: bool = False
 

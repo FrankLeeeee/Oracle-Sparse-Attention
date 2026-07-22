@@ -1155,10 +1155,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
-            for block in self.blocks:
-                hidden_states = block(
-                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
-                )
+            hidden_states = self._run_transformer_blocks(
+                hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+            )
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
@@ -1199,6 +1198,25 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
 
         return output
+
+    def _run_transformer_blocks(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep_proj: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        """Run the main block stack.
+
+        Split out so variants that interleave a side network with the blocks
+        (LongVie 2's dual-control branch) can override just this, instead of
+        duplicating the whole forward.
+        """
+        for block in self.blocks:
+            hidden_states = block(
+                hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+            )
+        return hidden_states
 
     def maybe_cache_states(
         self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor

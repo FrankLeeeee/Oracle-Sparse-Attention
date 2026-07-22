@@ -1038,6 +1038,24 @@ class SamplingParams:
             ),
         )
         add_argument(
+            "--longvie-dense-video",
+            type=str,
+            dest="longvie_dense_video",
+            help=(
+                "LongVie 2 dense control video (depth). Must be given together "
+                "with --longvie-sparse-video; ignored by other pipelines."
+            ),
+        )
+        add_argument(
+            "--longvie-sparse-video",
+            type=str,
+            dest="longvie_sparse_video",
+            help=(
+                "LongVie 2 sparse control video (point tracks). Must be given "
+                "together with --longvie-dense-video; ignored by other pipelines."
+            ),
+        )
+        add_argument(
             "--action-mode",
             type=str,
             dest="action_mode",
