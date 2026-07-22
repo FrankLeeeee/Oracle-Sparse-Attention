@@ -71,6 +71,7 @@ from sglang.multimodal_gen.runtime.models.dits.causal_wanvideo import (
     CausalWanSelfAttention,
     CausalWanTransformer3DModel,
     CausalWanTransformerBlock,
+    visible_key_segments,
 )
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanI2VCrossAttention,
@@ -92,6 +93,10 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.realtime.states import (
     get_realtime_causal_dit_state,
+)
+from sglang.multimodal_gen.runtime.utils.attention_map_probe import (
+    get_attention_map_recorder,
+    warn_unsupported_once,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
@@ -313,6 +318,21 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             ),
             debug_name="LingBot KV cache",
         )
+        recorder = get_attention_map_recorder()
+        if recorder is not None and not sequence_shard_enabled:
+            key_segments = visible_key_segments(kv_cache, cache_view)
+            if key_segments is None:
+                warn_unsupported_once(
+                    "pinned / global-sink KV cache views are not mapped to chunks"
+                )
+            else:
+                recorder.record(
+                    layer_index=self.layer_index,
+                    query=roped_query,
+                    key=cache_view.k,
+                    key_segments=key_segments,
+                )
+
         if update_cache_only:
             return v
         attn_impl = self.ulysses_attn if sequence_shard_enabled else self.attn
@@ -1187,6 +1207,10 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 for i in range(config.num_layers)
             ]
         )
+        # these blocks replace the ones the base __init__ built and tagged, so
+        # re-tag them or every layer would report the default -1 to the probe
+        for layer_index, block in enumerate(self.blocks):
+            block.attn1.layer_index = layer_index
 
     def post_load_weights(self) -> None:
         super().post_load_weights()
@@ -1582,6 +1606,17 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             c2ws_plucker_emb, forward_batch
         )
 
+        recorder = get_attention_map_recorder()
+        if recorder is not None and kv_cache is not None:
+            # The visible key layout is shared by every layer of this forward.
+            recorder.begin_forward(
+                frame_seqlen=post_patch_height * post_patch_width,
+                num_frames_per_block=self.num_frame_per_block,
+                query_token_start=current_start,
+                grid_height=post_patch_height,
+                grid_width=post_patch_width,
+            )
+
         for block_index, block in enumerate(self.blocks):
             hidden_states = block(
                 hidden_states,
@@ -1602,6 +1637,9 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 update_cache_only=skip_final_projection
                 and block_index == len(self.blocks) - 1,
             )
+
+        if recorder is not None:
+            recorder.end_forward()
 
         if skip_final_projection:
             return hidden_states

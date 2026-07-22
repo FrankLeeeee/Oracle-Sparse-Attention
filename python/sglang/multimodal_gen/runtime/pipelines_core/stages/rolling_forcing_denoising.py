@@ -351,5 +351,6 @@ class RollingForcingDenoisingStage(CausalDMDDenoisingStage):
                 if progress_bar is not None:
                     progress_bar.update()
 
+        self._flush_attention_maps(batch)
         batch.latents = output
         return batch

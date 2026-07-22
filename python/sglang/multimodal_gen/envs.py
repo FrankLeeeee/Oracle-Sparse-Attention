@@ -24,6 +24,11 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_LOGGING_PREFIX: str = ""
     SGLANG_DIFFUSION_LOGGING_CONFIG_PATH: str | None = None
     SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
+    SGLANG_DIFFUSION_ATTENTION_MAP_DIR: str | None = None
+    SGLANG_DIFFUSION_ATTENTION_MAP_QUERY_STRIDE: int = 8
+    SGLANG_DIFFUSION_ATTENTION_MAP_SPATIAL: bool = False
+    SGLANG_DIFFUSION_ATTENTION_MAP_SPATIAL_QUERY_STRIDE: int = 32
+    SGLANG_DIFFUSION_ATTENTION_MAP_TOKEN_SCORES: bool = False
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
@@ -252,6 +257,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # traces are saved. Note that it must be an absolute path.
     "SGLANG_DIFFUSION_TORCH_PROFILER_DIR": _lazy_path(
         "SGLANG_DIFFUSION_TORCH_PROFILER_DIR"
+    ),
+    # Enables the per-chunk attention-map probe for block-causal video DiTs
+    # (Causal Forcing / Rolling Forcing) if set. Path to the directory where the
+    # per-chunk attention dumps are written.
+    "SGLANG_DIFFUSION_ATTENTION_MAP_DIR": _lazy_path(
+        "SGLANG_DIFFUSION_ATTENTION_MAP_DIR"
+    ),
+    # Query subsampling stride of the attention-map probe. Higher is cheaper and
+    # noisier; the probe recomputes softmax(q k^T) for every stride-th query.
+    "SGLANG_DIFFUSION_ATTENTION_MAP_QUERY_STRIDE": _lazy_int(
+        "SGLANG_DIFFUSION_ATTENTION_MAP_QUERY_STRIDE", 8
+    ),
+    # Also accumulate attention mass by spatial displacement (dy, dx) per head
+    # and temporal offset, written as `spatial_displacement.npz`. Costs an extra
+    # softmax pass per layer, so it has its own coarser query stride below.
+    "SGLANG_DIFFUSION_ATTENTION_MAP_SPATIAL": _lazy_bool(
+        "SGLANG_DIFFUSION_ATTENTION_MAP_SPATIAL"
+    ),
+    "SGLANG_DIFFUSION_ATTENTION_MAP_SPATIAL_QUERY_STRIDE": _lazy_int(
+        "SGLANG_DIFFUSION_ATTENTION_MAP_SPATIAL_QUERY_STRIDE", 32
+    ),
+    # Dump the full per-key-token attention scores (no reduction over the key
+    # axis) as `token_scores.npz`. Large: [chunks, layers, heads, tokens].
+    "SGLANG_DIFFUSION_ATTENTION_MAP_TOKEN_SCORES": _lazy_bool(
+        "SGLANG_DIFFUSION_ATTENTION_MAP_TOKEN_SCORES"
     ),
     # If set, sgl_diffusion will run in development mode, which will enable
     # some additional endpoints for developing and debugging,

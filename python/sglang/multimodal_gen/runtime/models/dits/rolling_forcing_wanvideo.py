@@ -21,6 +21,8 @@ so the model computes it once (:func:`compute_rolling_cache_layout`) and
 stashes it on each layer's :class:`RollingForcingSelfAttentionKVCache`.
 """
 
+from contextlib import nullcontext
+
 import msgspec
 import torch
 import torch.nn as nn
@@ -40,6 +42,10 @@ from sglang.multimodal_gen.runtime.models.dits.causal_wanvideo import (
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
+)
+from sglang.multimodal_gen.runtime.utils.attention_map_probe import (
+    CACHE_UPDATE_PASS,
+    get_attention_map_recorder,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -137,6 +143,58 @@ def compute_rolling_cache_layout(
     )
 
 
+def _cache_range_segments(
+    local_start: int,
+    local_end: int,
+    *,
+    sink_tokens: int,
+    window_start: int,
+) -> tuple[tuple[int, int], ...]:
+    """Map a cache-buffer range to global ``(token_start, length)`` ranges.
+
+    The sink slots ``[0, sink_tokens)`` always hold the first block of the video;
+    everything after them rolls, so slot ``i`` holds global token
+    ``window_start + i``.
+    """
+    segments = []
+    if local_start < sink_tokens:
+        segments.append((local_start, min(local_end, sink_tokens) - local_start))
+    if local_end > sink_tokens:
+        start = max(local_start, sink_tokens)
+        segments.append((window_start + start, local_end - start))
+    return tuple(segments)
+
+
+def visible_key_segments(
+    layout: RollingCacheLayout,
+    *,
+    sink_tokens: int,
+    block_tokens: int,
+    current_start: int,
+    num_query_tokens: int,
+) -> tuple[tuple[int, int], ...]:
+    """Global ``(token_start, length)`` ranges of the keys one attention call sees.
+
+    Mirrors the key assembly in :meth:`RollingForcingWanSelfAttention.forward`
+    (only the per-chunk attention-map probe consumes this).
+    """
+    if layout.local_start_index == 0:
+        # Ramp-up: everything visible is the window's own freshly computed keys.
+        return ((current_start, num_query_tokens),)
+
+    window_start = layout.global_end_after - layout.local_end_after
+    working = _cache_range_segments(
+        layout.working_start,
+        layout.working_end,
+        sink_tokens=sink_tokens,
+        window_start=window_start,
+    )
+    if layout.updating_cache:
+        return working
+    # Denoising pass: re-roped sink, working cache, then the window's own keys.
+    return ((0, block_tokens),) + working + ((current_start, num_query_tokens),)
+
+
 class RollingForcingWanSelfAttention(nn.Module):
     """Self-attention with the Rolling Forcing cache protocol.
 
@@ -163,6 +221,9 @@ class RollingForcingWanSelfAttention(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = head_dim
+        # Set by the transformer after the block list is built; only read by the
+        # per-chunk attention-map probe.
+        self.layer_index = -1
         self.attn = LocalAttention(
             num_heads=num_heads,
             head_size=head_dim,
@@ -249,24 +310,49 @@ class RollingForcingWanSelfAttention(nn.Module):
         )
         self._write_first_block(kv_cache, layout, key=k, roped_key=roped_key, value=v)
 
+        block_tokens = kv_cache.rolling_block_tokens
+        recorder = get_attention_map_recorder()
+        key_segments = (
+            visible_key_segments(
+                layout,
+                sink_tokens=kv_cache.sink_tokens,
+                block_tokens=block_tokens,
+                current_start=current_start,
+                num_query_tokens=q.shape[1],
+            )
+            if recorder is not None
+            else ()
+        )
+
+        def record(key: torch.Tensor) -> None:
+            if recorder is not None:
+                recorder.record(
+                    layer_index=self.layer_index,
+                    query=roped_query,
+                    key=key,
+                    key_segments=key_segments,
+                )
+
         if layout.local_start_index == 0:
             # Ramp-up windows: everything visible is inside the current window.
+            record(roped_key)
             return self.attn(roped_query, roped_key, v)
 
         working = slice(layout.working_start, layout.working_end)
-        block_tokens = kv_cache.rolling_block_tokens
         if layout.updating_cache:
             working_k = kv_cache.k[:, working]
             working_v = kv_cache.v[:, working]
             if layout.anchor_start_frame >= 0:
                 working_k = working_k.clone()
                 working_k[:, :block_tokens] = self._rerope_anchor(kv_cache, v)
+            record(working_k)
             return self.attn(roped_query, working_k, working_v)
 
         anchor_k = self._rerope_anchor(kv_cache, v)
         anchor_v = kv_cache.v[:, :block_tokens]
         input_k = torch.cat([anchor_k, kv_cache.k[:, working], roped_key], dim=1)
         input_v = torch.cat([anchor_v, kv_cache.v[:, working], v], dim=1)
+        record(input_k)
         return self.attn(roped_query, input_k, input_v)
 
 
@@ -370,17 +456,24 @@ class RollingForcingWanTransformer3DModel(CausalWanTransformer3DModel):
                 current_start,
                 updating_cache,
             )
-        return super().forward(
-            hidden_states,
-            encoder_hidden_states,
-            timestep,
-            encoder_hidden_states_image=encoder_hidden_states_image,
-            kv_cache=kv_cache,
-            crossattn_cache=crossattn_cache,
-            current_start=current_start,
-            cache_start=cache_start,
-            start_frame=start_frame,
+        recorder = get_attention_map_recorder()
+        pass_scope = (
+            recorder.pass_kind_scope(CACHE_UPDATE_PASS)
+            if recorder is not None and updating_cache
+            else nullcontext()
         )
+        with pass_scope:
+            return super().forward(
+                hidden_states,
+                encoder_hidden_states,
+                timestep,
+                encoder_hidden_states_image=encoder_hidden_states_image,
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start=current_start,
+                cache_start=cache_start,
+                start_frame=start_frame,
+            )
 
 
 EntryClass = RollingForcingWanTransformer3DModel

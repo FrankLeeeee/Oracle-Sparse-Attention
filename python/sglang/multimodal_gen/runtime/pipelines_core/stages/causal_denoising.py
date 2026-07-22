@@ -34,6 +34,10 @@ from sglang.multimodal_gen.runtime.realtime.states import (
     get_realtime_causal_dit_state,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.attention_map_probe import (
+    CACHE_UPDATE_PASS,
+    get_attention_map_recorder,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled as precision_autocast_enabled,
@@ -838,22 +842,29 @@ class CausalDMDDenoisingStage(DenoisingStage):
             device=context_input.device,
             dtype=torch.long,
         )
-        self._forward_causal_transformer(
-            batch,
-            latent_model_input=context_input.to(target_dtype),
-            prompt_embeds=prompt_embeds,
-            timestep=timestep,
-            kv_cache=kv_cache,
-            crossattn_cache=crossattn_cache,
-            current_start_tokens=current_start_tokens,
-            start_frame=start_frame,
-            image_kwargs=image_kwargs,
-            pos_cond_kwargs=pos_cond_kwargs,
-            current_timestep=0,
-            attn_metadata=attn_metadata,
-            target_dtype=target_dtype,
-            autocast_enabled=autocast_enabled,
+        recorder = get_attention_map_recorder()
+        pass_scope = (
+            recorder.pass_kind_scope(CACHE_UPDATE_PASS)
+            if recorder is not None
+            else nullcontext()
         )
+        with pass_scope:
+            self._forward_causal_transformer(
+                batch,
+                latent_model_input=context_input.to(target_dtype),
+                prompt_embeds=prompt_embeds,
+                timestep=timestep,
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start_tokens=current_start_tokens,
+                start_frame=start_frame,
+                image_kwargs=image_kwargs,
+                pos_cond_kwargs=pos_cond_kwargs,
+                current_timestep=0,
+                attn_metadata=attn_metadata,
+                target_dtype=target_dtype,
+                autocast_enabled=autocast_enabled,
+            )
 
     def _warm_up_causal_context_cache(
         self,
@@ -946,6 +957,22 @@ class CausalDMDDenoisingStage(DenoisingStage):
             autocast_enabled=autocast_enabled,
         )
         return current_latents
+
+    def _flush_attention_maps(self, batch: Req) -> None:
+        """Write the per-chunk attention maps of this request, if probing."""
+        recorder = get_attention_map_recorder()
+        if recorder is None:
+            return
+        recorder.flush(
+            model_tag=type(self.transformer).__name__,
+            meta={
+                "prompt": batch.prompt,
+                "seed": batch.seed,
+                "num_frames": batch.num_frames,
+                "num_frames_per_block": self.num_frames_per_block,
+                "num_token_per_frame": self.num_token_per_frame,
+            },
+        )
 
     def _get_max_text_len(self, server_args: ServerArgs) -> int:
         return server_args.pipeline_config.text_encoder_configs[0].arch_config.text_len
@@ -1324,6 +1351,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
 
                 start_index += current_num_frames
 
+        self._flush_attention_maps(batch)
         batch.latents = latents
         return batch
 

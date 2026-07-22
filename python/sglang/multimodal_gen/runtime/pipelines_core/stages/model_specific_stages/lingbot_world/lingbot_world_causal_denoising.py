@@ -671,5 +671,9 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         batch.latents = current_latents
         batch.raw_latent_shape = current_latents.shape
         if not cache_ctx.persist_state:
+            # this stage runs once per chunk, so the probe can only be flushed
+            # when the causal state is being torn down — otherwise every chunk
+            # would land in its own run directory
+            self._flush_attention_maps(batch)
             cache_ctx.cache_state.dispose()
         return batch
