@@ -37,6 +37,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     HunyuanConfig,
     LingBotWorldCausalDMDConfig,
     LingBotWorldV2CausalDMDConfig,
+    LongVie2Config,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -162,6 +163,7 @@ from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
 from sglang.multimodal_gen.configs.sample.wan import (
     CausalForcingT2VSamplingParams,
     FastWanT2V480PConfig,
+    LongVie2SamplingParams,
     RollingForcingT2VSamplingParams,
     Turbo_Wan2_2_I2V_A14B_SamplingParam,
     Wan2_1_Fun_1_3B_InP_SamplingParams,
@@ -734,6 +736,14 @@ def _register_configs():
             "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
         ],
         model_detectors=[lambda hf_id: "wanimagetovideo" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=LongVie2SamplingParams,
+        pipeline_config_cls=LongVie2Config,
+        hf_model_paths=[
+            "Vchitect/LongVie2",
+        ],
+        model_detectors=[lambda hf_id: "longvie" in hf_id.lower()],
     )
     register_configs(
         sampling_param_cls=WanI2V_14B_720P_SamplingParam,

@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
+from typing import Any
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
@@ -135,6 +136,23 @@ class WanI2V_14B_480P_SamplingParam(WanT2V_1_3B_SamplingParams):
             end_skipping=1.0,
         )
     )
+
+
+@dataclass
+class LongVie2SamplingParams(WanI2V_14B_480P_SamplingParam):
+    """LongVie 2 — Wan I2V 480P plus the dual-control (depth + track) signals.
+
+    Both control videos must be supplied together; with neither, the pipeline
+    degrades to plain Wan I2V.
+    """
+
+    longvie_dense_video: str | None = None
+    longvie_sparse_video: str | None = None
+
+    def apply_request_extra(self, req: Any) -> None:
+        super().apply_request_extra(req)
+        req.longvie_dense_video = self.longvie_dense_video
+        req.longvie_sparse_video = self.longvie_sparse_video
 
 
 @dataclass

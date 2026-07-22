@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.distributed import (
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
+    CausalAttentionKVView,
     CausalSelfAttentionKVCache,
     CrossAttentionKVCache,
 )
@@ -68,10 +69,54 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.attention_map_probe import (
+    get_attention_map_recorder,
+    warn_unsupported_once,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
+
+
+def visible_key_segments(
+    kv_cache: CausalSelfAttentionKVCache,
+    view: CausalAttentionKVView,
+) -> tuple[tuple[int, int], ...] | None:
+    """Global ``(token_start, length)`` ranges of the keys visible to a chunk.
+
+    The plain sliding-window cache returns the trailing tokens ending at the
+    current chunk, so its keys are one contiguous global range.
+
+    With ``sink_tokens`` the buffer is *locally* contiguous but *globally*
+    disjoint: local ``[0, sink)`` pins the first tokens of the video and is
+    never evicted or rolled, while everything after it slides, so it maps to
+    global positions shifted by however much has been evicted::
+
+        local:  [ 0 .. sink )[ sink .......... local_end )
+        global: [ 0 .. sink )[ sink+shift .. local_end+shift )
+
+    Both pieces are returned, in key order. ``global_sink_tokens`` and the
+    pinned-sink view interleave a third slice whose global position depends on
+    write history the view does not carry, so those still return ``None`` (only
+    the per-chunk attention-map probe consumes this).
+    """
+    if kv_cache.global_sink_tokens != 0 or kv_cache.pinned_len > 0:
+        return None
+    num_keys = view.k.shape[1]
+    local_end = view.visible_local_end
+    local_start = local_end - num_keys
+    # global == local + shift for every token past the sink
+    shift = view.visible_global_end - local_end
+    sink = min(kv_cache.sink_tokens, local_end)
+    if local_start >= sink:
+        return ((local_start + shift, num_keys),)
+    if local_end <= sink:
+        return ((local_start, num_keys),)
+    return (
+        (local_start, sink - local_start),
+        (sink + shift, local_end - sink),
+    )
 
 
 class CausalWanSelfAttention(nn.Module):
@@ -100,6 +145,9 @@ class CausalWanSelfAttention(nn.Module):
         self.qk_norm = qk_norm
         self.eps = eps
         self.parallel_attention = parallel_attention
+        # Set by the transformer after the block list is built; only read by the
+        # per-chunk attention-map probe.
+        self.layer_index = -1
 
         # Scaled dot product attention
         self.attn = LocalAttention(
@@ -183,7 +231,15 @@ class CausalWanSelfAttention(nn.Module):
                 block_mask=block_mask,
             )[:, :, :-padded_length].transpose(2, 1)
         else:
+            recorder = get_attention_map_recorder()
             if kv_cache.can_direct_current_attention(roped_key.shape[1]):
+                if recorder is not None:
+                    recorder.record(
+                        layer_index=self.layer_index,
+                        query=roped_query,
+                        key=roped_key,
+                        key_segments=((current_start, roped_key.shape[1]),),
+                    )
                 return self.attn(roped_query, roped_key, v)
 
             cache_view = kv_cache.update_and_get_attention_kv(
@@ -193,6 +249,19 @@ class CausalWanSelfAttention(nn.Module):
                 cache_head_start=self.head_start,
                 debug_name="CausalWan KV cache",
             )
+            if recorder is not None:
+                key_segments = visible_key_segments(kv_cache, cache_view)
+                if key_segments is None:
+                    warn_unsupported_once(
+                        "attention-sink KV cache views are not mapped to chunks"
+                    )
+                else:
+                    recorder.record(
+                        layer_index=self.layer_index,
+                        query=roped_query,
+                        key=cache_view.k,
+                        key_segments=key_segments,
+                    )
             x = self.attn(
                 roped_query,
                 cache_view.k,
@@ -545,6 +614,8 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 for i in range(config.num_layers)
             ]
         )
+        for layer_index, block in enumerate(self.blocks):
+            block.attn1.layer_index = layer_index
 
         # 4. Output norm & projection
         self.norm_out = LayerNormScaleShift(
@@ -739,6 +810,17 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         assert encoder_hidden_states.dtype == orig_dtype
 
+        recorder = get_attention_map_recorder()
+        if recorder is not None and kv_cache is not None:
+            # The visible key layout is shared by every layer of this forward.
+            recorder.begin_forward(
+                frame_seqlen=post_patch_height * post_patch_width,
+                num_frames_per_block=self.num_frame_per_block,
+                query_token_start=current_start,
+                grid_height=post_patch_height,
+                grid_width=post_patch_width,
+            )
+
         # 4. Transformer blocks
         for block_index, block in enumerate(self.blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -771,6 +853,9 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     freqs_cis,
                     **causal_kwargs,
                 )
+
+        if recorder is not None:
+            recorder.end_forward()
 
         # 5. Output norm, projection & unpatchify
         temb = temb.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)

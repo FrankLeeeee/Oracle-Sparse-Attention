@@ -8,6 +8,7 @@ import torch
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
+from sglang.multimodal_gen.configs.models.dits.longvie import LongVie2VideoConfig
 from sglang.multimodal_gen.configs.models.dits.rolling_forcing_wanvideo import (
     RollingForcingWanVideoConfig,
 )
@@ -314,3 +315,14 @@ class RollingForcingWanT2V480PConfig(SelfForcingWanT2V480PConfig):
         default_factory=lambda: [1000, 800, 600, 400, 200]
     )
     dit_config: DiTConfig = field(default_factory=RollingForcingWanVideoConfig)
+
+
+@dataclass
+class LongVie2Config(WanI2V480PConfig):
+    """LongVie 2: Wan I2V 14B 480P plus the dual-control side network.
+
+    Only the DiT differs from the base model — the VAE, encoders and scheduler
+    are Wan's — so this inherits everything and swaps the transformer config.
+    """
+
+    dit_config: DiTConfig = field(default_factory=LongVie2VideoConfig)

@@ -48,6 +48,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     SelfForcingWanT2V480PConfig,
+    LongVie2Config,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -77,6 +78,7 @@ __all__ = [
     "Pi05PipelineConfig",
     "StableDiffusion3PipelineConfig",
     "WanT2V480PConfig",
+    "LongVie2Config",
     "WanI2V480PConfig",
     "WanT2V720PConfig",
     "WanI2V720PConfig",
