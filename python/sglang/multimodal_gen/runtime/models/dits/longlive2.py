@@ -185,6 +185,10 @@ class LongLive2Transformer3DModel(CausalWanTransformer3DModel):
                 for i in range(config.num_layers)
             ]
         )
+        # rebuilding self.blocks discards the depth stamps the base __init__
+        # put on its own blocks; the attention-map probe reads them
+        for layer_index, block in enumerate(self.blocks):
+            block.attn1.layer_index = layer_index
 
 
 EntryClass = LongLive2Transformer3DModel
