@@ -326,3 +326,15 @@ class LongVie2Config(WanI2V480PConfig):
     """
 
     dit_config: DiTConfig = field(default_factory=LongVie2VideoConfig)
+
+    # --- clip-by-clip autoregressive generation (upstream inference.py) ---
+    # Frames generated per clip; requests longer than this run the clip loop.
+    longvie_clip_num_frames: int = 81
+    # Pixel frames of the previous clip carried as history. Upstream takes the
+    # last 8 but its VAE's chunked encoder only consumes the first
+    # ``1 + 4 * ((n - 1) // 4)`` of them (5 for n=8) — the encode helper
+    # reproduces that.
+    longvie_history_frames: int = 8
+    # Blend factor for re-noising latent frame 0 toward the history's last
+    # latent frame on clips after the first (upstream hardcodes this).
+    longvie_first_frame_blend_sigma: float = 0.925926

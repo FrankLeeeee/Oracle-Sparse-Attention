@@ -229,6 +229,9 @@ class Req:
     longvie_sparse_video: str | None = None
     longvie_dense_latents: torch.Tensor | None = None
     longvie_sparse_latents: torch.Tensor | None = None
+    # 36-channel history latents ([ones(20) | VAE(16)]) prepended to the main
+    # stream's tokens for clip-by-clip autoregressive generation
+    longvie_history_latents: torch.Tensor | None = None
     # return websocket-friendly raw RGB frame bytes instead of rwa tensors
     return_raw_frames: bool = False
 

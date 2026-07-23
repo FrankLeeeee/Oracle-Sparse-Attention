@@ -176,6 +176,45 @@ class LongVie2Transformer3DModel(WanTransformer3DModel):
             )
         return dense, sparse
 
+    def _history_latents(self) -> torch.Tensor | None:
+        forward_batch = get_forward_context().forward_batch
+        if forward_batch is None:
+            return None
+        return forward_batch.longvie_history_latents
+
+    def _prepend_history_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        history_latents: torch.Tensor,
+    ) -> tuple[torch.Tensor, int, tuple[torch.Tensor, torch.Tensor]]:
+        """Prepend patchified history tokens and extend RoPE over them.
+
+        Upstream (``model_fn_wan_video``) concatenates ``[history, current]``
+        and computes ``freqs_history`` over the combined frame count — history
+        sits at temporal positions ``[0, f_h)`` and the current clip is shifted
+        to start at ``f_h``. The control streams keep the unshifted ``freqs``.
+        """
+        history_tokens = self._patchify_control(
+            history_latents, dtype=hidden_states.dtype
+        )
+        p_t, p_h, p_w = self.patch_size
+        f_h = history_latents.shape[2] // p_t
+        grid_h = history_latents.shape[3] // p_h
+        grid_w = history_latents.shape[4] // p_w
+        current_frames = hidden_states.shape[1] // (grid_h * grid_w)
+        freqs_cos, freqs_sin = self.rotary_emb.forward_from_grid(
+            (f_h + current_frames, grid_h, grid_w),
+            shard_dim=0,
+            start_frame=0,
+            device=hidden_states.device,
+        )
+        hidden_states = torch.cat([history_tokens, hidden_states], dim=1)
+        return (
+            hidden_states,
+            history_tokens.shape[1],
+            (freqs_cos.float(), freqs_sin.float()),
+        )
+
     def _run_transformer_blocks(
         self,
         hidden_states: torch.Tensor,
@@ -199,17 +238,24 @@ class LongVie2Transformer3DModel(WanTransformer3DModel):
             timestep_proj=timestep_proj,
         )
         if dense.shape[1] != hidden_states.shape[1]:
-            # once history tokens are prepended this becomes `>`, since the
-            # control streams cover only the generated tail
             raise ValueError(
-                "LongVie control tokens must match the generated tokens "
-                "(history conditioning is not implemented yet): "
+                "LongVie control tokens must match the generated tokens: "
                 f"control={dense.shape[1]} main={hidden_states.shape[1]}"
+            )
+
+        # Clip-by-clip AR: history tokens sit in front of the main stream and
+        # shift its RoPE; the control streams cover only the generated tail.
+        history_latents = self._history_latents()
+        history_len = 0
+        main_freqs_cis = freqs_cis
+        if history_latents is not None:
+            hidden_states, history_len, main_freqs_cis = self._prepend_history_tokens(
+                hidden_states, history_latents
             )
 
         for index, block in enumerate(self.blocks):
             hidden_states = block(
-                hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                hidden_states, encoder_hidden_states, timestep_proj, main_freqs_cis
             )
             if index >= self.control_layers:
                 continue
@@ -220,12 +266,13 @@ class LongVie2Transformer3DModel(WanTransformer3DModel):
                 sparse, control_context, control_t_mod, freqs_cis
             )
             fused = self.control.combine_linears[index](dense + sparse)
-            # the control streams cover only the generated tokens; when history
-            # tokens are prepended to the main stream they sit at the front and
-            # must not be steered
+            # history tokens sit at the front and must not be steered
             hidden_states[:, -fused.shape[1] :] = (
                 hidden_states[:, -fused.shape[1] :] + fused
             )
+
+        if history_len:
+            hidden_states = hidden_states[:, history_len:]
         return hidden_states
 
 
