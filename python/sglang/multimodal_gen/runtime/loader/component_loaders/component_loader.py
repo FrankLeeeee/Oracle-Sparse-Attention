@@ -466,9 +466,13 @@ class ComponentLoader(ABC):
 
 
 class ImageProcessorLoader(ComponentLoader):
-    """Loader for image processor."""
+    """Loader for image processor.
 
-    component_names = ["image_processor"]
+    `feature_extractor` is the legacy diffusers model_index.json slot name for
+    the same component (e.g. HunyuanVideo 1.5's SiglipImageProcessor).
+    """
+
+    component_names = ["image_processor", "feature_extractor"]
     expected_library = "transformers"
 
     def load_customized(
