@@ -90,3 +90,26 @@ Related notes: [`attention sparsity analysis.md`](attention%20sparsity%20analysi
 (measurements), [`token attention maps.md`](token%20attention%20maps.md) (probe
 mechanics + per-model maps), [`attention map visualization.md`](attention%20map%20visualization.md)
 (chunk-level probe).
+
+## Update 2026-07-23 (second prompt): register-lattice stability confirmed for Wan-1.3B
+
+The n=1 caveat is partially resolved. A second 10-second sweep with a different
+prompt ("A white sailboat gliding across a turquoise bay at sunset, camera
+follows", same seed; dumps in `attn_token_sailboat/`, videos in
+`samples/demos_2026-07-23/*_sailboat.mp4`) gives cross-prompt register-cell
+Jaccard (union over chunks, layer-mean >10x uniform):
+
+| model | fox cells | sailboat cells | cross-prompt Jaccard |
+|---|---|---|---|
+| Causal Forcing | 1208 | 1197 | **0.69** |
+| Self-Forcing | 1070 | 1180 | **0.67** |
+| Rolling Forcing | 1224 | 1153 | **0.72** |
+| LongLive-2.0 | 160 | 150 | 0.34 |
+| LingBot-World v2 | 592 | 410 | 0.23 |
+
+So the Wan-1.3B stripe lattice is ~70% prompt-independent — **offline
+calibration of register-cell columns is justified for that family** (level 3
+of the strategy), while LongLive-2.0 and LingBot confirm the content-bound
+side: their registers must be harvested at runtime (first denoise step per
+chunk). This is exactly the split the strategy assumed; it is now measured
+rather than assumed. Still n=2 prompts and one seed.
