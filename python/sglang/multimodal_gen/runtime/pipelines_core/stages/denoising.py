@@ -1454,6 +1454,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             current_model: the next active dit, transformer_1 or transformer_2
         """
         manager = self._component_residency_manager
+        if manager is None:
+            # No residency manager (e.g. the stage is run directly rather than
+            # through the pipeline executor); residency is the caller's problem.
+            return
 
         component_name = manager.component_name_for_module(current_model, current_phase)
         phase = str(batch.extra.get("ltx2_phase", current_phase))

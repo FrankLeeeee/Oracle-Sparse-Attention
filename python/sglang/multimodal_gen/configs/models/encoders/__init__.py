@@ -23,6 +23,7 @@ from sglang.multimodal_gen.configs.models.encoders.ideogram import (
 from sglang.multimodal_gen.configs.models.encoders.llama import LlamaConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen3vl import Qwen3VLConfig
+from sglang.multimodal_gen.configs.models.encoders.siglip import SiglipVisionConfig
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
 
 __all__ = [
@@ -38,6 +39,7 @@ __all__ = [
     "LlamaConfig",
     "Qwen3TextConfig",
     "Qwen3VLConfig",
+    "SiglipVisionConfig",
     "T5Config",
     "Gemma2Config",
     "Gemma3Config",

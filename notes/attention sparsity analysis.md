@@ -195,3 +195,74 @@ and is the companion to `tools/plot_chunk_attention_maps.py`). Promote them into
   the per-cell oracle with an achievable bound.
 - Multi-prompt calibration of the head tables before baking any config.
 - Perceptual A/B of a prototype mask against the dense baseline.
+
+---
+
+# The 10-second six-model revision (2026-07-23)
+
+Re-analysis over the fresh 10 s token-score dumps (`attn_token_10s/`: Self/
+Causal/Rolling Forcing, LingBot-World v2, LongVie 2 clip 2 with history,
+LongLive-2.0). Stats + figures in `attn_token_10s/sparsity_analysis/`
+(`stats.json`, `block_gap.json`, `retention_curves.png`,
+`concentration_by_depth.png`, `sink_mass_per_head.png`,
+`register_cell_maps.png`); scan scripts in the 2026-07-23 session scratchpad
+(`sparsity_scan.py`, `sparsity_figs.py`).
+
+## Findings
+
+1. **Concentration is universal and strong.** Median per-(chunk,layer,head):
+   half of a head's mass sits in 5.1–9.7% of its visible keys; 90% needs
+   30–50%. An oracle top-4% keeps 30–45% of mass (uniform would keep 4%);
+   top-16% keeps 63–76%. LongVie 2 is the most concentrated (n50 = 5.1%,
+   4% → 45%) — full attention hides the most exploitable structure.
+2. **Head heterogeneity is the dominant axis, again.** p10–p90 of
+   retention@4% spans ~14% to ~85% in every model; the within-layer
+   head gap has median 0.56–0.77. Any uniform budget wastes most of the win.
+3. **Frame granularity ≈ token granularity; 4×4 spatial blocks lose.** At an
+   equal ~4% token budget (last chunk, per head): token oracle 0.34–0.48,
+   whole-latent-frame selection 0.24–0.45 (within a few points for the Wan
+   models, budget-rounding favours it slightly), but 4×4 spatial blocks only
+   0.19–0.30 — 25–45% relative loss vs tokens. Attention mass is organized in
+   *frames* plus *isolated cells*, and mid-size spatial blocks straddle both.
+   (The even/odd column checkerboard, 1.08–1.19× in all six models, is one
+   reason: any even-width block mixes biased and unbiased columns.)
+4. **Sink usage is zero-inflated.** Mass on the pinned sink per
+   (chunk,layer,head) at steady state: RF median 0.085 (17–21% of heads
+   < 2%, tail to 0.79), LingBot 0.089 (17% < 2%), LongLive-2.0 0.074
+   (23% < 2%, 8% > 30%). Roughly a fifth of sites never read the sink.
+5. **Registers are spatially anchored — and in the Wan-1.3B family they form
+   a static positional lattice.** Token-level register positions (>10×
+   uniform at layer mean) barely persist across chunks (Jaccard 0.03–0.18;
+   LingBot 0.39), but their *grid cells* do: cell-Jaccard 0.63–0.86 for
+   SF/CF/RF. The register_cell_maps figure shows why: SF/CF/RF registers sit
+   on a periodic vertical-stripe + checkerboard lattice covering the grid —
+   position-locked (patchify/RoPE geometry), not content-locked, hence
+   calibratable offline. The 14B models differ: LingBot's registers partly
+   track content (a cluster over the subject), LongLive-2.0's are sparse and
+   scattered — those need runtime discovery.
+6. **Temporal structure by model** (steady-state medians): LongLive-2.0 own
+   block 0.78 / prev 0.086 / sink 0.074 (0.94 in three row-blocks); CF/SF own
+   0.56–0.58 / prev 0.17; LingBot own 0.41 / prev 0.17 / sink 0.089.
+   Rolling Forcing spreads mass across its jointly-denoised window (its
+   "own chunk" is not the newest frame), so its masks must be window-relative.
+   LongVie 2: ±4 frames ≈ 0.74 of mass within a clip, history at 0.25×
+   uniform after the first generated frames.
+
+## Proposed sparse-attention strategy
+
+Promoted to its own note:
+[`sparse attention strategy.md`](sparse%20attention%20strategy.md) — per-head
+static frame masks + per-head sink dropping + register-cell columns +
+head-adaptive budgets with a dense fallback, with expected gains and the
+validation plan.
+
+## Caveats
+
+- Received-mass view: per-query structure inside a chunk is averaged; the
+  frame-mask calibration should be re-checked per query block before trusting
+  it for RF's joint window.
+- n = 1 prompt/seed/model; the Wan-1.3B register lattice looks positional
+  (stripes + checkerboard) but prompt-independence is unverified — one more
+  prompt would settle it.
+- Oracle retention is an upper bound for any selector, and retained mass is a
+  proxy — end-to-end quality is the real gate.

@@ -1,6 +1,6 @@
 # Token-Level Attention Maps: LingBot-World v2 & LongVie 2
 
-Date: 2026-07-22
+Date: 2026-07-22 (updated 2026-07-23 — see "The 10-second five-model sweep")
 Scope: render attention at *latent-token* resolution — for every key token, how
 much attention mass it receives — for the two 14B video DiTs, and compare a
 block-causal world model against a full-attention I2V model on the same
@@ -343,9 +343,92 @@ longer clip needs either a coarser grouping or a bigger card.
   dynamic selection (the same conclusion the spatial study reached).
 - Extend the same instrumentation to the rest of the full-attention Wan family
   now that `wanvideo.py` carries the hook.
-- **Re-probe LongVie 2 once the clip loop and history conditioning land** (phase
+- ~~Re-probe LongVie 2 once the clip loop and history conditioning land~~ —
+  done 2026-07-23, see "The 10-second five-model sweep" below. Answer: the
+  8-frame history is attended like a fading local neighbour (0.84x uniform at
+  the first generated frame → 0.18x by mid-clip, 0.25x mean), *not* like
+  LingBot's pinned sink.
+- **(superseded original)** Re-probe LongVie 2 once the clip loop and history conditioning land (phase
   2 of [`longvie2 integration.md`](longvie2%20integration.md)). That is the run
   worth having: with history tokens prepended, `[history | current]` is exactly
   the chunk structure the probe was built for, and it would show whether the
   8-frame history is attended to like LingBot's sink or ignored — the question
   this note set out to answer for LongVie 2 and could not.
+
+## The 10-second five-model sweep (2026-07-23)
+
+Same fox prompt, seed 1234, ~10 s of video from five models, each with the
+token-scores probe on. Videos in `samples/demos_2026-07-23/`, dumps + rendered
+plots (`plots/`, `token_plots/`, `token_bars/` per run) under
+`/data/projects/vision-gen/attn_token_10s/{cf,sf,rf,longvie2,lingbot}/`,
+launch logs in `outputs/attn_probe_10s/`.
+
+| model | frames | driver | probe stride | wall time |
+|---|---|---|---|---|
+| Self-Forcing (new: converted via `--preset self-forcing`, registered as `gdhe17/SelfForcing-Wan2.1-T2V-1.3B-Diffusers`) | 165 | generate | 8 | 65 s |
+| Causal Forcing (chunkwise) | 165 | generate | 8 | 75 s |
+| Rolling Forcing | 165 | generate | 8 | 82 s |
+| LongVie 2 (2-clip AR, 50 steps) | 161 | generate | 16 | 26.5 min |
+| LingBot-World v2 (14-chunk realtime session) | 165 | websocket | 8 | 126 s |
+
+Findings new at this length:
+
+- **LongVie 2 with history — the question the 07-22 note could not answer.**
+  The clip loop flushes one dump per clip; clip 2's has 23 query groups
+  (2 history latent frames + 21 generated). Generated frames put **0.25x
+  uniform** mass on the history on average — 0.84x at the first generated
+  frame, decaying to ~0.16-0.20x from mid-clip on — while the history frames
+  attend to themselves with 0.545. So the 8-frame history behaves exactly like
+  the conditioning frame did in the single-clip run: a strong *local* neighbour
+  that fades within a few frames, **not** a LingBot-style pinned attractor. A
+  KV-cache policy for LongVie 2 clips could deprioritize history keys after
+  the first ~2 generated latent frames.
+- **CF/SF's emergent chunk-0 sink dies with eviction.** At 14 chunks the
+  21-frame window slides past chunk 0 from chunk 7 on, and the bright chunk-0
+  column simply ends there — the sink is an artifact of chunk 0 being visible,
+  not a pinned mechanism. RF (pinned `sink_size=3`) and LingBot (9-frame sink)
+  keep their sink columns lit across all 14 rows, as designed.
+- **Self-Forcing vs Causal Forcing:** near-identical chunk-to-chunk structure
+  (same geometry, ancestor weights) — CF's matrix is marginally more
+  diagonal-concentrated. Visually SF drifts gray and CF drifts saturated by
+  frame ~160; RF holds color best of the three 1.3B models.
+- Probe overhead on the LongVie 2 AR run: 10.8/12.2 s/step (clip 1/clip 2)
+  vs 6.4/7.1 clean — clip 2 costs more because history tokens extend the
+  sequence and the group count rises to 23.
+
+### Addendum: LongLive-2.0 (2026-07-23)
+
+Sixth model, same prompt/seed: **LongLive-2.0-5B**
+(`Rabinovich/LongLive-2.0-5B-Diffusers`, NVIDIA, distilled few-step TI2V on
+Wan2.2-TI2V-5B) — asked whether it is chunk-causal, and it definitively is:
+**block-causal in 8-latent-frame blocks with an 8-frame pinned sink and a
+32-frame local window** (`configs/models/dits/longlive2.py`). 253 frames
+(10.5 s at 24 fps, 64 latent frames = 8 chunks) generated in 23 s, 4 DMD
+steps/chunk. Dump + plots:
+`attn_token_10s/longlive2/LongLive2Transformer3DModel-20260723-081349`
+(15x26 grid — the Wan2.2 16x VAE, so probe cost is tiny), video
+`samples/demos_2026-07-23/longlive2_10s.mp4`.
+
+Chunk matrix (layer+head+step mean, rows = generating chunk):
+
+- strictly lower-triangular; self mass 0.71-0.76, previous chunk 0.10-0.13,
+  two back 0.04-0.06 — sharp recency decay inside the 4-chunk window;
+- the sink column settles at a **constant ~0.11 for every chunk** once past
+  the window (vs LingBot's 0.45-0.58 over a 9-frame sink) — a pinned but
+  much lighter anchor;
+- chunks outside window+sink are exactly evicted (true zeros), like the other
+  KV-cache models.
+
+Two integration bugs surfaced by the probe (both fixed, both instances of
+traps this note already documents):
+
+1. `LongLive2Transformer3DModel.__init__` **rebuilds `self.blocks` after
+   `super().__init__` has stamped `attn1.layer_index`**, so all layers kept
+   `-1` and the probe indexed `token_mass[chunk, -1]` into a 0-layer buffer.
+   Fix: re-stamp after the rebuild (`runtime/models/dits/longlive2.py`) —
+   the same after-the-list pattern the base uses.
+2. `LongLive2CausalDenoisingStage._forward_one_shot_common` **returned
+   without `_flush_attention_maps`** (it overrides `forward` and never goes
+   through the base's flushing path) — the LingBot session bug in one-shot
+   form. Fix: flush before returning
+   (`stages/model_specific_stages/longlive2.py`).

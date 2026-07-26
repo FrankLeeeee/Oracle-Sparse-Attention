@@ -513,6 +513,7 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
                 start_index += current_num_frames
 
         self._rope_temporal_offset = 0.0
+        self._flush_attention_maps(batch)
         batch.latents = latents
         return batch
 

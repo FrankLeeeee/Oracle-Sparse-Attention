@@ -87,6 +87,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageLayeredPipelineConfig,
     QwenImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuanvideo15 import (
+    CausalHunyuanVideo15TI2VConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
@@ -154,6 +157,9 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageEditPlusSamplingParams,
     QwenImageLayeredSamplingParams,
     QwenImageSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.hunyuanvideo15 import (
+    CausalHunyuanVideo15TI2VSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
@@ -840,6 +846,39 @@ def _register_configs():
         model_detectors=[
             lambda hf_id: "causal-forcing" in hf_id.lower()
             or "causalforcing" in hf_id.lower(),
+        ],
+    )
+    # Self-Forcing (guandeh17/Self-Forcing) — Wan2.1-T2V-1.3B causal DMD, the
+    # ancestor of Causal Forcing; identical chunk-wise inference geometry, so
+    # it reuses the Causal Forcing pipeline/config classes. Checkpoints are
+    # local dirs produced by tools/convert_forcing_to_diffusers.py
+    # (--preset self-forcing).
+    register_configs(
+        sampling_param_cls=CausalForcingT2VSamplingParams,
+        pipeline_config_cls=CausalForcingWanT2V480PConfig,
+        hf_model_paths=[
+            "gdhe17/SelfForcing-Wan2.1-T2V-1.3B-Diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: "self-forcing" in hf_id.lower()
+            or "selfforcing" in hf_id.lower(),
+        ],
+    )
+    # minWM causal HunyuanVideo 1.5 TI2V (MIN-Lab/minWM, HY15/TI2V line) —
+    # KV-cached autoregressive chunk rollout on the HunyuanVideo-1.5 8B
+    # backbone. Checkpoints are local dirs assembled by
+    # tools/assemble_minwm_hy15.py (minWM transformer + stock HY1.5
+    # components).
+    register_configs(
+        sampling_param_cls=CausalHunyuanVideo15TI2VSamplingParams,
+        pipeline_config_cls=CausalHunyuanVideo15TI2VConfig,
+        hf_model_paths=[
+            "MIN-Lab/minWM-HY15-TI2V-dmd-Diffusers",
+            "MIN-Lab/minWM-HY15-TI2V-causal-cd-Diffusers",
+            "MIN-Lab/minWM-HY15-TI2V-causal-ode-Diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: "minwm" in hf_id.lower() and "hy15" in hf_id.lower(),
         ],
     )
     # Rolling Forcing (TencentARC/RollingForcing) — Wan2.1-T2V-1.3B streaming

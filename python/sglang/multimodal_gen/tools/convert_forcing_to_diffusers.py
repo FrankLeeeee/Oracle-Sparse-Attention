@@ -60,6 +60,18 @@ PRESETS: dict[str, dict] = {
             "sink_size": 0,
         },
     },
+    "self-forcing": {
+        # Self-Forcing (guandeh17/Self-Forcing) — the ancestor of Causal
+        # Forcing; same chunk-wise DMD inference geometry (3-frame blocks,
+        # 21-latent-frame context, no pinned sink), different weights.
+        "pipeline_class": "CausalForcingPipeline",
+        "transformer_class": "CausalWanTransformer3DModel",
+        "arch_overrides": {
+            "num_frames_per_block": 3,
+            "sliding_window_num_frames": 21,
+            "sink_size": 0,
+        },
+    },
     "rolling-forcing": {
         "pipeline_class": "WanRollingForcingPipeline",
         "transformer_class": "RollingForcingWanTransformer3DModel",
