@@ -864,6 +864,23 @@ def _register_configs():
             or "selfforcing" in hf_id.lower(),
         ],
     )
+    # Light Forcing (chengtao-lv/LightForcing) — Wan2.1-T2V-1.3B causal DMD
+    # retrained with hierarchical sparse attention; Self-Forcing inference
+    # geometry, so it reuses the Causal Forcing pipeline/config classes. Pair
+    # with --sparse-attention lightforcing for the speedup it was trained for
+    # (dense attention also works). Checkpoints are local dirs produced by
+    # tools/convert_forcing_to_diffusers.py (--preset light-forcing).
+    register_configs(
+        sampling_param_cls=CausalForcingT2VSamplingParams,
+        pipeline_config_cls=CausalForcingWanT2V480PConfig,
+        hf_model_paths=[
+            "mack-williams/LightForcing-Wan2.1-T2V-1.3B-Diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: "light-forcing" in hf_id.lower()
+            or "lightforcing" in hf_id.lower(),
+        ],
+    )
     # minWM causal HunyuanVideo 1.5 TI2V (MIN-Lab/minWM, HY15/TI2V line) —
     # KV-cached autoregressive chunk rollout on the HunyuanVideo-1.5 8B
     # backbone. Checkpoints are local dirs assembled by

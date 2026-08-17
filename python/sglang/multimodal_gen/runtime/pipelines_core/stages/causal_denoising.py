@@ -814,6 +814,10 @@ class CausalDMDDenoisingStage(DenoisingStage):
 
             if progress_bar is not None:
                 progress_bar.update()
+            # Advance the torch-profiler schedule exactly like the base
+            # DenoisingStage loop does; without this, --profile never leaves
+            # its warmup phase on causal pipelines and dumps an empty trace.
+            self.step_profile()
 
         return current_latents, attn_metadata
 

@@ -72,6 +72,31 @@ PRESETS: dict[str, dict] = {
             "sink_size": 0,
         },
     },
+    "light-forcing": {
+        # Light Forcing (chengtao-lv/LightForcing) short_video_gen.pt —
+        # Self-Forcing geometry (3-frame blocks, 21-latent-frame context, no
+        # sink) retrained with hierarchical sparse attention; the sparse
+        # schedule is an inference-time choice, not baked into the weights.
+        "pipeline_class": "CausalForcingPipeline",
+        "transformer_class": "CausalWanTransformer3DModel",
+        "arch_overrides": {
+            "num_frames_per_block": 3,
+            "sliding_window_num_frames": 21,
+            "sink_size": 0,
+        },
+    },
+    "light-forcing-long": {
+        # Light Forcing long_video_gen.pt — 12-latent-frame local window with
+        # a 1-frame pinned sink; upstream re-ropes cached K per step
+        # (long_video_gen=True) for unbounded rollout.
+        "pipeline_class": "CausalForcingPipeline",
+        "transformer_class": "CausalWanTransformer3DModel",
+        "arch_overrides": {
+            "num_frames_per_block": 3,
+            "sliding_window_num_frames": 12,
+            "sink_size": 1,
+        },
+    },
     "rolling-forcing": {
         "pipeline_class": "WanRollingForcingPipeline",
         "transformer_class": "RollingForcingWanTransformer3DModel",

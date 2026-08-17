@@ -196,6 +196,11 @@ class ServerArgs(DisaggServerArgsMixin):
         None  # cache-dit config for diffusers
     )
 
+    # Sparse attention for block-causal video DiTs. None keeps dense attention;
+    # see runtime/layers/attention/sparse/ for the methods and their knobs.
+    sparse_attention: str | None = None
+    sparse_attention_config: str | dict[str, Any] | None = None
+
     # Distributed executor backend
     nccl_port: Optional[int] = None
 
@@ -462,6 +467,7 @@ class ServerArgs(DisaggServerArgsMixin):
         # adjust parallelism before attention backend
         self._adjust_parallelism()
         self._adjust_attention_backend()
+        self._adjust_sparse_attention()
         self._adjust_platform_specific()
         self._adjust_layerwise_offload_components()
         self._adjust_autocast()
@@ -791,6 +797,32 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
                 return
             self._set_default_attention_backend()
+
+    def _adjust_sparse_attention(self):
+        from sglang.multimodal_gen.runtime.layers.attention.sparse import (
+            SPARSE_ATTENTION_METHODS,
+        )
+
+        if isinstance(self.sparse_attention, str):
+            self.sparse_attention = self.sparse_attention.strip().lower() or None
+        if self.sparse_attention == "none":
+            self.sparse_attention = None
+        if (
+            self.sparse_attention is not None
+            and self.sparse_attention not in SPARSE_ATTENTION_METHODS
+        ):
+            raise ValueError(
+                f"Invalid --sparse-attention {self.sparse_attention!r}; expected one "
+                f"of {', '.join(SPARSE_ATTENTION_METHODS)} (or omit it for dense)."
+            )
+        if isinstance(self.sparse_attention_config, str):
+            self.sparse_attention_config = self._parse_attention_backend_config(
+                self.sparse_attention_config
+            )
+        if self.sparse_attention_config and self.sparse_attention is None:
+            raise ValueError(
+                "--sparse-attention-config was given without --sparse-attention."
+            )
 
     @staticmethod
     def _normalize_attention_backend_name(backend: str) -> str:
@@ -1355,6 +1387,26 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.cache_dit_config,
             help="Path to a Cache-DiT YAML/JSON config. Enables cache-dit for diffusers backend.",
+        )
+        parser.add_argument(
+            "--sparse-attention",
+            type=str,
+            default=ServerArgs.sparse_attention,
+            help=(
+                "Sparse self-attention method for block-causal video DiTs "
+                "(Self-Forcing family). Omit for dense attention. 'osa' is "
+                "Oracle Sparse Attention; 'xattention', 'svg1', 'svg2', "
+                "'radial' and 'fastar' are the published baselines."
+            ),
+        )
+        parser.add_argument(
+            "--sparse-attention-config",
+            type=str,
+            default=None,
+            help=(
+                "Knobs for --sparse-attention, as a JSON string, a JSON/YAML file "
+                "path, or key=value pairs, e.g. 'reference_chunk=3,retention=0.9'."
+            ),
         )
 
         # HuggingFace specific parameters

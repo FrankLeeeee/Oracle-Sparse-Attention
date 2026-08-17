@@ -181,6 +181,41 @@ def attention_mass_by_frame(
     return mass, counts
 
 
+@torch.no_grad()
+def strided_qk_probs(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    *,
+    key_stride: int,
+    query_tile: int = _QUERY_TILE,
+) -> torch.Tensor:
+    """Strided columns of the true attention matrix — ``[heads, nq, nk]``.
+
+    ``query`` is the already query-strided ``[nq, heads, head_dim]``, ``key``
+    the full visible ``[key_seq, heads, head_dim]``. The softmax runs over the
+    *full* key axis and columns are sampled afterwards, so every kept column
+    is the query's exact probability on that key token.
+    """
+    scale = query.shape[-1] ** -0.5
+    key_by_head = key.permute(1, 2, 0)  # [heads, head_dim, key_seq]
+    out = torch.empty(
+        key.shape[1],
+        query.shape[0],
+        (key.shape[0] + key_stride - 1) // key_stride,
+        dtype=torch.float16,
+        device=query.device,
+    )
+    for start in range(0, query.shape[0], query_tile):
+        tile = query[start : start + query_tile].permute(1, 0, 2)
+        probs = torch.softmax(
+            torch.bmm(tile, key_by_head).float() * scale, dim=-1
+        )
+        out[:, start : start + tile.shape[1]] = probs[:, :, ::key_stride].to(
+            torch.float16
+        )
+    return out
+
+
 def _concentration_ranks(frame_seqlen: int, *, device: torch.device) -> torch.Tensor:
     """Top-k cut-offs (0-based indices) for the per-query concentration curve."""
     ranks = [k for k in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024) if k < frame_seqlen]
@@ -353,6 +388,8 @@ class ChunkAttentionRecorder:
         spatial_query_stride: int = _DEFAULT_SPATIAL_QUERY_STRIDE,
         spatial_min_chunk: int = _DEFAULT_SPATIAL_MIN_CHUNK,
         token_scores: bool = False,
+        qk_chunks: frozenset[int] = frozenset(),
+        qk_key_stride: int = 16,
     ) -> None:
         self.output_dir = pathlib.Path(output_dir)
         self.query_stride = max(1, query_stride)
@@ -361,6 +398,12 @@ class ChunkAttentionRecorder:
         self.spatial_query_stride = max(1, spatial_query_stride)
         self.spatial_min_chunk = spatial_min_chunk
         self.token_scores = token_scores
+        self.qk_chunks = qk_chunks
+        self.qk_key_stride = max(1, qk_key_stride)
+        # chunk -> layer -> [heads, nq, nk] float16, first denoising step only
+        self._qk_scores: dict[int, dict[int, np.ndarray]] = {}
+        self._qk_positions: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self._qk_seen: set[tuple[int, int]] = set()
         self.current_pass_kind = DENOISE_PASS
         self.enabled = True
         self._scope: ForwardScope | None = None
@@ -492,6 +535,30 @@ class ChunkAttentionRecorder:
             token_mass=token_mass,
             query_tile=self.query_tile,
         )
+        if self.qk_chunks and scope.pass_kind == DENOISE_PASS:
+            query_chunk = scope.query_token_start // scope.chunk_tokens
+            if (
+                query_chunk in self.qk_chunks
+                and (query_chunk, layer_index) not in self._qk_seen
+            ):
+                self._qk_seen.add((query_chunk, layer_index))
+                probs = strided_qk_probs(
+                    sampled_query,
+                    visible_key,
+                    key_stride=self.qk_key_stride,
+                    query_tile=self.query_tile,
+                )
+                self._qk_scores.setdefault(query_chunk, {})[layer_index] = (
+                    probs.cpu().numpy()
+                )
+                if query_chunk not in self._qk_positions:
+                    key_positions = segment_positions(
+                        key_segments, device=query.device
+                    )
+                    self._qk_positions[query_chunk] = (
+                        query_positions.cpu().numpy(),
+                        key_positions[:: self.qk_key_stride].cpu().numpy(),
+                    )
         if token_mass is not None:
             self._accumulate_token_scores(
                 layer_index=layer_index,
@@ -656,6 +723,11 @@ class ChunkAttentionRecorder:
         token_mass = self._token_mass
         token_counts = self._token_counts
         token_visible = self._token_visible
+        qk_scores = self._qk_scores
+        qk_positions = self._qk_positions
+        self._qk_scores = {}
+        self._qk_positions = {}
+        self._qk_seen = set()
         grid = self._grid
         frames_per_block = self._frames_per_block
         self._grid = None
@@ -733,6 +805,22 @@ class ChunkAttentionRecorder:
                 token_scores=scores.cpu().numpy().astype(np.float32),
             )
             spatial_meta["token_scores_layout"] = "[chunks, layers, heads, tokens]"
+        for query_chunk, per_layer in sorted(qk_scores.items()):
+            layer_ids = sorted(per_layer)
+            query_pos, key_pos = qk_positions[query_chunk]
+            # Uncompressed on purpose: ~GB of float16 that zlib barely shrinks
+            # but takes a minute to chew through.
+            np.savez(
+                run_dir / f"qk_chunk_{query_chunk:03d}.npz",
+                scores=np.stack([per_layer[i] for i in layer_ids], axis=0),
+                layer_ids=np.asarray(layer_ids),
+                query_positions=query_pos,
+                key_positions=key_pos,
+            )
+        if qk_scores:
+            spatial_meta["qk_layout"] = "[layers, heads, queries, keys]"
+            spatial_meta["qk_key_stride"] = self.qk_key_stride
+            spatial_meta["qk_chunks"] = sorted(qk_scores)
         if grid is not None:
             spatial_meta["grid_height"], spatial_meta["grid_width"] = grid
         if frames_per_block:
@@ -790,12 +878,18 @@ def get_attention_map_recorder() -> ChunkAttentionRecorder | None:
 
     if get_world_rank() != 0:
         return None
+    qk_raw = envs.SGLANG_DIFFUSION_ATTENTION_MAP_QK_CHUNKS
+    qk_chunks = frozenset(
+        int(part) for part in qk_raw.split(",") if part.strip()
+    ) if qk_raw else frozenset()
     _recorder = ChunkAttentionRecorder(
         output_dir=output_dir,
         query_stride=envs.SGLANG_DIFFUSION_ATTENTION_MAP_QUERY_STRIDE,
         spatial=envs.SGLANG_DIFFUSION_ATTENTION_MAP_SPATIAL,
         spatial_query_stride=envs.SGLANG_DIFFUSION_ATTENTION_MAP_SPATIAL_QUERY_STRIDE,
         token_scores=envs.SGLANG_DIFFUSION_ATTENTION_MAP_TOKEN_SCORES,
+        qk_chunks=qk_chunks,
+        qk_key_stride=envs.SGLANG_DIFFUSION_ATTENTION_MAP_QK_KEY_STRIDE,
     )
     logger.info(
         "Chunk attention-map probe enabled (dir=%s, query_stride=%d, spatial=%s)",
