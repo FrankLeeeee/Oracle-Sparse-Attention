@@ -60,16 +60,31 @@ PRESETS: dict[str, dict] = {
             "sink_size": 0,
         },
     },
-    "self-forcing": {
-        # Self-Forcing (guandeh17/Self-Forcing) — the ancestor of Causal
-        # Forcing; same chunk-wise DMD inference geometry (3-frame blocks,
-        # 21-latent-frame context, no pinned sink), different weights.
+    # Self-Forcing (guandeh17/Self-Forcing) has its own entry point with the
+    # full-context geometry: convert_self_forcing_to_diffusers.py.
+    "light-forcing": {
+        # Light Forcing (chengtao-lv/LightForcing) short_video_gen.pt —
+        # Self-Forcing geometry (3-frame blocks, 21-latent-frame context, no
+        # sink) retrained with hierarchical sparse attention; the sparse
+        # schedule is an inference-time choice, not baked into the weights.
         "pipeline_class": "CausalForcingPipeline",
         "transformer_class": "CausalWanTransformer3DModel",
         "arch_overrides": {
             "num_frames_per_block": 3,
             "sliding_window_num_frames": 21,
             "sink_size": 0,
+        },
+    },
+    "light-forcing-long": {
+        # Light Forcing long_video_gen.pt — 12-latent-frame local window with
+        # a 1-frame pinned sink; upstream re-ropes cached K per step
+        # (long_video_gen=True) for unbounded rollout.
+        "pipeline_class": "CausalForcingPipeline",
+        "transformer_class": "CausalWanTransformer3DModel",
+        "arch_overrides": {
+            "num_frames_per_block": 3,
+            "sliding_window_num_frames": 12,
+            "sink_size": 1,
         },
     },
     "rolling-forcing": {
@@ -193,14 +208,13 @@ def resolve_base_model_path(base_model: str) -> pathlib.Path:
 
 def convert(
     *,
-    preset_name: str,
+    preset: dict,
     checkpoint: pathlib.Path,
     base_model: str,
     output_path: pathlib.Path,
     prefer_ema: bool,
     dtype: torch.dtype,
 ) -> None:
-    preset = PRESETS[preset_name]
     base_model_path = resolve_base_model_path(base_model)
 
     raw_state_dict = load_generator_state_dict(checkpoint, prefer_ema=prefer_ema)
@@ -254,7 +268,7 @@ def get_args() -> argparse.Namespace:
 def main() -> None:
     args = get_args()
     convert(
-        preset_name=args.preset,
+        preset=PRESETS[args.preset],
         checkpoint=args.checkpoint,
         base_model=args.base_model,
         output_path=args.output_path,

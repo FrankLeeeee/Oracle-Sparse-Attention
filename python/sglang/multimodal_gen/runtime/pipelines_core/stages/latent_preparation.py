@@ -11,6 +11,8 @@ from typing import Any
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
+from sglang.multimodal_gen import envs
+
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
 )
@@ -146,12 +148,26 @@ class LatentPreparationStage(PipelineStage):
             spec = self.get_latent_preparation_spec(
                 batch, server_args, batch_size, latent_num_frames, device
             )
-            latents = randn_tensor(
-                spec.shape,
-                generator=generator,
-                device=spec.device,
-                dtype=spec.dtype,
-            )
+            parity_dir = envs.SGLANG_DIFFUSION_TEST_PARITY_DIR
+            if parity_dir is not None:
+                # Numerical-parity test hook: consume the pre-generated
+                # initial noise instead of sampling (see
+                # tools/verify_self_forcing_parity.py).
+                latents = torch.load(
+                    f"{parity_dir}/init_noise_bcthw.pt", map_location="cpu"
+                ).to(device=spec.device, dtype=spec.dtype)
+                if tuple(latents.shape) != tuple(spec.shape):
+                    raise ValueError(
+                        f"parity init noise shape {tuple(latents.shape)} != "
+                        f"expected latent shape {tuple(spec.shape)}"
+                    )
+            else:
+                latents = randn_tensor(
+                    spec.shape,
+                    generator=generator,
+                    device=spec.device,
+                    dtype=spec.dtype,
+                )
 
             latent_ids = (
                 server_args.pipeline_config.maybe_prepare_latent_ids(latents)

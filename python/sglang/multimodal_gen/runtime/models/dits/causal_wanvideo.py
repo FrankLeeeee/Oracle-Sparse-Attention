@@ -33,6 +33,11 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.attention.sparse import (
+    ChunkGeometry,
+    SparseAttentionCall,
+    get_sparse_attention_backend,
+)
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CausalAttentionKVView,
@@ -249,8 +254,13 @@ class CausalWanSelfAttention(nn.Module):
                 cache_head_start=self.head_start,
                 debug_name="CausalWan KV cache",
             )
+            sparse_attention = get_sparse_attention_backend()
+            key_segments = (
+                visible_key_segments(kv_cache, cache_view)
+                if recorder is not None or sparse_attention is not None
+                else None
+            )
             if recorder is not None:
-                key_segments = visible_key_segments(kv_cache, cache_view)
                 if key_segments is None:
                     warn_unsupported_once(
                         "attention-sink KV cache views are not mapped to chunks"
@@ -262,6 +272,21 @@ class CausalWanSelfAttention(nn.Module):
                         key=cache_view.k,
                         key_segments=key_segments,
                     )
+            if sparse_attention is not None:
+                sparse_output = sparse_attention.attend(
+                    SparseAttentionCall(
+                        layer_index=self.layer_index,
+                        query=roped_query,
+                        key=cache_view.k,
+                        value=cache_view.v,
+                        key_segments=key_segments,
+                        head_start=self.head_start,
+                        num_local_heads=self.num_heads,
+                        softmax_scale=self.attn.softmax_scale,
+                    )
+                )
+                if sparse_output is not None:
+                    return sparse_output
             x = self.attn(
                 roped_query,
                 cache_view.k,
@@ -819,6 +844,17 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 query_token_start=current_start,
                 grid_height=post_patch_height,
                 grid_width=post_patch_width,
+            )
+        sparse_attention = get_sparse_attention_backend()
+        if sparse_attention is not None and kv_cache is not None:
+            sparse_attention.begin_forward(
+                ChunkGeometry(
+                    frame_seqlen=post_patch_height * post_patch_width,
+                    frames_per_block=self.num_frame_per_block,
+                    query_token_start=current_start,
+                    grid_height=post_patch_height,
+                    grid_width=post_patch_width,
+                )
             )
 
         # 4. Transformer blocks

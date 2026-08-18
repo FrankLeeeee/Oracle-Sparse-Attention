@@ -25,10 +25,13 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_LOGGING_CONFIG_PATH: str | None = None
     SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
     SGLANG_DIFFUSION_ATTENTION_MAP_DIR: str | None = None
+    SGLANG_DIFFUSION_TEST_PARITY_DIR: str | None = None
     SGLANG_DIFFUSION_ATTENTION_MAP_QUERY_STRIDE: int = 8
     SGLANG_DIFFUSION_ATTENTION_MAP_SPATIAL: bool = False
     SGLANG_DIFFUSION_ATTENTION_MAP_SPATIAL_QUERY_STRIDE: int = 32
     SGLANG_DIFFUSION_ATTENTION_MAP_TOKEN_SCORES: bool = False
+    SGLANG_DIFFUSION_ATTENTION_MAP_QK_CHUNKS: str | None = None
+    SGLANG_DIFFUSION_ATTENTION_MAP_QK_KEY_STRIDE: int = 16
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
@@ -264,6 +267,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_ATTENTION_MAP_DIR": _lazy_path(
         "SGLANG_DIFFUSION_ATTENTION_MAP_DIR"
     ),
+    # Test-only hook for numerical parity verification against upstream
+    # implementations (tools/verify_self_forcing_parity.py). Points at a
+    # directory with a pre-generated noise bank: causal DMD denoising then
+    # consumes init_noise_bcthw.pt / renoise_<i>.pt instead of sampling, and
+    # dumps the final denoised latents to sglang_latents.pt in the same dir.
+    "SGLANG_DIFFUSION_TEST_PARITY_DIR": _lazy_path(
+        "SGLANG_DIFFUSION_TEST_PARITY_DIR"
+    ),
     # Query subsampling stride of the attention-map probe. Higher is cheaper and
     # noisier; the probe recomputes softmax(q k^T) for every stride-th query.
     "SGLANG_DIFFUSION_ATTENTION_MAP_QUERY_STRIDE": _lazy_int(
@@ -282,6 +293,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # axis) as `token_scores.npz`. Large: [chunks, layers, heads, tokens].
     "SGLANG_DIFFUSION_ATTENTION_MAP_TOKEN_SCORES": _lazy_bool(
         "SGLANG_DIFFUSION_ATTENTION_MAP_TOKEN_SCORES"
+    ),
+    # Comma-separated chunk indices for which the probe additionally dumps the
+    # raw query x key attention matrix (strided both ways, first denoising step
+    # only) as `qk_chunk_<c>.npz`: [layers, heads, queries, keys] float16.
+    # Unset = off. Very large per chunk; list only the chunks you will plot.
+    "SGLANG_DIFFUSION_ATTENTION_MAP_QK_CHUNKS": _lazy_str(
+        "SGLANG_DIFFUSION_ATTENTION_MAP_QK_CHUNKS", None
+    ),
+    # Key subsampling stride of the QK-matrix dump (the query axis reuses
+    # SGLANG_DIFFUSION_ATTENTION_MAP_QUERY_STRIDE). Columns are sampled after
+    # the softmax, so each row is a strided view of the true distribution.
+    "SGLANG_DIFFUSION_ATTENTION_MAP_QK_KEY_STRIDE": _lazy_int(
+        "SGLANG_DIFFUSION_ATTENTION_MAP_QK_KEY_STRIDE", 16
     ),
     # If set, sgl_diffusion will run in development mode, which will enable
     # some additional endpoints for developing and debugging,
