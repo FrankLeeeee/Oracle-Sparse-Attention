@@ -3,14 +3,21 @@
 日期：2026-07-23（Self-Forcing 转换）/ 2026-07-20（所复用的 Causal-DMD 通路）
 范围：SGLang Diffusion 原生支持 **Self-Forcing**（guandeh17/Self-Forcing，
 gdhe17）——Wan2.1-T2V-1.3B 上的块因果自回归 T2V：3 潜帧块、4 步 DMD、
-21 潜帧滑窗（`sliding_window_num_frames: 21`，无固定 sink）。它是全部
+全上下文注意力（`sliding_window_num_frames: None`，无固定 sink；与上游
+`self_forcing_dmd.yaml` 的 `local_attn_size=-1` 默认对齐——上游固定的
+32760-token cache 恰为整段 21 潜帧视频，并无滚动淘汰。2026-08-18 起转换
+preset 与 HF 上的 config 均改为 None，runtime 按整段视频长度分配 KV cache、
+从不淘汰；此前误写为 21 帧滚动滑窗，仅在超过 21 潜帧时行为有差异。上游的
+`local_attn_size: 21` 属于 local21/720p 另外的 checkpoint）。它是全部
 稀疏注意力实验的主试验台（见 [`../experiments/self-forcing.md`](../experiments/self-forcing.md)）。
 
 ## 权重转换
 
 上游发布的是 DiT-only 的 `.pt` 训练态（`generator`/`generator_ema` 键、
-原始 Wan 命名）。`tools/convert_forcing_to_diffusers.py` 将其组装为自包含
-的 diffusers 布局：取 `generator_ema`、重命名 key、写入因果几何配置
+原始 Wan 命名）。独立入口 `tools/convert_self_forcing_to_diffusers.py`
+（2026-08-18 起从共用工具拆出，机制复用
+`convert_forcing_to_diffusers.py`）将其组装为自包含的 diffusers 布局：
+取 `generator_ema`、重命名 key、写入因果几何配置
 （`num_frames_per_block`、`sliding_window_num_frames` 等），并从
 `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` 复制 scheduler/text_encoder/tokenizer/vae：
 
@@ -25,8 +32,7 @@ hf download gdhe17/Self-Forcing checkpoints/self_forcing_dmd.pt \
   --local-dir /tmp/self-forcing-upstream
 
 # 转换到临时目录 → 上传 → 清理
-python -m sglang.multimodal_gen.tools.convert_forcing_to_diffusers \
-  --preset self-forcing \
+python -m sglang.multimodal_gen.tools.convert_self_forcing_to_diffusers \
   --checkpoint /tmp/self-forcing-upstream/checkpoints/self_forcing_dmd.pt \
   --output-path /tmp/SelfForcing-Wan2.1-T2V-1.3B-Diffusers
 
@@ -40,7 +46,8 @@ rm -rf /tmp/self-forcing-upstream /tmp/SelfForcing-Wan2.1-T2V-1.3B-Diffusers
 `gdhe17/SelfForcing-Wan2.1-T2V-1.3B-Diffusers`），改名会落到基础 Wan
 配置上。
 
-同一工具还提供同家族其它模型的 preset：`causal-forcing-chunkwise` /
+同家族其它模型用共用工具 `convert_forcing_to_diffusers.py` 的
+preset：`causal-forcing-chunkwise` /
 `causal-forcing-framewise`（thu-ml/Causal-Forcing，推理路径与 Self-Forcing
 完全相同，只是训练配方不同）、`light-forcing` / `light-forcing-long`
 （chengtao-lv/LightForcing，训练时即带稀疏注意力）、`rolling-forcing`
@@ -83,9 +90,19 @@ sglang generate \
 - 已知模型特性（非移植问题）：超出训练时长（5 s / 7 chunk）后长视频缓慢
   漂色，20 s 处出现粉色偏色——量化见
   [`../experiments/self-forcing.md`](../experiments/self-forcing.md) §3。
+- 同噪声数值 parity（2026-08-18）：把同一组噪声（初始 + 21 次 re-noise）
+  注入上游与 sglang，以"上游 FA3 vs 上游 SDPA"为浮点基准对照。block 0
+  latent 相对误差 sglang 0.068 vs 基准 0.076；末块 0.629 vs 0.595；视频
+  PSNR 18.1 dB vs 基准 19.5 dB（无关样本基线 10.8 dB）；文本编码器输出与
+  上游逐位一致。偏差逐块单调增长无突变——即偏差完全在 kernel 级浮点噪声
+  被自回归 cache 放大的量级内，实现逻辑与上游一致。已封装为一条命令：
+  `python -m sglang.multimodal_gen.tools.verify_self_forcing_parity
+  --upstream-repo <Self-Forcing checkout> --model-path <转换后模型>`
+  （runtime 侧噪声注入走 `SGLANG_DIFFUSION_TEST_PARITY_DIR` 测试钩子）。
 
 ## 未做事项
 
 - Causal Forcing++ 的 1/2 步模型（`denoising_step_list_first_chunk`）。
-- 与上游逐位对齐的数值 parity（仅视觉验证）。
+- Rolling Forcing / Causal Forcing 的同噪声 parity（Self-Forcing 已做，
+  方法可复用）。
 - CI 条目（等转换后的 checkpoint 上传 HF）。

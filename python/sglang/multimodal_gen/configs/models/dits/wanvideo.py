@@ -107,7 +107,10 @@ class WanVideoArchConfig(DiTArchConfig):
         0  # Size of the attention sink, we keep the first `sink_size` frames unchanged when rolling the KV cache
     )
     num_frames_per_block: int = 3
-    sliding_window_num_frames: int = 21
+    # Rolling KV-cache window in latent frames. None means full context
+    # (upstream Self-Forcing default: the cache spans the whole video and
+    # nothing is ever evicted).
+    sliding_window_num_frames: int | None = 21
     attention_type: str = "original"
     sla_topk: float = 0.1
 

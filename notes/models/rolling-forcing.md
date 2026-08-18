@@ -81,6 +81,7 @@ sglang generate \
 
 - DiT 的 TP/SP（当前仅单卡复制式运行）。
 - 与上游逐位对齐的数值 parity（仅视觉验证）。
-- CI 条目（等转换后的 checkpoint 上传 HF）。
+- CI 条目（checkpoint 已于 2026-08-18 上传
+  `frankleeeee/RollingForcing-Wan2.1-T2V-1.3B-Diffusers`（private），CI 条目本身仍未加）。
 - 流式 serving 集成（逐 chunk 会话 API、流式 VAE 解码）——目前仅离线
   批式生成。

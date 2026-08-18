@@ -551,6 +551,30 @@ def test_causal_kv_cache_update_grows_without_rolling_when_enabled():
     assert view.k.flatten().tolist() == [1.0, 2.0, 3.0, 4.0]
 
 
+def test_causal_kv_cache_size_windowed_full_context_and_local_attn():
+    import pytest
+
+    stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
+    stage.num_token_per_frame = 10
+    stage.local_attn_size = -1
+
+    stage.sliding_window_num_frames = 21
+    assert stage._get_causal_kv_cache_size() == 210
+    # A windowed model ignores the total video length.
+    assert stage._get_causal_kv_cache_size(total_num_frames=42) == 210
+
+    # Full-context model (upstream Self-Forcing default): the cache spans
+    # the whole video and the total length is required.
+    stage.sliding_window_num_frames = None
+    assert stage._get_causal_kv_cache_size(total_num_frames=42) == 420
+    with pytest.raises(ValueError, match="full-context"):
+        stage._get_causal_kv_cache_size()
+
+    # local_attn_size takes precedence over both modes.
+    stage.local_attn_size = 5
+    assert stage._get_causal_kv_cache_size() == 50
+
+
 def test_crossattn_cache_block_stores_detached_tensors_and_resets():
     stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
     stage.num_transformer_blocks = 1

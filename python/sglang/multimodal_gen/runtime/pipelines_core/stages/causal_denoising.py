@@ -7,6 +7,7 @@ from typing import Any
 
 import torch  # type: ignore
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CausalSelfAttentionKVCache,
@@ -162,6 +163,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
         self.sliding_window_num_frames = (
             self.transformer.config.arch_config.sliding_window_num_frames
         )
+        # Draw counter for the numerical-parity test hook (see
+        # SGLANG_DIFFUSION_TEST_PARITY_DIR); reset per offline request.
+        self._parity_renoise_idx = 0
 
         try:
             self.local_attn_size = getattr(
@@ -735,12 +739,27 @@ class CausalDMDDenoisingStage(DenoisingStage):
         scheduler,
         device,
     ) -> torch.Tensor:
-        noise = torch.randn(
-            raw_latent_shape,
-            dtype=x0_btchw.dtype,
-            generator=self._single_generator(batch),
-            device=device,
-        )
+        parity_dir = envs.SGLANG_DIFFUSION_TEST_PARITY_DIR
+        if parity_dir is not None:
+            # Numerical-parity test hook: consume the shared re-noise bank in
+            # draw order (see tools/verify_self_forcing_parity.py).
+            noise = torch.load(
+                f"{parity_dir}/renoise_{self._parity_renoise_idx}.pt",
+                map_location="cpu",
+            ).to(device=device, dtype=x0_btchw.dtype)
+            self._parity_renoise_idx += 1
+            if tuple(noise.shape) != tuple(raw_latent_shape):
+                raise ValueError(
+                    f"parity re-noise shape {tuple(noise.shape)} != "
+                    f"expected {tuple(raw_latent_shape)}"
+                )
+        else:
+            noise = torch.randn(
+                raw_latent_shape,
+                dtype=x0_btchw.dtype,
+                generator=self._single_generator(batch),
+                device=device,
+            )
         return scheduler.add_noise(
             x0_btchw.flatten(0, 1),
             noise.flatten(0, 1),
@@ -1133,9 +1152,20 @@ class CausalDMDDenoisingStage(DenoisingStage):
         self,
         *,
         sequence_shard_enabled: bool = False,
+        total_num_frames: int | None = None,
     ) -> int:
         if self.local_attn_size != -1:
             return self.local_attn_size * self.num_token_per_frame
+        if self.sliding_window_num_frames is None:
+            # Full-context model: the cache must span the whole video.
+            if total_num_frames is None:
+                raise ValueError(
+                    "sliding_window_num_frames=None (full-context causal "
+                    "attention) requires the total video length to size the "
+                    "KV cache; this model cannot run with an unbounded "
+                    "stream length"
+                )
+            return self.num_token_per_frame * total_num_frames
         return self.num_token_per_frame * self.sliding_window_num_frames
 
     def _get_causal_sink_tokens(self) -> int:
@@ -1231,13 +1261,29 @@ class CausalDMDDenoisingStage(DenoisingStage):
         # TODO(will): make this a parameter once we add i2v support
         independent_first_frame = self.transformer.independent_first_frame
 
-        # Initialize or reset caches
-        if self.causal_kv_cache is None:
+        # Numerical-parity test hook: restart the re-noise draw counter per
+        # request so renoise_<i>.pt files are consumed in generation order.
+        self._parity_renoise_idx = 0
+
+        # Initialize or reset caches. Full-context models
+        # (sliding_window_num_frames=None) size the cache to the whole video,
+        # so the expected size can change between requests.
+        num_context_frames = 0
+        if batch.image_latent is not None:
+            num_context_frames = batch.image_latent.shape[2]
+        expected_kv_cache_size = self._get_causal_kv_cache_size(
+            total_num_frames=num_context_frames + t,
+        )
+        if (
+            self.causal_kv_cache is None
+            or self.causal_kv_cache[0].cache_size != expected_kv_cache_size
+        ):
             self._initialize_causal_caches(
                 batch_size=latents.shape[0],
                 max_text_len=self._get_max_text_len(server_args),
                 dtype=target_dtype,
                 device=latents.device,
+                kv_cache_kwargs={"kv_cache_size": expected_kv_cache_size},
             )
         else:
             assert self.crossattn_cache is not None
@@ -1374,6 +1420,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 start_index += current_num_frames
 
         self._flush_attention_maps(batch)
+        parity_dir = envs.SGLANG_DIFFUSION_TEST_PARITY_DIR
+        if parity_dir is not None:
+            torch.save(latents.float().cpu(), f"{parity_dir}/sglang_latents.pt")
         batch.latents = latents
         return batch
 

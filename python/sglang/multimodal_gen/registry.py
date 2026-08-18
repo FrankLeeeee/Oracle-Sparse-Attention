@@ -851,8 +851,7 @@ def _register_configs():
     # Self-Forcing (guandeh17/Self-Forcing) — Wan2.1-T2V-1.3B causal DMD, the
     # ancestor of Causal Forcing; identical chunk-wise inference geometry, so
     # it reuses the Causal Forcing pipeline/config classes. Checkpoints are
-    # local dirs produced by tools/convert_forcing_to_diffusers.py
-    # (--preset self-forcing).
+    # local dirs produced by tools/convert_self_forcing_to_diffusers.py.
     register_configs(
         sampling_param_cls=CausalForcingT2VSamplingParams,
         pipeline_config_cls=CausalForcingWanT2V480PConfig,
