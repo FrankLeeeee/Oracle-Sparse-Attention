@@ -20,7 +20,11 @@ from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    from sgl_kernel import qserve_w4a8_per_chn_gemm, qserve_w4a8_per_group_gemm
+    try:
+        from sgl_kernel import qserve_w4a8_per_chn_gemm, qserve_w4a8_per_group_gemm
+    except ImportError:  # sgl_kernel builds without the QServe kernels
+        qserve_w4a8_per_chn_gemm = None
+        qserve_w4a8_per_group_gemm = None
 
 
 QoQ_SUPPORTED_WEIGHT_BITS = [4]
