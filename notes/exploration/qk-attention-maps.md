@@ -31,10 +31,21 @@ sglang generate \
 
 ## 绘图命令
 
+（2026-08-18 更新：探针支持按去噪步采集——`SGLANG_DIFFUSION_ATTENTION_MAP_QK_STEPS`
+指定步编号（默认 `0`）、`SGLANG_DIFFUSION_ATTENTION_MAP_QK_LAYERS` 限定层；
+每个 (chunk, step) 写一个 `qk_chunk_<c>_step_<s>.npz`（`scores
+[layers, heads, queries, keys]`，按 step 分文件是因为 Rolling Forcing
+ramp-up 窗口的 query 几何随 step 变化），并新增
+`coverage [layers, heads, queries]`——每个 query 行在**完整** key 轴上
+累计概率超过 0.9 所需的最少 top-k token 数。旧的
+`plot_qk_attention_maps` / `plot_chunk_attention_maps` /
+`plot_token_attention_maps` / `plot_token_attention_bars` 已移除，绘图统一用
+`plot_attention_token_maps`。）
+
 ```bash
-python -m sglang.multimodal_gen.tools.plot_qk_attention_maps <run_dir> \
-    [--chunks 7,13] [--layers 0,10,20,29] [--heads 0-11] [--out-dir ...]
-# -> <run_dir>/qk_plots/chunk_XXX_layer_YY_head_ZZ.png
+python -m sglang.multimodal_gen.tools.plot_attention_token_maps <run_dir> \
+    [--chunks 7,13] [--steps 0,1,3] [--layers 15] [--heads 0-4] [--out-dir ...]
+# -> <run_dir>/token_map_plots/chunk_XXX_step_S_layer_YY_head_ZZ.png
 ```
 
 每张图是一个 (chunk, layer, head) 的 query × key 矩阵（对数色标）：

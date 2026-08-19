@@ -350,6 +350,10 @@ class RollingForcingDenoisingStage(CausalDMDDenoisingStage):
                 )
                 if progress_bar is not None:
                     progress_bar.update()
+                # One window advance = one joint denoising step over the
+                # window; advance the torch-profiler schedule accordingly,
+                # else --profile never leaves warmup and dumps an empty trace.
+                self.step_profile()
 
         self._flush_attention_maps(batch)
         batch.latents = output

@@ -659,6 +659,10 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
 
                 if progress_bar is not None:
                     progress_bar.update()
+            # Advance the torch-profiler schedule exactly like the base
+            # DenoisingStage loop does; without this, --profile never leaves
+            # its warmup phase on this stage and dumps an empty trace.
+            self.step_profile()
 
         return current_latents, attn_metadata
 
@@ -774,6 +778,9 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
 
                 if progress_bar is not None:
                     progress_bar.update()
+            # See the non-CFG loop above: keep the torch-profiler schedule
+            # advancing once per denoising step.
+            self.step_profile()
 
         return current_latents, attn_metadata
 

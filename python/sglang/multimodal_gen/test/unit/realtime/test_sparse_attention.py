@@ -936,3 +936,73 @@ def test_osa_runs_dense_until_the_reference_chunk_then_freezes_its_policy():
     backend.begin_forward(_geometry(5))
     backend.attend(call)
     assert backend.policies[0] is frozen  # never recalibrated
+
+
+@requires_cuda
+def test_osa_replicate_freezes_the_last_chunk0_step_and_replicates():
+    """The replicate policy: chunk 0's *last* denoising step is the oracle,
+    the frozen per-head tile set repeats in every non-full frame, the achieved
+    density tracks the requested one, and the gather + FA3 execution matches a
+    masked reference."""
+    from sglang.multimodal_gen.runtime.layers.attention.sparse.replicate_kernel import (
+        ReplicateGatherPlan,
+    )
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    backend = build_sparse_attention_backend(
+        "osa",
+        {
+            "granularity": "replicate",
+            "density": 0.4,
+            "num_recent_frames": 1,
+            "sink_latent_frames": 1,
+            "spatial_tile": 64,
+            "calibration_query_stride": 4,
+        },
+    )
+
+    backend.begin_forward(_geometry(0))
+    for _ in range(3):  # denoising steps of chunk 0 run dense while measuring
+        assert backend.attend(_self_forcing_call(device, chunk_index=0)) is None
+    frozen = backend._spatial_mass[0].clone()
+    with backend.cache_update_scope():  # the KV refresh must not overwrite
+        assert backend.attend(_self_forcing_call(device, chunk_index=0)) is None
+    assert torch.equal(backend._spatial_mass[0], frozen)
+
+    chunk_index = 9
+    call = _self_forcing_call(device, chunk_index=chunk_index)
+    backend.begin_forward(_geometry(chunk_index))
+    out = backend.attend(call)
+    assert out is not None and out.shape == call.query.shape
+
+    plan = backend._plans._entries[0][1]
+    assert isinstance(plan, ReplicateGatherPlan)
+    kv_len = call.key.shape[1]
+    heads = call.query.shape[2]
+    allow = torch.zeros(heads, kv_len, dtype=torch.bool, device=device)
+    allow.scatter_(1, plan.indices, True)
+    num_frames = kv_len // FRAME_SEQLEN
+    frames = allow.view(heads, num_frames, FRAME_SEQLEN)
+    # own chunk, sink frame and the recent frame are whole ...
+    assert frames[:, -FRAMES_PER_BLOCK:].all() and frames[:, 0].all()
+    assert frames[:, -FRAMES_PER_BLOCK - 1].all()
+    # ... and every other frame repeats one per-head tile pattern.
+    for frame in range(2, num_frames - FRAMES_PER_BLOCK - 1):
+        assert torch.equal(frames[:, frame], frames[:, 1])
+    density = allow.float().mean().item()
+    assert abs(density - 0.4) < 0.1
+    assert abs(plan.density - density) < 1e-6
+
+    # The gather + FA3 execution computes exactly the masked attention.
+    scores = (
+        torch.einsum("qhd,khd->hqk", call.query[0].float(), call.key[0].float())
+        * call.softmax_scale
+    )
+    scores = scores.masked_fill(~allow[:, None, :], float("-inf"))
+    reference = torch.softmax(scores, dim=-1) @ call.value[0].float().permute(
+        1, 0, 2
+    )
+    torch.testing.assert_close(
+        out[0].float(), reference.permute(1, 0, 2), atol=3e-2, rtol=3e-2
+    )

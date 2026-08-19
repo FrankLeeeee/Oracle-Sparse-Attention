@@ -9,6 +9,9 @@ import torch  # type: ignore
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.layers.attention.sparse import (
+    get_sparse_attention_backend,
+)
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CausalSelfAttentionKVCache,
     CrossAttentionKVCache,
@@ -871,7 +874,13 @@ class CausalDMDDenoisingStage(DenoisingStage):
             if recorder is not None
             else nullcontext()
         )
-        with pass_scope:
+        sparse_backend = get_sparse_attention_backend()
+        sparse_scope = (
+            sparse_backend.cache_update_scope()
+            if sparse_backend is not None
+            else nullcontext()
+        )
+        with pass_scope, sparse_scope:
             self._forward_causal_transformer(
                 batch,
                 latent_model_input=context_input.to(target_dtype),

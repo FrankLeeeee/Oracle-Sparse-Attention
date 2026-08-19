@@ -10,6 +10,7 @@ would keep everything anyway.
 """
 
 import abc
+from contextlib import contextmanager
 from typing import ClassVar
 
 import msgspec
@@ -92,6 +93,29 @@ class SparseAttentionBackend(abc.ABC):
         self._sparse_calls = 0
         self._dense_calls = 0
         self._calls_since_report = 0
+        self._in_cache_update = False
+
+    @contextmanager
+    def cache_update_scope(self):
+        """Tag the forwards run inside the block as clean-latent KV refreshes.
+
+        Block-causal pipelines run two flavors of DiT forward per chunk: the
+        denoising steps and a final clean-latent pass that refreshes the KV
+        cache. Methods that calibrate on denoising activations (OSA) must not
+        observe the refresh pass, and methods can choose to run it dense —
+        its hidden states feed the K/V that every later chunk reads, so
+        sparsification errors there compound instead of decaying.
+        """
+        previous = self._in_cache_update
+        self._in_cache_update = True
+        try:
+            yield
+        finally:
+            self._in_cache_update = previous
+
+    @property
+    def in_cache_update(self) -> bool:
+        return self._in_cache_update
 
     def begin_forward(self, geometry: ChunkGeometry) -> None:
         """Stamp the geometry shared by every layer of one DiT forward."""
@@ -144,7 +168,13 @@ class SparseAttentionBackend(abc.ABC):
     ) -> SparseAttentionExecution | None:
         """Decide what to run for this call, or ``None`` for dense."""
 
-    def _record_density(self, plan: SparseAttentionPlan | None, *, kv_len: int) -> None:
+    def _record_density(
+        self,
+        plan: SparseAttentionPlan | None,
+        *,
+        kv_len: int,
+        fraction: float | None = None,
+    ) -> None:
         """Accumulate the fraction of keys actually read, and log it now and then.
 
         The density a method *achieves on real activations* is the number every
@@ -153,21 +183,30 @@ class SparseAttentionBackend(abc.ABC):
         count as fully dense, so the running figure covers the whole run rather
         than only its sparse part. Accumulating on device costs a few
         microseconds; the host sync happens once every
-        ``_DENSITY_REPORT_INTERVAL`` calls.
+        ``_DENSITY_REPORT_INTERVAL`` calls. A method that knows its exact read
+        fraction analytically (OSA's replicate gather) passes ``fraction``
+        instead of a plan.
         """
-        if plan is None:
+        if plan is None and fraction is None:
             self._dense_calls += 1
         else:
             self._sparse_calls += 1
             if self._sparse_calls % _DENSITY_SAMPLE_INTERVAL == 1:
-                heads, q_blocks = plan.range_counts.shape
-                fraction = plan.kept_tokens().sum().float() / float(
-                    heads * q_blocks * kv_len
-                )
-                fraction = fraction.clamp(max=1.0)
+                if fraction is not None:
+                    sampled = torch.tensor(min(fraction, 1.0))
+                else:
+                    heads, q_blocks = plan.range_counts.shape
+                    sampled = plan.kept_tokens().sum().float() / float(
+                        heads * q_blocks * kv_len
+                    )
+                    sampled = sampled.clamp(max=1.0)
                 if self._sampled_density_sum is None:
-                    self._sampled_density_sum = torch.zeros_like(fraction)
-                self._sampled_density_sum += fraction
+                    self._sampled_density_sum = torch.zeros_like(
+                        sampled, device=sampled.device
+                    )
+                self._sampled_density_sum = (
+                    self._sampled_density_sum.to(sampled.device) + sampled
+                )
                 self._density_samples += 1
         self._calls_since_report += 1
         if self._calls_since_report < _DENSITY_REPORT_INTERVAL:

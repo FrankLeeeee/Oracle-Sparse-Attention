@@ -86,6 +86,11 @@ from sglang.multimodal_gen.runtime.layers.attention.sparse.kernel import (
     plan_from_segment_mask,
     plan_from_shared_ranges,
 )
+from sglang.multimodal_gen.runtime.layers.attention.sparse.replicate_kernel import (
+    ReplicateGatherPlan,
+    build_gather_plan,
+    replicate_gather_attention,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -117,6 +122,33 @@ class OsaConfig(msgspec.Struct, frozen=True):
     # Sink size in latent frames; None falls back to sink_chunks whole chunks.
     # Frame granularity usually wants 1 (the classic first-frame sink).
     sink_latent_frames: int | None = None
+    # --- "replicate" granularity (2026-08-18) ---------------------------------
+    # Rests on the observation that a head's attention map is a *replication of
+    # one frame-to-frame pattern*: the within-frame spatial structure of the
+    # mass a head sends to a key frame is the same for every (query frame, key
+    # frame) pair, at every chunk and (once settled) every denoising step. So
+    # the pattern is measured ONCE — on the last denoising step of chunk 0,
+    # before any history exists — as per-head mass over spatial key *tiles*
+    # folded modulo the frame, and replicated across every visible frame of
+    # every later chunk. `density` (fraction of visible keys read; exactly one
+    # of density/sparsity may be set, sparsity = 1 - density) is met exactly by
+    # construction: the query's own chunk, `sink_latent_frames` and
+    # `num_recent_frames` are always kept whole, and the remaining token budget
+    # buys each head its top-mass tiles, the same tile set in every other
+    # frame.
+    density: float | None = None
+    sparsity: float | None = None
+    # Most-recent past latent frames kept whole (the diagonal band every
+    # measured head shows), counted against the density budget.
+    num_recent_frames: int = 2
+    # Run the clean-latent KV-refresh pass dense. Its hidden states feed the
+    # K/V every later chunk reads, so sparsification errors there compound.
+    # Off by default to keep the read-density comparable with the baselines
+    # (which sparsify that pass too); turn on as a quality lever.
+    dense_cache_update: bool = False
+    # Spatial selection quantum in key tokens; 64 matches the kernel's key
+    # tile, so a kept tile is never partially wasted.
+    spatial_tile: int = 64
     # Re-observe and refresh the frozen policies every N chunks after the
     # reference (0 = calibrate once, the original design). Chunk-relative
     # stationarity holds for *which* offsets a head prefers but not for the
@@ -282,6 +314,48 @@ def measure_query_frame_mass(
         mass.cpu().numpy().astype(np.float64),
         counts.cpu().numpy().astype(np.float64),
     )
+
+
+@torch.no_grad()
+def measure_spatial_tile_mass(
+    *,
+    query: torch.Tensor,  # [batch, q_len, heads, head_dim]
+    key: torch.Tensor,  # [batch, kv_len, heads, head_dim]
+    layout: VisibleLayout,
+    softmax_scale: float,
+    query_stride: int,
+    query_tile: int,
+    spatial_tile: int,
+) -> torch.Tensor:
+    """Mean attention mass per within-frame spatial tile: ``[heads, tiles]``.
+
+    Folds the key axis modulo the frame — summing a head's probabilities over
+    all visible frames and all sampled queries — so the result is the
+    frame-to-frame pattern the replicate policy freezes. Rows sum to ~1.
+    Stays on device; the caller decides when (if ever) to sync.
+    """
+    frame_seqlen = layout.frame_seqlen
+    num_frames = layout.num_frames
+    num_tiles = (frame_seqlen + spatial_tile - 1) // spatial_tile
+    sampled = query[:1, ::query_stride]
+    keys = key[:1]
+    num_heads = query.shape[2]
+    spatial_mass = torch.zeros(
+        num_heads, frame_seqlen, dtype=torch.float32, device=query.device
+    )
+    num_sampled = sampled.shape[1]
+    for tile_start in range(0, num_sampled, query_tile):
+        tile = sampled[:, tile_start : tile_start + query_tile]
+        scores = torch.einsum("bqhd,bkhd->hqk", tile.float(), keys.float())
+        probs = torch.softmax(scores * softmax_scale, dim=-1)
+        folded = probs.view(num_heads, -1, num_frames, frame_seqlen).sum((1, 2))
+        spatial_mass += folded
+    spatial_mass /= max(num_sampled, 1)
+    padded = torch.zeros(
+        num_heads, num_tiles * spatial_tile, dtype=torch.float32, device=query.device
+    )
+    padded[:, :frame_seqlen] = spatial_mass
+    return padded.view(num_heads, num_tiles, spatial_tile).sum(-1)
 
 
 def measure_chunk_relative_mass(
@@ -634,16 +708,37 @@ class OracleSparseAttention(SparseAttentionBackend):
 
     def __init__(self, config: OsaConfig) -> None:
         super().__init__()
-        if config.granularity not in ("chunk", "frame", "dt"):
+        if config.granularity not in ("chunk", "frame", "dt", "replicate"):
             raise ValueError(
-                "granularity must be 'chunk', 'frame' or 'dt', got "
-                f"{config.granularity!r}"
+                "granularity must be 'chunk', 'frame', 'dt' or 'replicate', "
+                f"got {config.granularity!r}"
             )
         if config.recalibrate_every < 0:
             raise ValueError("recalibrate_every must be non-negative")
+        if config.density is not None and config.sparsity is not None:
+            raise ValueError("set either density or sparsity, not both")
+        if config.granularity == "replicate":
+            density = (
+                config.density
+                if config.density is not None
+                else (1.0 - config.sparsity if config.sparsity is not None else None)
+            )
+            if density is None or not 0.0 < density <= 1.0:
+                raise ValueError(
+                    "granularity='replicate' needs density in (0, 1] "
+                    "(or the equivalent sparsity in [0, 1))"
+                )
+            self._density = density
         self._config = config
         self._frame_granular = config.granularity == "frame"
         self._dt_granular = config.granularity == "dt"
+        self._replicate = config.granularity == "replicate"
+        # layer -> [heads, tiles] spatial mass, overwritten at every denoise
+        # step of chunk 0 so the surviving measurement is the last step's.
+        self._spatial_mass: dict[int, torch.Tensor] = {}
+        # layer -> [heads, tiles] tile indices by descending mass, frozen at
+        # the first post-calibration chunk.
+        self._tile_order: dict[int, torch.Tensor] = {}
         self._policies: dict[int, HeadPolicies | PatternHeadPolicies] = {}
         # Chunk each layer's policies were last observed at.
         self._calibrated_at: dict[int, int] = {}
@@ -667,6 +762,8 @@ class OracleSparseAttention(SparseAttentionBackend):
         self._policies.clear()
         self._calibrated_at.clear()
         self._calibration_window_start.clear()
+        self._spatial_mass.clear()
+        self._tile_order.clear()
         self._plans.clear()
         self._last_chunk_index = -1
         self._logged_summary = False
@@ -678,6 +775,11 @@ class OracleSparseAttention(SparseAttentionBackend):
     def prepare(
         self, call: SparseAttentionCall, layout: VisibleLayout
     ) -> SparseAttentionExecution | None:
+        if self._replicate:
+            raise RuntimeError(
+                "replicate mode executes through attend() (gather + FA3), "
+                "not through the shared-kernel prepare() path"
+            )
         chunk_index = layout.query_chunk_index
         reference = self._config.reference_chunk
         if chunk_index < reference:
@@ -717,6 +819,169 @@ class OracleSparseAttention(SparseAttentionBackend):
             return None
         return SparseAttentionExecution(
             plan=plan, query=call.query, key=call.key, value=call.value
+        )
+
+    def attend(self, call: SparseAttentionCall) -> torch.Tensor | None:
+        """Replicate mode executes via gather + FA3 varlen (2x the shared
+        range kernel on its scattered-tile plans); other granularities use the
+        base class path unchanged."""
+        if not self._replicate:
+            return super().attend(call)
+        layout = self._layout(call)
+        if layout is None:
+            return None
+        plan = self._prepare_replicate(call, layout)
+        if plan is None:
+            self._record_density(None, kv_len=call.key.shape[1])
+            return None
+        self._record_density(None, kv_len=call.key.shape[1], fraction=plan.density)
+        return replicate_gather_attention(
+            query=call.query,
+            key=call.key,
+            value=call.value,
+            plan=plan,
+            softmax_scale=call.softmax_scale,
+        )
+
+    def _prepare_replicate(
+        self, call: SparseAttentionCall, layout: VisibleLayout
+    ) -> ReplicateGatherPlan | None:
+        if self._config.dense_cache_update and self.in_cache_update:
+            return None
+        if layout.query_chunk_index == 0:
+            # Chunk 0 runs dense; every denoising step overwrites the
+            # measurement so the frozen pattern is the last step's, which is
+            # when the per-head pattern has settled. The clean-latent
+            # KV-refresh pass runs after the last step and must not overwrite.
+            if not self.in_cache_update:
+                self._spatial_mass[call.layer_index] = measure_spatial_tile_mass(
+                    query=call.query,
+                    key=call.key,
+                    layout=layout,
+                    softmax_scale=call.softmax_scale,
+                    query_stride=self._config.calibration_query_stride,
+                    query_tile=self._config.calibration_query_tile,
+                    spatial_tile=self._config.spatial_tile,
+                )
+            return None
+        order = self._tile_order.get(call.layer_index)
+        if order is None:
+            mass = self._spatial_mass.get(call.layer_index)
+            if mass is None:
+                self.warn_dense_once(
+                    f"layer {call.layer_index} was never calibrated "
+                    "(chunk 0 not seen)"
+                )
+                return None
+            # The frame's short tail tile (when frame_seqlen % spatial_tile
+            # != 0) is excluded from selection so every head keeps exactly the
+            # same token count — the gather execution needs a uniform varlen
+            # batch. Whole frames still include the tail.
+            full_tiles = layout.frame_seqlen // self._config.spatial_tile
+            order = torch.argsort(
+                mass[:, :full_tiles], dim=1, descending=True
+            )
+            self._tile_order[call.layer_index] = order
+            self._spatial_mass.pop(call.layer_index, None)
+        return self._replicate_plan(call, layout, order)
+
+    def _replicate_plan(
+        self,
+        call: SparseAttentionCall,
+        layout: VisibleLayout,
+        order: torch.Tensor,  # [heads, full_tiles] tile ids by descending mass
+    ) -> ReplicateGatherPlan | None:
+        signature = (
+            call.key_segments,
+            layout.query_frames,
+            call.head_start,
+            call.num_local_heads,
+        )
+        hit, cached = self._plans.get(call.layer_index, signature)
+        if hit:
+            return cached
+        num_heads, num_tiles = order.shape
+        if num_heads != call.num_local_heads:
+            self.warn_dense_once(
+                f"calibrated {num_heads} heads but layer "
+                f"{call.layer_index} has {call.num_local_heads}"
+            )
+            return None
+        frame_seqlen = layout.frame_seqlen
+        tile_size = self._config.spatial_tile
+        num_frames = layout.num_frames
+        device = order.device
+
+        # Frames kept whole: the query's own chunk, the sink, and the most
+        # recent past frames. Everything else gets the replicated tile set.
+        ages = frame_ages(layout)
+        full = (
+            layout.own_frames
+            | layout.sink_frames(self._sink_frames())
+            | ((ages > 0) & (ages <= self._config.num_recent_frames))
+        )
+        num_full = int(full.sum())
+        num_other = num_frames - num_full
+        budget = self._density * num_frames * frame_seqlen
+        remaining = budget - num_full * frame_seqlen
+        if num_other == 0 or remaining >= num_other * frame_seqlen:
+            plan = None  # everything is kept — dense is strictly better
+        else:
+            tiles_kept = min(
+                max(0, int(round(remaining / (num_other * tile_size)))),
+                num_tiles,
+            )
+            full_frames = torch.from_numpy(full).to(device)
+            frame_starts = (
+                torch.arange(num_frames, dtype=torch.int64, device=device)
+                * frame_seqlen
+            )
+            # Whole frames: every token, identical for all heads.
+            full_tokens = (
+                frame_starts[full_frames][:, None]
+                + torch.arange(frame_seqlen, dtype=torch.int64, device=device)
+            ).reshape(-1)
+            # Replicated tiles: each head's top tiles in every other frame.
+            kept_offsets = (
+                order[:, :tiles_kept].to(torch.int64)[:, :, None] * tile_size
+                + torch.arange(tile_size, dtype=torch.int64, device=device)
+            ).reshape(num_heads, -1)  # [heads, tiles_kept * tile]
+            other_starts = frame_starts[~full_frames]
+            replicated = (
+                other_starts[None, :, None] + kept_offsets[:, None, :]
+            ).reshape(num_heads, -1)
+            indices = torch.cat(
+                [
+                    full_tokens[None, :].expand(num_heads, -1),
+                    replicated,
+                ],
+                dim=1,
+            )
+            indices, _ = torch.sort(indices, dim=1)
+            plan = build_gather_plan(
+                indices=indices,
+                q_len=call.query.shape[1],
+                kv_len=layout.kv_len,
+            )
+        self._plans.put(call.layer_index, signature, plan)
+        self._log_replicate_summary(layout)
+        return plan
+
+    def _log_replicate_summary(self, layout: VisibleLayout) -> None:
+        # Freezing is lazy per layer during the first post-calibration chunk;
+        # wait one more chunk so the count covers every layer.
+        if self._logged_summary or layout.query_chunk_index < 2:
+            return
+        self._logged_summary = True
+        logger.info(
+            "OSA (replicate) frozen from chunk 0's last denoising step: "
+            "%d layers, target density %.2f, %d recent + %d sink frames kept "
+            "whole; visible window %d frames",
+            len(self._tile_order),
+            self._density,
+            self._config.num_recent_frames,
+            self._sink_frames(),
+            layout.num_frames,
         )
 
     def _sink_frames(self) -> int:
