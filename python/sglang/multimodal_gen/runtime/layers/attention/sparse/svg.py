@@ -31,15 +31,17 @@ from sglang.multimodal_gen.runtime.layers.attention.sparse.base import (
     SparseAttentionCall,
     SparseAttentionExecution,
 )
-from sglang.multimodal_gen.runtime.layers.attention.sparse.blocks import (
-    block_bounds,
-    own_block_mask,
+from sglang.multimodal_gen.runtime.layers.attention.sparse.blocks import block_bounds
+from sglang.multimodal_gen.runtime.layers.attention.sparse.context import (
+    ChunkGeometry,
+    VisibleLayout,
 )
-from sglang.multimodal_gen.runtime.layers.attention.sparse.context import VisibleLayout
 from sglang.multimodal_gen.runtime.layers.attention.sparse.kernel import (
-    plan_from_block_mask,
     plan_from_segment_mask,
     sparse_attention,
+)
+from sglang.multimodal_gen.runtime.layers.attention.sparse.lightforcing import (
+    frame_aligned_block_bounds,
 )
 
 
@@ -48,9 +50,10 @@ class Svg1Config(msgspec.Struct, frozen=True):
     # Upstream's `block_thres`, as a multiple of the frame length: both masks are
     # token-distance bands of half-width `band_frames * frame_seqlen`, the
     # spatial one in natural (frame-major) order and the temporal one in
-    # spatial-major order. `svg/models/wan/utils.py` hard-codes
-    # `block_thres = frame_size * 2`, so 2.0 is upstream's setting and the knob
-    # to turn for a sparsity sweep.
+    # spatial-major order. Upstream hard-codes its *profiling* masks at 2
+    # frames (`svg/models/wan/utils.py`) but executes a band derived from its
+    # `sparsity` knob via `sparsity_to_width`; here one width drives both
+    # scoring and execution, and it is the knob to turn for a sparsity sweep.
     band_frames: float = 2.0
     # Upstream's `pixel_attn_mask[:, :frame_size] = 1` — the first frame of the
     # video is a sink for *both* candidate masks.
@@ -59,14 +62,29 @@ class Svg1Config(msgspec.Struct, frozen=True):
     # samples 32 individual rows; whole blocks keep the profiling pass on the
     # block-sparse fast path, and two of them is the nearest equivalent cost.
     num_sampled_blocks: int = 2
+    # Key-segment granularity of the executed masks, in tokens. The temporal
+    # mask keeps a narrow spatial-cell interval of every visible frame, so its
+    # per-frame ranges quantize on this grid; 32 keeps the quantization loss
+    # a few percent while adjacent kept segments still merge into one kernel
+    # range each.
+    key_tile: int = 32
 
 
 class Svg2Config(msgspec.Struct, frozen=True):
     block: int = 128
     # Average keys per semantic cluster; the cluster count follows from the
-    # history length.
+    # history length. Upstream's Wan config works out to ~33 tokens/cluster on
+    # a fixed 33k-token clip; a constant tokens-per-cluster would make the
+    # assignment matmul quadratic in KV length on these unbounded-KV runs, so
+    # the default trades cluster resolution for a bounded planning cost.
     cluster_size: int = 256
+    # Cold-start iterations for a layer's first clustering, and the warm
+    # iterations used when the previous chunk's centroids seed the next one
+    # (upstream's `kmeans_step` warm-starts from cached centroids the same
+    # way; the history only grows by one chunk between refits). 0 warm
+    # iterations disables the warm start.
     kmeans_iters: int = 4
+    kmeans_warm_iters: int = 2
     top_p: float = 0.9
 
 
@@ -120,77 +138,123 @@ def _spatial_major_index(
     return (tokens % frame_seqlen) * num_frames + tokens // frame_seqlen
 
 
-def build_svg1_masks(
+def chunk_spatial_major_permutation(
+    *, q_len: int, frame_seqlen: int, device: torch.device
+) -> torch.Tensor:
+    """Spatial-major order of the chunk's own queries: ``[q_len]`` long.
+
+    Sorts the chunk's tokens by (spatial cell, frame), which is upstream's
+    temporal-head placement restricted to the query side. A 128-query block
+    then covers ~``128 / query_frames`` consecutive spatial cells instead of
+    128, which is what keeps the per-block union of the spatial-major band
+    narrow.
+    """
+    tokens = torch.arange(q_len, device=device)
+    query_frames = q_len // frame_seqlen
+    spatial_major = (tokens % frame_seqlen) * query_frames + tokens // frame_seqlen
+    return torch.argsort(spatial_major)
+
+
+def build_svg1_segment_masks(
     *,
     layout: VisibleLayout,
     q_len: int,
     kv_len: int,
     config: Svg1Config,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``(spatial, temporal)`` ``[q_blocks, key_blocks]`` masks for one layout.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(spatial, temporal, query_permutation)`` for one visible layout.
 
-    The same two masks as :func:`svg1_token_masks`, reduced to blocks by "keep a
-    block pair if any of its token pairs is kept" — the convention upstream's own
-    block-level execution path uses. Built one query block at a time so the
-    intermediate is ``[block, kv_len]`` rather than ``[kv_len, kv_len]``, which is
-    what makes it affordable at Wan's geometry.
+    Both masks are ``[q_blocks, segments]`` over frame-aligned ``key_tile``
+    segments (:func:`frame_aligned_block_bounds`). The token-level masks are
+    exactly :func:`svg1_token_masks`'s; what this builder chooses is the
+    *executed* reduction, and two choices keep the temporal mask's executed
+    density near its token density instead of collapsing to ~2x it (the fate
+    of a global 128-block any-overlap reduction, 0.42 vs 0.22 at Self-Forcing
+    geometry):
+
+    * temporal rows are taken in **spatial-major query order** — upstream's
+      head placement applied to the query side only, keys stay in place; the
+      returned permutation applies to temporal-classified heads' queries and
+      the executed rows of ``temporal[b]`` are ``query_permutation[b*block :
+      (b+1)*block]``;
+    * the key axis is quantized on per-frame ``key_tile`` segments, so the
+      per-frame spatial-cell interval the band solves to is kept at token
+      rather than 128-block resolution.
     """
     block = config.block
+    tile = config.key_tile
     frame_seqlen = layout.frame_seqlen
     num_frames = layout.num_frames
     band_blocks = int(config.band_frames * frame_seqlen) // block
     offset = kv_len - q_len  # the chunk's queries are the last keys of the view
+    sink = config.dense_sink_frames > 0
 
-    keys = torch.arange(kv_len, device=device)
-    key_block = keys // block
-    key_spatial_major = _spatial_major_index(
-        keys, frame_seqlen=frame_seqlen, num_frames=num_frames
+    seg_lo, seg_hi = frame_aligned_block_bounds(
+        num_frames=num_frames,
+        frame_seqlen=frame_seqlen,
+        block=tile,
+        device=device,
     )
-    sink_columns = keys < frame_seqlen if config.dense_sink_frames > 0 else None
-    sink_columns_permuted = (
-        key_spatial_major < frame_seqlen if config.dense_sink_frames > 0 else None
-    )
+    frames = torch.arange(num_frames, device=device)
+    tiles_per_frame = -(-frame_seqlen // tile)
+    within_lo = seg_lo[:tiles_per_frame]  # spatial-cell tile bounds in one frame
+    within_hi = seg_hi[:tiles_per_frame].clamp(max=frame_seqlen)
 
+    def overlapping(a: int, b: int) -> torch.Tensor:
+        """Segments overlapping view-token interval ``[a, b)``: ``[segments]``."""
+        return (seg_hi > a) & (seg_lo < b)
+
+    permutation = chunk_spatial_major_permutation(
+        q_len=q_len, frame_seqlen=frame_seqlen, device=device
+    )
     q_lo, q_hi = block_bounds(q_len, block, device=device)
-    num_key_blocks = -(-kv_len // block)
-    spatial_columns = []
-    temporal_columns = []
+    spatial_rows = []
+    temporal_rows = []
     for lo, hi in zip(q_lo.tolist(), q_hi.tolist(), strict=True):
-        rows = torch.arange(lo + offset, hi + offset, device=device)
-        natural = ((rows[:, None] // block) - key_block[None, :]).abs() < band_blocks
-        if sink_columns is not None:
-            natural |= sink_columns[None, :]
-        spatial_columns.append(natural.any(dim=0))
-
-        rows_spatial_major = _spatial_major_index(
-            rows, frame_seqlen=frame_seqlen, num_frames=num_frames
+        # Natural-order band, block-quantized on the global grid exactly as
+        # upstream states it; as a token set it is one interval per query block.
+        rlo, rhi = lo + offset, hi + offset
+        row_block_min, row_block_max = rlo // block, (rhi - 1) // block
+        spatial = overlapping(
+            max(0, (row_block_min - band_blocks + 1) * block),
+            min(kv_len, (row_block_max + band_blocks) * block),
         )
-        permuted = (
-            (rows_spatial_major[:, None] // block)
-            - (key_spatial_major[None, :] // block)
-        ).abs() < band_blocks
-        if sink_columns_permuted is not None:
-            permuted |= sink_columns_permuted[None, :]
-        temporal_columns.append(permuted.any(dim=0))
+        if sink:
+            spatial = spatial | overlapping(0, frame_seqlen)
+        spatial_rows.append(spatial | overlapping(rlo, rhi))
 
-    def _to_blocks(columns: list[torch.Tensor]) -> torch.Tensor:
-        stacked = torch.stack(columns)  # [q_blocks, kv_len]
-        padded = torch.nn.functional.pad(
-            stacked, (0, num_key_blocks * block - kv_len)
+        # Spatial-major band over sm = cell * F + f, for the *permuted* rows
+        # of this block. Row-to-row sm steps are < block, so the union over
+        # the block's rows fills the sm-block interval; the kept token set per
+        # frame f is then the spatial-cell interval that sm in [A, B) solves
+        # to, exact on the tile grid.
+        rows = permutation[lo:hi] + offset
+        sm = (rows % frame_seqlen) * num_frames + rows // frame_seqlen
+        sm_block_min = int(sm.min()) // block
+        sm_block_max = int(sm.max()) // block
+        band_lo = max(0, (sm_block_min - band_blocks + 1) * block)
+        band_hi = min(num_frames * frame_seqlen, (sm_block_max + band_blocks) * block)
+        cell_lo = ((band_lo - frames + num_frames - 1) // num_frames).clamp(min=0)
+        cell_hi = ((band_hi - frames + num_frames - 1) // num_frames).clamp(
+            min=0, max=frame_seqlen
         )
-        return padded.view(len(columns), num_key_blocks, block).amax(dim=-1)
+        kept = (within_hi[None, :] > cell_lo[:, None]) & (
+            within_lo[None, :] < cell_hi[:, None]
+        )
+        if sink:
+            # Upstream applies the sink before the permutation, so the
+            # temporal sink is sm < frame_seqlen: the lowest spatial cells of
+            # every frame, not the first frame.
+            sink_hi = (frame_seqlen - frames + num_frames - 1) // num_frames
+            kept |= within_lo[None, :] < sink_hi[:, None]
+        temporal = kept.reshape(-1)
+        if band_blocks < 1:
+            # Degenerate band: guarantee each permuted row still sees itself.
+            temporal = temporal | overlapping(int(rows.min()), int(rows.max()) + 1)
+        temporal_rows.append(temporal)
 
-    own = own_block_mask(
-        q_lo=q_lo,
-        q_hi=q_hi,
-        k_lo=torch.arange(num_key_blocks, device=device) * block,
-        k_hi=((torch.arange(num_key_blocks, device=device) + 1) * block).clamp(
-            max=kv_len
-        ),
-        query_offset_in_view=offset,
-    )
-    return _to_blocks(spatial_columns) | own, _to_blocks(temporal_columns) | own
+    return torch.stack(spatial_rows), torch.stack(temporal_rows), permutation
 
 
 def choose_mask_per_head(
@@ -198,14 +262,16 @@ def choose_mask_per_head(
     query: torch.Tensor,  # [batch, q_len, heads, head_dim]
     key: torch.Tensor,
     value: torch.Tensor,
-    candidate_plans: list,  # one SparseAttentionPlan per candidate, sampled rows
-    sampled_rows: torch.Tensor,  # [sampled] long
+    candidates: list,  # (plan, sampled_rows) per candidate
     softmax_scale: float,
 ) -> torch.Tensor:
     """Index of the candidate mask with the lowest error, per head: ``[heads]``.
 
     Upstream's ``sample_mse``: exact attention on a small sample of the queries,
     each candidate mask scored against it by mean squared error, lowest wins.
+    Each candidate's ``sampled_rows`` are in its own executed query order
+    (natural for the spatial mask, spatial-major for the temporal one), so the
+    plan's sampled query blocks line up with the rows they were built for.
 
     Two deviations from ``svg/models/wan/attention.py``, both for cost. Upstream
     samples 32 individual random rows and evaluates the candidates by masking a
@@ -215,16 +281,15 @@ def choose_mask_per_head(
     attention it is choosing. The candidate plans depend only on the visible
     layout, so the caller builds them once per chunk rather than once per step.
     """
-    sampled_query = query[:1, sampled_rows]
-    exact = torch.nn.functional.scaled_dot_product_attention(
-        sampled_query.transpose(1, 2),
-        key[:1].transpose(1, 2),
-        value[:1].transpose(1, 2),
-        scale=softmax_scale,
-    ).transpose(1, 2)
-
     errors = []
-    for plan in candidate_plans:
+    for plan, sampled_rows in candidates:
+        sampled_query = query[:1, sampled_rows]
+        exact = torch.nn.functional.scaled_dot_product_attention(
+            sampled_query.transpose(1, 2),
+            key[:1].transpose(1, 2),
+            value[:1].transpose(1, 2),
+            scale=softmax_scale,
+        ).transpose(1, 2)
         out = sparse_attention(
             query=sampled_query,
             key=key[:1],
@@ -291,52 +356,84 @@ class Svg1Attention(SparseAttentionBackend):
             self._masks.put(0, signature, cached)
         if cached is None:
             return None
-        spatial, temporal, sampled_rows, candidate_plans = cached
+        spatial, temporal, permutation, seg_lo, seg_hi, candidates = cached
 
         choice = choose_mask_per_head(
             query=call.query,
             key=call.key,
             value=call.value,
-            candidate_plans=candidate_plans,
-            sampled_rows=sampled_rows,
+            candidates=candidates,
             softmax_scale=call.softmax_scale,
         )
+        temporal_heads = choice == 1
         keep = torch.where(
-            (choice == 0)[:, None, None], spatial[None], temporal[None]
+            temporal_heads[:, None, None], temporal[None], spatial[None]
         )
-        plan = plan_from_block_mask(
-            keep, block_n=config.block, kv_len=kv_len, block_m=config.block
+        plan = plan_from_segment_mask(
+            keep, segment_starts=seg_lo, segment_ends=seg_hi, block_m=config.block
+        )
+        if not bool(temporal_heads.any()):
+            return SparseAttentionExecution(
+                plan=plan, query=call.query, key=call.key, value=call.value
+            )
+        # Temporal heads' queries execute in spatial-major order (their mask
+        # rows were built for it); keys stay in place, and the base class
+        # scatters the output back through query_permutation.
+        natural = torch.arange(q_len, device=device)
+        index = torch.where(
+            temporal_heads[None, :], permutation[:, None], natural[:, None]
+        )  # [q_len, heads]
+        gathered = call.query.gather(
+            1, index[None, :, :, None].expand_as(call.query)
         )
         return SparseAttentionExecution(
-            plan=plan, query=call.query, key=call.key, value=call.value
+            plan=plan,
+            query=gathered,
+            key=call.key,
+            value=call.value,
+            query_permutation=index[None].expand(call.query.shape[0], -1, -1),
         )
 
     def _build_candidates(self, layout, q_len, kv_len, call, device):
         config = self._config
-        spatial, temporal = build_svg1_masks(
+        spatial, temporal, permutation = build_svg1_segment_masks(
             layout=layout, q_len=q_len, kv_len=kv_len, config=config, device=device
         )
         if bool(spatial.all()) and bool(temporal.all()):
             return None
+        seg_lo, seg_hi = frame_aligned_block_bounds(
+            num_frames=layout.num_frames,
+            frame_seqlen=layout.frame_seqlen,
+            block=config.key_tile,
+            device=device,
+        )
         num_q_blocks = spatial.shape[0]
         sampled_blocks = torch.linspace(
             0, num_q_blocks - 1, min(config.num_sampled_blocks, num_q_blocks),
             device=device,
         ).long()
-        sampled_rows = (
+        natural_rows = (
             sampled_blocks[:, None] * config.block
             + torch.arange(config.block, device=device)
         ).flatten().clamp(max=q_len - 1)
-        candidate_plans = [
-            plan_from_block_mask(
-                candidate[sampled_blocks][None].expand(call.num_local_heads, -1, -1),
-                block_n=config.block,
-                kv_len=kv_len,
-                block_m=config.block,
+        candidates = [
+            (
+                plan_from_segment_mask(
+                    candidate[sampled_blocks][None].expand(
+                        call.num_local_heads, -1, -1
+                    ),
+                    segment_starts=seg_lo,
+                    segment_ends=seg_hi,
+                    block_m=config.block,
+                ),
+                rows,
             )
-            for candidate in (spatial, temporal)
+            for candidate, rows in (
+                (spatial, natural_rows),
+                (temporal, permutation[natural_rows]),
+            )
         ]
-        return spatial, temporal, sampled_rows, candidate_plans
+        return spatial, temporal, permutation, seg_lo, seg_hi, candidates
 
 
 class KeyClustering(msgspec.Struct, frozen=True):
@@ -355,11 +452,24 @@ def cluster_keys(
     num_clusters: int,
     iters: int,
     own_chunk_len: int,
+    initial_centroids: torch.Tensor | None = None,
 ) -> KeyClustering:
-    """k-means over the history keys, packed into contiguous per-head segments."""
+    """k-means over the history keys, packed into contiguous per-head segments.
+
+    ``initial_centroids`` (the previous chunk's fit) warm-starts the iteration:
+    the history only grows by one chunk between refits, so a couple of warm
+    iterations recover what a full cold start would. Extra clusters demanded by
+    the longer history are seeded from the keys as in a cold start.
+    """
     num_heads, history_len, head_dim = keys.shape
     seeds = torch.linspace(0, history_len - 1, num_clusters, device=keys.device).long()
-    centroids = keys[:, seeds].clone()
+    if initial_centroids is None:
+        centroids = keys[:, seeds].clone()
+    else:
+        carried = initial_centroids[:, :num_clusters]
+        centroids = torch.cat(
+            [carried, keys[:, seeds[carried.shape[1] :]]], dim=1
+        )
     labels = torch.zeros(num_heads, history_len, dtype=torch.long, device=keys.device)
     for _ in range(iters):
         similarity = keys @ centroids.transpose(1, 2)
@@ -407,6 +517,16 @@ class Svg2Attention(SparseAttentionBackend):
         super().__init__()
         self._config = config
         self._clusters: dict[int, tuple[tuple, KeyClustering]] = {}
+        self._last_chunk_index = -1
+
+    def _on_begin_forward(self, geometry: ChunkGeometry) -> None:
+        chunk_index = geometry.query_chunk_index
+        if chunk_index < self._last_chunk_index:
+            # A new video restarts the chunk counter; its keys have nothing to
+            # do with the cached clusterings, and the warm start must not seed
+            # from the previous video's centroids either.
+            self._clusters.clear()
+        self._last_chunk_index = chunk_index
 
     def prepare(
         self, call: SparseAttentionCall, layout: VisibleLayout
@@ -449,11 +569,13 @@ class Svg2Attention(SparseAttentionBackend):
         if cached is not None and cached[0] == signature:
             return cached[1]
         history = call.key[0, :history_len].permute(1, 0, 2)
+        warm = self._config.kmeans_warm_iters > 0 and cached is not None
         clustering = cluster_keys(
             history,
             num_clusters=num_clusters,
-            iters=self._config.kmeans_iters,
+            iters=self._config.kmeans_warm_iters if warm else self._config.kmeans_iters,
             own_chunk_len=call.key.shape[1] - history_len,
+            initial_centroids=cached[1].centroids if warm else None,
         )
         self._clusters[call.layer_index] = (signature, clustering)
         return clustering
@@ -504,8 +626,16 @@ class Svg2Attention(SparseAttentionBackend):
         num_blocks = -(-q_len // config.block)
         pad = num_blocks * config.block - q_len
         padded = torch.nn.functional.pad(query[0], (0, 0, 0, 0, 0, pad))
-        block_mean = padded.view(num_blocks, config.block, -1, query.shape[-1]).mean(1)
-        block_mean = block_mean.permute(1, 0, 2)  # [heads, q_blocks, head_dim]
+        block_sum = padded.view(num_blocks, config.block, -1, query.shape[-1]).sum(1)
+        # Divide by the true row count: a zero-padded partial last block would
+        # otherwise scale its dot-logits down while log(cluster size) stays
+        # put, reordering that block's cluster scores.
+        rows = torch.full(
+            (num_blocks, 1, 1), config.block, device=query.device, dtype=block_sum.dtype
+        )
+        if pad:
+            rows[-1] = config.block - pad
+        block_mean = (block_sum / rows).permute(1, 0, 2)  # [heads, q_blocks, head_dim]
 
         logits = (
             block_mean @ clustering.centroids.transpose(1, 2)

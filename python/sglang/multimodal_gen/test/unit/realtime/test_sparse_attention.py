@@ -440,6 +440,30 @@ def test_current_chunk_keys_are_never_cached_across_denoising_steps(method, conf
 
 
 @requires_cuda
+def test_lightforcing_pooled_history_resets_on_new_video():
+    """A new video must not reuse the previous video's pooled history keys.
+
+    The pooled-history cache is keyed by the KV layout signature, which says
+    nothing about which video the keys came from: a new request whose first
+    sparse chunk matches the previous video's last cached signature would
+    silently select blocks against stale keys. A chunk-counter regression is
+    the new-video signal (same rule as OSA's calibration reset).
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    backend = build_sparse_attention_backend(
+        "lightforcing", {"num_output_frames": 81, "sparsity": 0.8}
+    )
+    for chunk_index in range(0, 3):
+        backend.begin_forward(_geometry(chunk_index))
+        backend.attend(_self_forcing_call(device, chunk_index=chunk_index))
+    assert backend._pooled_history._entries, "cache never populated"
+
+    backend.begin_forward(_geometry(0))  # chunk counter regressed: new video
+    assert not backend._pooled_history._entries
+
+
+@requires_cuda
 def test_tempcache_merge_is_exact_for_identical_keys():
     """FAST-AR's Lemma 5.1: merging identical keys must change nothing.
 

@@ -128,6 +128,43 @@ def test_end_to_end_mask_matches_upstream(threshold):
 
 
 @requires_cuda
+def test_ragged_q_len_zeroes_padded_rows_like_upstream():
+    """q_len that is not a block multiple — every real chunk at Wan geometry.
+
+    Upstream zeroes the reduced rows made entirely of query padding after the
+    softmax (in both its eager and Triton paths), so those rows contribute no
+    mass to the last query block's scores. The aligned shapes elsewhere in this
+    file cannot see that step; this case pads 328 -> 384 (3 reduced pad rows)
+    with chunk_size equal to our padded length so both sides pad identically
+    and any mismatch is attributable.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(3)
+    q_len, chunk = 328, 384
+    kv_len = 6 * chunk  # whole chunks and whole blocks: no key padding
+    query = torch.randn(1, q_len, HEADS, HEAD_DIM, device=device, dtype=torch.float32)
+    key = torch.randn(1, kv_len, HEADS, HEAD_DIM, device=device, dtype=torch.float32)
+    ours = antidiagonal_block_scores(query=query, key=key, block=BLOCK, stride=STRIDE)
+    sums, masks = xattention_reference.xattn_estimate(
+        query.transpose(1, 2),
+        key.transpose(1, 2),
+        block_size=BLOCK,
+        stride=STRIDE,
+        norm=1,
+        softmax=True,
+        threshold=0.9,
+        chunk_size=chunk,
+        select_mode="inverse",
+        use_triton=False,
+        causal=False,
+        kdb=1,
+    )
+    torch.testing.assert_close(ours, sums[0].float(), atol=1e-5, rtol=1e-5)
+    keep = select_blocks_by_cumulative_mass(ours, threshold=0.9)
+    torch.testing.assert_close(keep.int(), masks[0].int())
+
+
+@requires_cuda
 def test_key_block_zero_is_always_selected():
     """Upstream folds rejected slots onto index 0, so block 0 survives everywhere.
 

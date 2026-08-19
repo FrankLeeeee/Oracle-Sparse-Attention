@@ -34,7 +34,7 @@ from sglang.multimodal_gen.runtime.layers.attention.sparse.context import (
 )
 from sglang.multimodal_gen.runtime.layers.attention.sparse.svg import (
     Svg1Config,
-    build_svg1_masks,
+    build_svg1_segment_masks,
     select_clusters_by_top_p,
     svg1_token_masks,
 )
@@ -135,11 +135,14 @@ def test_svg1_sink_columns_land_where_upstream_puts_them():
 
 @requires_cuda
 @pytest.mark.parametrize("visible_frames", [6, 9])
-def test_svg1_block_masks_are_the_any_overlap_reduction(visible_frames):
-    """The block builder must equal the block reduction of the token masks.
+def test_svg1_segment_masks_are_the_any_overlap_reduction(visible_frames):
+    """The segment builder must equal the tile reduction of the token masks.
 
-    This is what licenses using the block builder at Wan's geometry, where the
-    token masks cannot be materialized.
+    This is what licenses using the segment builder at Wan's geometry, where
+    the token masks cannot be materialized. The temporal mask's executed rows
+    are the *spatial-major permuted* queries (upstream's head placement,
+    applied to the query side), so its reduction pools the token mask's rows
+    in that order.
     """
     device = torch.device("cuda")
     frame_seqlen = SMALL_FRAME
@@ -151,12 +154,9 @@ def test_svg1_block_masks_are_the_any_overlap_reduction(visible_frames):
     )
     q_len = FRAMES_PER_BLOCK * frame_seqlen
     kv_len = layout.kv_len
-    ours = build_svg1_masks(
-        layout=layout,
-        q_len=q_len,
-        kv_len=kv_len,
-        config=Svg1Config(block=BLOCK, band_frames=2.0, dense_sink_frames=1),
-        device=device,
+    config = Svg1Config(block=BLOCK, band_frames=2.0, dense_sink_frames=1)
+    ours_spatial, ours_temporal, permutation = build_svg1_segment_masks(
+        layout=layout, q_len=q_len, kv_len=kv_len, config=config, device=device
     )
 
     token_masks = svg1_token_masks(
@@ -166,11 +166,19 @@ def test_svg1_block_masks_are_the_any_overlap_reduction(visible_frames):
         dense_sink_frames=1,
         device=device,
     )
-    for ours_mask, token_mask in zip(ours, token_masks, strict=True):
-        # Query rows of the current chunk only, then max-pool to blocks.
-        rows = token_mask[kv_len - q_len :]
+    natural = torch.arange(q_len, device=device)
+    tile = config.key_tile
+    for ours_mask, token_mask, order in zip(
+        (ours_spatial, ours_temporal),
+        token_masks,
+        (natural, permutation),
+        strict=True,
+    ):
+        # Query rows of the current chunk, in the executed order, max-pooled
+        # onto the frame-aligned tile grid (aligned here: 256 % 32 == 0).
+        rows = token_mask[kv_len - q_len :][order]
         pooled = (
-            rows.view(q_len // BLOCK, BLOCK, kv_len // BLOCK, BLOCK)
+            rows.view(q_len // BLOCK, BLOCK, kv_len // tile, tile)
             .amax(dim=1)
             .amax(dim=-1)
         )
@@ -183,7 +191,7 @@ def test_svg1_band_frames_is_monotone_in_density_at_wan_geometry():
     layout = _layout(frame_seqlen=WAN_FRAME, visible_frames=21, chunk_index=10)
     previous = None
     for band_frames in (4.0, 2.0, 1.0, 0.5):
-        spatial, temporal = build_svg1_masks(
+        spatial, temporal, _ = build_svg1_segment_masks(
             layout=layout,
             q_len=FRAMES_PER_BLOCK * WAN_FRAME,
             kv_len=layout.kv_len,

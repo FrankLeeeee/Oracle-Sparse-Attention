@@ -48,7 +48,10 @@ from sglang.multimodal_gen.runtime.layers.attention.sparse.base import (
     SparseAttentionCall,
     SparseAttentionExecution,
 )
-from sglang.multimodal_gen.runtime.layers.attention.sparse.context import VisibleLayout
+from sglang.multimodal_gen.runtime.layers.attention.sparse.context import (
+    ChunkGeometry,
+    VisibleLayout,
+)
 from sglang.multimodal_gen.runtime.layers.attention.sparse.kernel import (
     plan_from_segment_mask,
 )
@@ -276,6 +279,17 @@ class LightForcingAttention(SparseAttentionBackend):
         # ``(chunk, layer)``. Own-chunk keys are pooled fresh on every call
         # (memoizing them is the FAST-AR class of bug).
         self._pooled_history = LayoutCache()
+        self._last_chunk_index = -1
+
+    def _on_begin_forward(self, geometry: ChunkGeometry) -> None:
+        chunk_index = geometry.query_chunk_index
+        if chunk_index < self._last_chunk_index:
+            # A new video restarts the chunk counter. Its first sparse chunk
+            # can carry the same layout signature as the previous video's last
+            # cached one, which would silently reuse the previous video's
+            # pooled history keys for block selection.
+            self._pooled_history.clear()
+        self._last_chunk_index = chunk_index
 
     def _chunk_sparsity(self, layout: VisibleLayout) -> float:
         config = self._config

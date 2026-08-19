@@ -16,8 +16,9 @@ to get wrong:
    ``2^bit_length(frame_seqlen) / 2^bit_length(d) * decay_factor`` tokens,
    floored at the block size. Note it is an absolute token count derived from the
    *power of two above* the frame length, not a fraction of the frame: at
-   ``frame_seqlen = 1560`` the reference length is 2048, so d=2,3 gives 256
-   tokens, d=4..7 gives 128, and everything beyond is clamped to 128.
+   ``frame_seqlen = 1560`` the reference length is 2048, so d=2,3 gives 512
+   tokens, d=4..7 gives 256, d=8..15 gives 128, and everything beyond is
+   clamped to 128.
 2. **Frame decimation.** Once the band would fall below the block size, upstream
    stops narrowing it and starts dropping whole frame pairs instead: with
    ``split_factor = block_size / decay_length``, the pair is kept only when

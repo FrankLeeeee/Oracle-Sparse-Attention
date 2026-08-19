@@ -65,20 +65,38 @@ class XAttentionConfig(msgspec.Struct, frozen=True):
     threshold: float = 0.9
 
 
-def _strided_reshape(tensor: torch.Tensor, *, stride: int, reverse: bool) -> torch.Tensor:
-    """``[batch, len, heads, dim]`` → ``[heads, len/stride, stride*dim]``.
+def _strided_reshape(
+    tensor: torch.Tensor, *, stride: int, reverse: bool, padded_length: int
+) -> torch.Tensor:
+    """``[batch, len, heads, dim]`` → ``[heads, padded/stride, stride*dim]``.
 
     Upstream's ``cat([x[a::stride] for a in ...], dim=-1)``; ``reverse`` selects
     the query side's ``stride - 1 - a`` residue order, which is what makes each
-    output element a single antidiagonal.
+    output element a single antidiagonal. Row ``u`` of upstream's cat is token
+    block ``u*stride .. (u+1)*stride`` flattened (reversed within the block on
+    the query side), so the whole reshape is one contiguous view — upstream's
+    default Triton path fuses it into the GEMM the same way; spelling it as 16
+    strided cat-copies (as an earlier version here did) costs ~3.5 ms per call
+    on a 280k-token KV and dominated the estimator.
     """
     batch, length, heads, dim = tensor.shape
-    residues = range(stride - 1, -1, -1) if reverse else range(stride)
-    slices = [tensor[:, residue::stride] for residue in residues]
     # Batch is averaged rather than kept: the plan has no batch axis, and under
     # CFG both elements want the same blocks.
-    stacked = torch.cat(slices, dim=-1).mean(dim=0)  # [len/stride, heads, stride*dim]
-    return stacked.permute(1, 0, 2)
+    source = (
+        tensor.permute(2, 0, 1, 3).mean(dim=1)
+        if batch > 1
+        else tensor[0].permute(1, 0, 2)
+    )
+    # Zero-pad to the block grid inside the transpose copy: F.pad would copy
+    # the whole KV view a second time, and this is the KV-sized data movement
+    # that dominates the estimator.
+    merged = tensor.new_empty(heads, padded_length, dim)
+    merged[:, length:].zero_()
+    merged[:, :length].copy_(source)
+    blocks = merged.view(heads, padded_length // stride, stride, dim)
+    if reverse:
+        blocks = blocks.flip(2)
+    return blocks.reshape(heads, padded_length // stride, stride * dim)
 
 
 def antidiagonal_block_scores(
@@ -95,20 +113,25 @@ def antidiagonal_block_scores(
     normalizes by the row sum itself.
     """
     head_dim = query.shape[-1]
-
-    def _pad_to_block(tensor: torch.Tensor) -> torch.Tensor:
-        remainder = tensor.shape[1] % block
-        if remainder == 0:
-            return tensor
-        return torch.nn.functional.pad(
-            tensor, (0, 0, 0, 0, 0, block - remainder)
-        )
-
-    reduced_query = _strided_reshape(_pad_to_block(query), stride=stride, reverse=True)
-    reduced_key = _strided_reshape(_pad_to_block(key), stride=stride, reverse=False)
+    q_len = query.shape[1]
+    padded_q_len = -(-q_len // block) * block
+    padded_kv_len = -(-key.shape[1] // block) * block
+    reduced_query = _strided_reshape(
+        query, stride=stride, reverse=True, padded_length=padded_q_len
+    )
+    reduced_key = _strided_reshape(
+        key, stride=stride, reverse=False, padded_length=padded_kv_len
+    )
     scores = torch.bmm(reduced_query, reduced_key.transpose(1, 2)).float()
     scores /= head_dim**0.5 * stride
     probabilities = torch.softmax(scores, dim=-1)
+    # Zero the reduced rows made entirely of query padding (upstream's
+    # ``sum_mask`` rule, applied in both its eager and Triton paths): the
+    # zero-padded rows would otherwise contribute uniform softmax mass to the
+    # last query block's scores whenever q_len is not a block multiple.
+    pad_rows = (padded_q_len - q_len) // stride
+    if pad_rows:
+        probabilities[:, -pad_rows:, :] = 0
 
     rows_per_block = block // stride
     heads, reduced_q, reduced_k = probabilities.shape
