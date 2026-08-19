@@ -184,8 +184,8 @@ class SparseAttentionBackend(abc.ABC):
         than only its sparse part. Accumulating on device costs a few
         microseconds; the host sync happens once every
         ``_DENSITY_REPORT_INTERVAL`` calls. A method that knows its exact read
-        fraction analytically (OSA's replicate gather) passes ``fraction``
-        instead of a plan.
+        fraction analytically (OSA's gather) passes ``fraction`` instead of a
+        plan.
         """
         if plan is None and fraction is None:
             self._dense_calls += 1

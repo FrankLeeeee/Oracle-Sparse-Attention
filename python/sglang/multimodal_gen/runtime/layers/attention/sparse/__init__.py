@@ -5,8 +5,9 @@
 package is constructed or called. Otherwise it names one method:
 
 ======================  ====================================================
-``osa``                 Oracle Sparse Attention: per-head sink + recent-chunk
-                        policy, calibrated on a reference chunk at runtime.
+``osa``                 Oracle Sparse Attention: per-head within-frame tile
+                        pattern, calibrated on chunk 0 at runtime and
+                        replicated across every history frame.
 ``xattention``          X-Attention's antidiagonal block scoring.
 ``svg1`` / ``svg2``     Sparse VideoGen v1 (spatial/temporal heads) and v2
                         (semantic clustering).

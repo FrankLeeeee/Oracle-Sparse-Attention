@@ -8,9 +8,9 @@ tested separately:
    checked against masked SDPA in float32 for every method's real plan, so a
    permutation, a merged key range or a logit bias that is wrong shows up here
    rather than as a subtly worse video;
-2. each method's selection logic is the pattern it claims — OSA's per-head
-   policy is chunk-relative and monotone, X-Attention's estimator matches a
-   brute-force antidiagonal sum, and so on.
+2. each method's selection logic is the pattern it claims — OSA's frozen
+   per-head tile set replicates across every history frame, X-Attention's
+   estimator matches a brute-force antidiagonal sum, and so on.
 """
 
 import msgspec
@@ -45,18 +45,6 @@ from sglang.multimodal_gen.runtime.layers.attention.sparse.kernel import (
 from sglang.multimodal_gen.runtime.layers.attention.sparse.radial import (
     RadialConfig,
     build_radial_block_mask,
-)
-from sglang.multimodal_gen.runtime.layers.attention.sparse.osa import (
-    PATTERN_BAND,
-    PATTERN_BLOCK,
-    PATTERN_DT_COMB,
-    PATTERN_V_COMB,
-    PatternHeadPolicies,
-    choose_head_policies,
-    choose_pattern_head_policies,
-    dt_policy_qblock_mask,
-    fold_mass_into_bins,
-    policy_frame_mask,
 )
 from sglang.multimodal_gen.runtime.layers.attention.sparse.xattention import (
     select_blocks_by_cumulative_mass,
@@ -284,430 +272,6 @@ def test_radial_band_narrows_with_temporal_distance():
 
 
 # --------------------------------------------------------------------------
-# OSA
-# --------------------------------------------------------------------------
-
-
-def test_choose_head_policies_picks_the_cheapest_sufficient_policy():
-    # head 0 lives on its own chunk plus the sink; head 1 on the two most
-    # recent chunks; head 2 spreads mass over everything it can see.
-    own = np.array([0.5, 0.5, 0.3])
-    sink = np.array([0.45, 0.02, 0.1])
-    offsets = np.array(
-        [[0.02, 0.02, 0.01], [0.30, 0.15, 0.03], [0.25, 0.20, 0.15]]
-    )
-    policies = choose_head_policies(
-        own_mass=own,
-        sink_mass=sink,
-        offset_mass=offsets,
-        retention=0.9,
-        frames_per_block=FRAMES_PER_BLOCK,
-        sink_frames=FRAMES_PER_BLOCK,
-    )
-    assert policies.keep_sink.tolist() == [True, False, False]
-    assert policies.num_recent.tolist() == [0, 2, 0]
-    assert policies.dense.tolist() == [False, False, True]
-    assert policies.observed_retention[0] == pytest.approx(0.95)
-
-
-def test_choose_head_policies_marks_saturated_heads_dense():
-    """Needing every observed past chunk means the horizon was not observed."""
-    policies = choose_head_policies(
-        own_mass=np.array([0.4]),
-        sink_mass=np.array([0.0]),
-        offset_mass=np.array([[0.3, 0.3]]),
-        retention=0.9,
-        frames_per_block=FRAMES_PER_BLOCK,
-        sink_frames=FRAMES_PER_BLOCK,
-    )
-    assert policies.dense.tolist() == [True]
-
-
-def test_policy_is_chunk_relative_and_monotone():
-    """The kept chunk set shifts by exactly one chunk per generated chunk."""
-    policies = choose_head_policies(
-        own_mass=np.array([0.6, 0.6]),
-        sink_mass=np.array([0.35, 0.0]),
-        offset_mass=np.array([[0.02, 0.03], [0.35, 0.05]]),
-        retention=0.9,
-        frames_per_block=FRAMES_PER_BLOCK,
-        sink_frames=FRAMES_PER_BLOCK,
-    )
-    assert policies.keep_sink.tolist() == [True, False]
-    assert policies.num_recent.tolist() == [0, 1]
-
-    def kept_chunks(chunk_index):
-        layout = _layout(chunk_index)
-        keep = policy_frame_mask(
-            policies, layout=layout, sink_frames=FRAMES_PER_BLOCK
-        )
-        chunk_of_frame = layout.global_frame_ids // FRAMES_PER_BLOCK
-        return [set(np.unique(chunk_of_frame[row])) for row in keep]
-
-    # Monotonicity: head 0 reads the sink at every later chunk, head 1 reads
-    # the one most recent chunk at every later chunk — the same relative set,
-    # shifted forward.
-    for chunk_index in range(3, 12):
-        sink_head, recent_head = kept_chunks(chunk_index)
-        assert sink_head == {0, chunk_index}
-        assert recent_head == {chunk_index - 1, chunk_index}
-
-
-@requires_cuda
-def test_osa_recalibration_refreshes_policies_on_schedule():
-    """`recalibrate_every` re-observes and swaps policies; 0 keeps them frozen.
-
-    The refresh must happen on the scheduled chunk's first denoising step,
-    update the bookkeeping, and keep producing valid sparse output; without
-    the knob the reference-chunk policies stay frozen forever.
-    """
-    torch.manual_seed(0)
-    device = torch.device("cuda")
-
-    def run(config):
-        backend = build_sparse_attention_backend("osa", config)
-        seen = {}
-        for chunk_index in range(2, 8):
-            backend.begin_forward(_geometry(chunk_index))
-            out = backend.attend(_self_forcing_call(device, chunk_index=chunk_index))
-            if 0 in backend.policies:
-                seen[chunk_index] = backend.policies[0]
-            if chunk_index > 2:
-                assert out is not None, f"expected sparse output at chunk {chunk_index}"
-        return backend, seen
-
-    frozen_backend, frozen = run({"reference_chunk": 2, "retention": 0.5})
-    assert all(p is frozen[3] for c, p in frozen.items() if c >= 3)
-    assert frozen_backend._calibrated_at[0] == 2
-
-    recal_backend, recal = run(
-        {"reference_chunk": 2, "retention": 0.5, "recalibrate_every": 2}
-    )
-    # Refreshed at chunks 4 and 6: new policy objects, bookkeeping advanced.
-    assert recal[4] is not recal[3]
-    assert recal[6] is not recal[5]
-    assert recal[5] is recal[4]
-    assert recal_backend._calibrated_at[0] == 6
-
-
-def test_frame_granular_policy_is_never_costlier_and_stays_monotone():
-    """Frame granularity refines chunk granularity without changing the shape.
-
-    Every chunk policy is expressible in frame units (k chunks = 3k frames), so
-    at equal retention and sink size the cheapest frame policy keeps at most as
-    many frames. And the kept set must still be the same chunk-relative set at
-    every later chunk, shifted forward.
-    """
-    from sglang.multimodal_gen.runtime.layers.attention.sparse.osa import (
-        fold_mass_into_bins,
-        fold_mass_into_frame_bins,
-        frame_ages,
-    )
-
-    rng = np.random.default_rng(0)
-    layout = _layout(4)
-    heads = 6
-    frame_mass = rng.dirichlet(np.ones(layout.num_frames) * 0.4, size=heads)
-    sink_frames = 1
-
-    own_c, sink_c, chunk_bins = fold_mass_into_bins(
-        frame_mass, layout=layout, sink_frames=sink_frames
-    )
-    own_f, sink_f, frame_bins = fold_mass_into_frame_bins(
-        frame_mass, layout=layout, sink_frames=sink_frames
-    )
-    np.testing.assert_allclose(own_c, own_f)
-    np.testing.assert_allclose(sink_c, sink_f)
-    # Frame bins are an exact refinement: summing ages within a chunk offset
-    # reproduces the chunk bin.
-    np.testing.assert_allclose(
-        frame_bins.reshape(heads, -1, FRAMES_PER_BLOCK).sum(-1), chunk_bins
-    )
-
-    retention = 0.7
-    chunk_policies = choose_head_policies(
-        own_mass=own_c, sink_mass=sink_c, offset_mass=chunk_bins,
-        retention=retention, frames_per_block=FRAMES_PER_BLOCK,
-        sink_frames=sink_frames,
-    )
-    frame_policies = choose_head_policies(
-        own_mass=own_f, sink_mass=sink_f, offset_mass=frame_bins,
-        retention=retention, frames_per_block=1, sink_frames=sink_frames,
-    )
-
-    def cost(policies, unit):
-        return (
-            policies.num_recent.astype(int) * unit
-            + policies.keep_sink.astype(int) * sink_frames
-            + policies.dense.astype(int) * 10_000
-        )
-
-    assert (
-        cost(frame_policies, 1) <= cost(chunk_policies, FRAMES_PER_BLOCK)
-    ).all()
-
-    def kept_ages(chunk_index):
-        layout_k = _layout(chunk_index)
-        keep = policy_frame_mask(
-            policies=frame_policies, layout=layout_k,
-            sink_frames=sink_frames, frame_granular=True,
-        )
-        ages = frame_ages(layout_k)
-        return [
-            set(ages[row & (ages > 0)].tolist()) for row in keep
-        ]
-
-    reference_ages = kept_ages(5)
-    for chunk_index in range(6, 10):
-        # Chunk-relative stationarity: the same past *ages* stay kept (up to
-        # frames that leave the visible window), only the sink is age-absolute.
-        for head in range(heads):
-            if frame_policies.dense[head] or frame_policies.keep_sink[head]:
-                continue
-            assert kept_ages(chunk_index)[head] == reference_ages[head]
-
-
-def _planted_dt_mass(query_frame_ids, key_frame_ids, per_head):
-    """[heads, nqf, K] rows summing to 1 from {dt: mass} / {("edge", i): mass}."""
-    heads = len(per_head)
-    mass = np.zeros((heads, query_frame_ids.size, key_frame_ids.size))
-    for head, spec in enumerate(per_head):
-        for qi, qf in enumerate(query_frame_ids):
-            for where, value in spec.items():
-                if isinstance(where, tuple):  # ("edge", view_index)
-                    mass[head, qi, where[1]] += value
-                else:  # dt = qf - kf
-                    kf = qf - where
-                    hits = np.flatnonzero(key_frame_ids == kf)
-                    if hits.size:
-                        mass[head, qi, hits[0]] += value
-            remainder = 1.0 - mass[head, qi].sum()
-            mass[head, qi] += remainder / key_frame_ids.size
-    return mass
-
-
-def _fit_patterns(mass, layout, *, retention=0.9, max_edge_frames=3):
-    return choose_pattern_head_policies(
-        query_frame_mass=mass,
-        query_frame_ids=layout.global_frame_ids[layout.own_frames],
-        key_frame_ids=layout.global_frame_ids,
-        retention=retention,
-        frames_per_block=FRAMES_PER_BLOCK,
-        max_future=FRAMES_PER_BLOCK - 1,
-        max_edge_frames=max_edge_frames,
-    )
-
-
-def test_choose_pattern_head_policies_recovers_planted_bands():
-    # Chunk 5 of a growing window: query frames 15..17, key frames 0..17.
-    layout = _layout(5)
-    query_frame_ids = layout.global_frame_ids[layout.own_frames]
-    key_frame_ids = layout.global_frame_ids
-    # head 0 is diagonal over its own and previous frame; head 1 reads its own
-    # frame and the next one (bidirectional inside the chunk; the newest frame
-    # has no next, so its mass stays on dt 0); head 2 reads its own frame plus
-    # the oldest visible frame.
-    mass = _planted_dt_mass(
-        query_frame_ids,
-        key_frame_ids,
-        [
-            {0: 0.70, 1: 0.25},
-            {0: 0.60, -1: 0.35},
-            {0: 0.60, ("edge", 0): 0.35},
-        ],
-    )
-    mass[1, -1] = 0.0
-    mass[1, -1, np.flatnonzero(key_frame_ids == query_frame_ids[-1])[0]] = 0.95
-    mass[1, -1] += 0.05 / key_frame_ids.size
-    mass /= mass.sum(axis=-1, keepdims=True)
-    policies = _fit_patterns(mass, layout)
-    assert policies.dense.tolist() == [False, False, False]
-    assert policies.pattern.tolist() == [PATTERN_BAND] * 3
-    assert policies.params[:, 0].tolist() == [1, 0, 0]  # num_past
-    assert policies.params[:, 1].tolist() == [0, 1, 0]  # num_future
-    assert policies.edge_frames.tolist() == [0, 0, 1]
-    assert (policies.observed_retention >= 0.9).all()
-
-
-def test_choose_pattern_head_policies_recovers_periodic_patterns():
-    layout = _layout(5)
-    query_frame_ids = layout.global_frame_ids[layout.own_frames]
-    key_frame_ids = layout.global_frame_ids
-    # head 0: periodic diagonals — mass at dt 0, 3, 6 (one chunk apart);
-    # head 1: chunk-aligned block — uniform over its own and previous chunk,
-    #   which no cheap band can cover but two chunks can;
-    # head 2: vertical stripes — every third *absolute* frame (chunk starts),
-    #   regardless of the query frame.
-    mass = _planted_dt_mass(
-        query_frame_ids,
-        key_frame_ids,
-        [
-            {0: 0.40, 3: 0.30, 6: 0.25},
-            {},
-            {},
-        ],
-    )
-    query_chunk = query_frame_ids[0] // FRAMES_PER_BLOCK
-    own_or_previous = (
-        key_frame_ids // FRAMES_PER_BLOCK >= query_chunk - 1
-    )
-    mass[1] = np.where(own_or_previous[None, :], 1.0, 0.02)
-    stripes = key_frame_ids % FRAMES_PER_BLOCK == 0
-    mass[2] = 0.002
-    mass[2, :, stripes] += 0.13
-    for qi, qf in enumerate(query_frame_ids):
-        mass[2, qi, np.flatnonzero(key_frame_ids == qf)[0]] += 0.20
-    mass /= mass.sum(axis=-1, keepdims=True)
-    policies = _fit_patterns(mass, layout, retention=0.95, max_edge_frames=0)
-    assert policies.dense.tolist() == [False, False, False]
-    assert policies.pattern.tolist() == [
-        PATTERN_DT_COMB,
-        PATTERN_BLOCK,
-        PATTERN_V_COMB,
-    ]
-    period, start, width, depth = policies.params[0]
-    assert (period, start, width) == (3, 0, 1) and depth >= 3
-    assert policies.params[1, 0] == 1  # own + one recent chunk
-    v_period, v_phase, v_width, _ = policies.params[2]
-    assert (v_period, v_phase, v_width) == (3, 0, 1)
-
-
-def test_choose_pattern_head_policies_marks_saturated_heads_dense():
-    """Needing the deepest visible dt means the horizon was not observed."""
-    layout = _layout(5)
-    query_frame_ids = layout.global_frame_ids[layout.own_frames]
-    key_frame_ids = layout.global_frame_ids
-    horizon = int(query_frame_ids.min() - key_frame_ids.min())
-    mass = _planted_dt_mass(
-        query_frame_ids, key_frame_ids, [{0: 0.50, horizon: 0.45}]
-    )
-    policies = _fit_patterns(mass, layout, max_edge_frames=0)
-    assert policies.dense.tolist() == [True]
-
-
-def test_dt_policy_mask_is_query_frame_relative_and_monotone():
-    """Each query frame keeps its own band, at every later chunk."""
-    policies = PatternHeadPolicies(
-        pattern=np.array([PATTERN_BAND, PATTERN_BAND], dtype=np.int8),
-        params=np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.int32),
-        edge_frames=np.array([0, 2], dtype=np.int32),
-        dense=np.array([False, False]),
-        observed_retention=np.ones(2, dtype=np.float32),
-    )
-    for chunk_index in range(5, 9):
-        layout = _layout(chunk_index)
-        # block_m == frame_seqlen so query block b is exactly query frame b
-        keep = dt_policy_qblock_mask(
-            policies, layout=layout, block_m=FRAME_SEQLEN
-        )
-        query_frame_ids = layout.global_frame_ids[layout.own_frames]
-        visible = set(layout.global_frame_ids.tolist())
-        for block, qf in enumerate(query_frame_ids):
-            band_head = set(layout.global_frame_ids[keep[0, block]].tolist())
-            assert band_head == {qf - 1, qf} & visible
-            edge_head = set(layout.global_frame_ids[keep[1, block]].tolist())
-            oldest = set(layout.global_frame_ids[:2].tolist())
-            assert edge_head == ({qf, qf + 1} & visible) | oldest
-
-
-def test_dt_comb_mask_shifts_with_the_query_frame():
-    """A periodic-diagonal head keeps dt 0, P, 2P... from *each* query frame."""
-    period, depth = 3, 3
-    policies = PatternHeadPolicies(
-        pattern=np.array([PATTERN_DT_COMB], dtype=np.int8),
-        params=np.array([[period, 0, 1, depth]], dtype=np.int32),
-        edge_frames=np.array([0], dtype=np.int32),
-        dense=np.array([False]),
-        observed_retention=np.ones(1, dtype=np.float32),
-    )
-    for chunk_index in (6, 8):
-        layout = _layout(chunk_index)
-        keep = dt_policy_qblock_mask(policies, layout=layout, block_m=FRAME_SEQLEN)
-        query_frame_ids = layout.global_frame_ids[layout.own_frames]
-        visible = set(layout.global_frame_ids.tolist())
-        for block, qf in enumerate(query_frame_ids):
-            expected = {qf - tooth * period for tooth in range(depth)} & visible
-            assert set(layout.global_frame_ids[keep[0, block]].tolist()) == expected
-
-
-def test_dt_qblock_mask_unions_straddling_frames():
-    """A query block spanning two frames keeps both frames' bands."""
-    policies = PatternHeadPolicies(
-        pattern=np.array([PATTERN_BAND], dtype=np.int8),
-        params=np.array([[0, 0, 0, 0]], dtype=np.int32),
-        edge_frames=np.array([0], dtype=np.int32),
-        dense=np.array([False]),
-        observed_retention=np.ones(1, dtype=np.float32),
-    )
-    layout = _layout(4)
-    block_m = 256  # FRAME_SEQLEN=390, so block 1 covers tokens 256..511: two frames
-    keep = dt_policy_qblock_mask(policies, layout=layout, block_m=block_m)
-    query_frame_ids = layout.global_frame_ids[layout.own_frames]
-    kept_frames = set(layout.global_frame_ids[keep[0, 1]].tolist())
-    assert kept_frames == {query_frame_ids[0], query_frame_ids[1]}
-    # a block wholly inside one frame keeps only that frame
-    kept_first = set(layout.global_frame_ids[keep[0, 0]].tolist())
-    assert kept_first == {query_frame_ids[0]}
-
-
-@requires_cuda
-def test_osa_dt_refreshes_once_at_the_first_full_window():
-    """A partial-window calibration is re-observed once eviction begins.
-
-    The reference chunk's window still starts at frame 0, so its policies
-    cannot bound the steady-state horizon; the first chunk whose view has
-    evicted frame 0 triggers exactly one recalibration, after which the
-    policies are frozen for good.
-    """
-    torch.manual_seed(0)
-    device = torch.device("cuda")
-    backend = build_sparse_attention_backend(
-        "osa", {"reference_chunk": 2, "retention": 0.5, "granularity": "dt"}
-    )
-
-    def sliding_call(chunk_index, window_chunks):
-        chunk_tokens = FRAMES_PER_BLOCK * FRAME_SEQLEN
-        first = chunk_index + 1 - window_chunks
-        call = _self_forcing_call(device, chunk_index=chunk_index)
-        return msgspec.structs.replace(
-            call,
-            key=call.key[:, -window_chunks * chunk_tokens :],
-            value=call.value[:, -window_chunks * chunk_tokens :],
-            key_segments=((first * chunk_tokens, window_chunks * chunk_tokens),),
-        )
-
-    for chunk_index in range(0, 4):  # growing window through the reference
-        backend.begin_forward(_geometry(chunk_index))
-        backend.attend(_self_forcing_call(device, chunk_index=chunk_index))
-    calibrated = backend.policies[0]
-    assert backend._calibration_window_start[0] == 0
-
-    backend.begin_forward(_geometry(5))
-    backend.attend(sliding_call(5, window_chunks=4))  # frame 0 evicted
-    refreshed = backend.policies[0]
-    assert refreshed is not calibrated
-    assert backend._calibration_window_start[0] > 0
-
-    backend.begin_forward(_geometry(6))
-    backend.attend(sliding_call(6, window_chunks=4))
-    assert backend.policies[0] is refreshed  # refresh happens only once
-
-
-def test_fold_mass_into_bins_counts_the_sink_once():
-    layout = _layout(3)
-    frame_mass = np.full((1, layout.num_frames), 1.0 / layout.num_frames)
-    own, sink, offsets = fold_mass_into_bins(
-        frame_mass, layout=layout, sink_frames=FRAMES_PER_BLOCK
-    )
-    # chunks 0..3 visible: chunk 0 is the sink, so offsets -1 and -2 hold
-    # chunks 2 and 1 and offset -3 (chunk 0) is empty.
-    assert own == pytest.approx(0.25)
-    assert sink == pytest.approx(0.25)
-    assert offsets[0].tolist() == pytest.approx([0.25, 0.25, 0.0])
-    assert own + sink + offsets.sum() == pytest.approx(1.0)
-
-
-# --------------------------------------------------------------------------
 # X-Attention
 # --------------------------------------------------------------------------
 
@@ -754,10 +318,6 @@ def _self_forcing_call(device, *, chunk_index, layer_index=0, heads=4, head_dim=
 @pytest.mark.parametrize(
     "method,config",
     [
-        ("osa", {"reference_chunk": 2, "retention": 0.8}),
-        ("osa", {"reference_chunk": 2, "retention": 0.8, "granularity": "frame",
-                 "sink_latent_frames": 1}),
-        ("osa", {"reference_chunk": 2, "retention": 0.8, "granularity": "dt"}),
         ("xattention", {"block": 128, "stride": 8, "threshold": 0.6}),
         ("svg1", {"block": 128, "num_sampled_blocks": 2, "band_frames": 0.5}),
         ("svg2", {"block": 128, "cluster_size": 32, "kmeans_iters": 2, "top_p": 0.5}),
@@ -771,7 +331,9 @@ def test_method_output_matches_its_own_plan(method, config):
 
     The reference is built from the plan the method produced, so this catches
     kernel bugs, permutation bugs and bias bugs without asserting anything
-    about the selection policy itself.
+    about the selection policy itself. OSA is absent because it executes via
+    gather + FA3 rather than the shared kernel; its execution is checked
+    against a masked reference in its own test below.
     """
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -829,10 +391,7 @@ def test_method_output_matches_its_own_plan(method, config):
 @pytest.mark.parametrize(
     "method,config",
     [
-        ("osa", {"reference_chunk": 2, "retention": 0.5}),
-        ("osa", {"reference_chunk": 2, "retention": 0.5, "granularity": "frame",
-                 "sink_latent_frames": 1}),
-        ("osa", {"reference_chunk": 2, "retention": 0.5, "granularity": "dt"}),
+        ("osa", {"density": 0.4, "num_recent_frames": 1, "sink_latent_frames": 1}),
         ("xattention", {"threshold": 0.6}),
         ("svg1", {"num_sampled_blocks": 2, "band_frames": 0.5}),
         ("svg2", {"cluster_size": 32, "kmeans_iters": 2, "top_p": 0.5}),
@@ -920,30 +479,11 @@ def test_tempcache_merge_is_exact_for_identical_keys():
 
 
 @requires_cuda
-def test_osa_runs_dense_until_the_reference_chunk_then_freezes_its_policy():
-    torch.manual_seed(0)
-    device = torch.device("cuda")
-    backend = build_sparse_attention_backend("osa", {"reference_chunk": 2})
-
-    for chunk_index in range(0, 3):
-        call = _self_forcing_call(device, chunk_index=chunk_index)
-        backend.begin_forward(_geometry(chunk_index))
-        assert backend.attend(call) is None  # dense up to and including chunk 2
-    assert 0 in backend.policies
-
-    frozen = backend.policies[0]
-    call = _self_forcing_call(device, chunk_index=5)
-    backend.begin_forward(_geometry(5))
-    backend.attend(call)
-    assert backend.policies[0] is frozen  # never recalibrated
-
-
-@requires_cuda
-def test_osa_replicate_freezes_the_last_chunk0_step_and_replicates():
-    """The replicate policy: chunk 0's *last* denoising step is the oracle,
-    the frozen per-head tile set repeats in every non-full frame, the achieved
-    density tracks the requested one, and the gather + FA3 execution matches a
-    masked reference."""
+def test_osa_freezes_the_last_chunk0_step_and_replicates():
+    """OSA: chunk 0's *last* denoising step is the oracle, the frozen per-head
+    tile set repeats in every non-full frame, the achieved density tracks the
+    requested one, and the gather + FA3 execution matches a masked
+    reference."""
     from sglang.multimodal_gen.runtime.layers.attention.sparse.replicate_kernel import (
         ReplicateGatherPlan,
     )
@@ -953,7 +493,6 @@ def test_osa_replicate_freezes_the_last_chunk0_step_and_replicates():
     backend = build_sparse_attention_backend(
         "osa",
         {
-            "granularity": "replicate",
             "density": 0.4,
             "num_recent_frames": 1,
             "sink_latent_frames": 1,

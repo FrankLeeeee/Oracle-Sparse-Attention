@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Gather-then-flash execution for OSA's replicate policy.
+"""Gather-then-flash execution for OSA.
 
-The replicate policy reads, per head, the same within-frame tile set in every
+OSA reads, per head, the same within-frame tile set in every
 history frame plus a few whole frames — and by construction every head keeps
 the *same number* of tokens. Expressed as generic key ranges, the shared
 range-walking kernel degenerates to one 64-token tile per range (no software

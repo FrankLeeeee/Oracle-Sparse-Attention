@@ -1405,7 +1405,7 @@ class ServerArgs(DisaggServerArgsMixin):
             default=None,
             help=(
                 "Knobs for --sparse-attention, as a JSON string, a JSON/YAML file "
-                "path, or key=value pairs, e.g. 'reference_chunk=3,retention=0.9'."
+                "path, or key=value pairs, e.g. 'density=0.4,num_recent_frames=2'."
             ),
         )
 

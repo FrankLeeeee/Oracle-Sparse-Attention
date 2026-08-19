@@ -29,7 +29,7 @@ _TOTAL_TIME = re.compile(
     r"Pixel data generated successfully in .*?([0-9]+\.[0-9]+).*?seconds"
 )
 _DENSITY = re.compile(r"attention density so far: ([0-9.]+) over (\d+) calls")
-_OSA_SUMMARY = re.compile(r"OSA calibrated .*")
+_OSA_SUMMARY = re.compile(r"OSA frozen .*")
 
 
 def run_one(
