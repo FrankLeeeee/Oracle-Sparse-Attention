@@ -29,7 +29,7 @@ import numpy as np  # noqa: E402
 from matplotlib.colors import LogNorm  # noqa: E402
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from geometry import GEOMETRY, chunk_ids  # noqa: E402
+from geometry import GEOMETRY, chunk_ids, coverage_share  # noqa: E402
 from paths import results_dir  # noqa: E402
 
 ROOT = results_dir("attention_layers")
@@ -61,6 +61,7 @@ def load(model: str, res: str, duration: int) -> dict | None:
         data = np.load(dump)
         chunks[chunk] = {
             "scores": data["scores"],
+            "coverage": data["coverage"],
             "layer_ids": [int(i) for i in data["layer_ids"]],
         }
     if not chunks:
@@ -68,13 +69,11 @@ def load(model: str, res: str, duration: int) -> dict | None:
     return {"chunks": chunks, "meta": json.loads((run / "meta.json").read_text())}
 
 
-def key_share(scores: np.ndarray) -> float:
-    """Median share of keys a query row needs for 90% of its mass."""
-    ranked = np.sort(scores.astype(np.float32), axis=-1)[..., ::-1]
-    total = ranked.sum(axis=-1, keepdims=True)
-    cumulative = np.cumsum(ranked, axis=-1) / np.maximum(total, 1e-12)
-    needed = (cumulative < 0.9).sum(axis=-1) + 1
-    return float(np.median(needed / scores.shape[-1]))
+def key_share(payload: dict, layer: int, stride: int) -> float:
+    """Median share of the visible keys a query row needs for 90% of its mass."""
+    index = payload["layer_ids"].index(layer)
+    visible = payload["scores"].shape[-1] * stride
+    return coverage_share(payload["coverage"][index], visible)
 
 
 def plot_sheet(
@@ -159,14 +158,13 @@ def plot_depth_trend(data: dict, res: str, duration: int, out_dir: pathlib.Path)
     for column, model in enumerate(models):
         ax = axes[0][column]
         entry = data[(model, res, duration)]
+        stride = entry["meta"]["qk_key_stride"]
         chunks = sorted(entry["chunks"])
         layers = entry["chunks"][chunks[0]]["layer_ids"]
         for layer in layers:
             shares = []
             for chunk in chunks:
-                payload = entry["chunks"][chunk]
-                index = payload["layer_ids"].index(layer)
-                shares.append(100 * key_share(payload["scores"][index]))
+                shares.append(100 * key_share(entry["chunks"][chunk], layer, stride))
             ax.plot(
                 chunks,
                 shares,
@@ -234,14 +232,17 @@ def main() -> None:
                             "layer": layer,
                             "chunks": chunks,
                             "visible_keys": [
-                                int(entry["chunks"][c]["scores"].shape[-1])
+                                int(
+                                    entry["chunks"][c]["scores"].shape[-1]
+                                    * entry["meta"]["qk_key_stride"]
+                                )
                                 for c in chunks
                             ],
                             "key_share_for_90pct": [
                                 key_share(
-                                    entry["chunks"][c]["scores"][
-                                        entry["chunks"][c]["layer_ids"].index(layer)
-                                    ]
+                                    entry["chunks"][c],
+                                    layer,
+                                    entry["meta"]["qk_key_stride"],
                                 )
                                 for c in chunks
                             ],

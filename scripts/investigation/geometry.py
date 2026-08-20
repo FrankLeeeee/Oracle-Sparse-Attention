@@ -102,3 +102,17 @@ def token_stride(width: int, height: int, num_frames: int, target: int = 2048) -
     while tokens // stride > target:
         stride *= 2
     return stride
+
+
+def coverage_share(coverage, num_visible_keys: int) -> float:
+    """Median share of the *full* key set a query row needs for 90% of its mass.
+
+    The probe computes ``coverage`` during capture, on the un-strided key axis,
+    which is the only stride-independent way to ask this. Estimating it from the
+    strided ``scores`` instead is biased: a narrow diagonal band collapses to a
+    single sampled column and reads as far sparser than it is, and a broad
+    pattern reads as denser.
+    """
+    import numpy as np
+
+    return float(np.median(coverage)) / num_visible_keys

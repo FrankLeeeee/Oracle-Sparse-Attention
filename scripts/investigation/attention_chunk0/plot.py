@@ -32,7 +32,7 @@ from matplotlib.colors import LogNorm  # noqa: E402
 from matplotlib.ticker import MaxNLocator  # noqa: E402
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from geometry import GEOMETRY  # noqa: E402
+from geometry import GEOMETRY, coverage_share  # noqa: E402
 from paths import results_dir  # noqa: E402
 
 ROOT = results_dir("attention_chunk0")
@@ -59,6 +59,7 @@ def load(model: str, res: str, duration: int) -> dict | None:
         data = np.load(dump)
         steps[step] = {
             "scores": data["scores"],  # [layers, heads, queries, keys]
+            "coverage": data["coverage"],  # [layers, heads, queries], full axis
             "layer_ids": [int(i) for i in data["layer_ids"]],
         }
     return {"steps": steps, "meta": json.loads((run / "meta.json").read_text())}
@@ -145,19 +146,22 @@ def plot_sheet(
 
 
 def concentration(entry: dict, layer: int) -> list[float]:
-    """Median share of keys needed for 90% of the mass, per denoising step."""
+    """Median share of keys needed for 90% of the mass, per denoising step.
+
+    Uses the probe's ``coverage``, measured during capture on the *full*
+    un-strided key axis. Deriving this from the strided ``scores`` is biased in
+    both directions -- a narrow diagonal collapses to one sampled column and
+    reads far sparser than it is.
+    """
+    stride = entry["meta"]["qk_key_stride"]
     shares = []
     for step in sorted(entry["steps"]):
         payload = entry["steps"][step]
         if layer not in payload["layer_ids"]:
             continue
-        scores = payload["scores"][payload["layer_ids"].index(layer)]
-        # scores are a strided view of a normalized row; rank and accumulate
-        ranked = np.sort(scores.astype(np.float32), axis=-1)[..., ::-1]
-        total = ranked.sum(axis=-1, keepdims=True)
-        cumulative = np.cumsum(ranked, axis=-1) / np.maximum(total, 1e-12)
-        needed = (cumulative < 0.9).sum(axis=-1) + 1
-        shares.append(float(np.median(needed / scores.shape[-1])))
+        index = payload["layer_ids"].index(layer)
+        visible = payload["scores"].shape[-1] * stride
+        shares.append(coverage_share(payload["coverage"][index], visible))
     return shares
 
 
