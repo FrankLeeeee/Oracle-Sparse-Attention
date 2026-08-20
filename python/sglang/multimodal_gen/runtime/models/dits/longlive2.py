@@ -21,6 +21,11 @@ from sglang.multimodal_gen.runtime.models.dits.causal_wanvideo import (
     CausalWanTransformer3DModel,
     CausalWanTransformerBlock,
 )
+from sglang.multimodal_gen.runtime.utils.chunk_timing_probe import (
+    CROSS_ATTENTION,
+    SELF_ATTENTION,
+    attention_timing,
+)
 
 
 class LongLive2CausalWanTransformerBlock(CausalWanTransformerBlock):
@@ -107,16 +112,17 @@ class LongLive2CausalWanTransformerBlock(CausalWanTransformerBlock):
         key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
         value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
 
-        attn_output = self.attn1(
-            query,
-            key,
-            value,
-            freqs_cis,
-            block_mask,
-            kv_cache,
-            current_start,
-            cache_start,
-        )
+        with attention_timing(SELF_ATTENTION):
+            attn_output = self.attn1(
+                query,
+                key,
+                value,
+                freqs_cis,
+                block_mask,
+                kv_cache,
+                current_start,
+                cache_start,
+            )
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -131,11 +137,12 @@ class LongLive2CausalWanTransformerBlock(CausalWanTransformerBlock):
             orig_dtype
         ), hidden_states.to(orig_dtype)
 
-        attn_output = self._cross_attn_with_cache(
-            norm_hidden_states,
-            encoder_hidden_states,
-            crossattn_cache,
-        )
+        with attention_timing(CROSS_ATTENTION):
+            attn_output = self._cross_attn_with_cache(
+                norm_hidden_states,
+                encoder_hidden_states,
+                crossattn_cache,
+            )
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )

@@ -34,6 +34,10 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_ATTENTION_MAP_QK_KEY_STRIDE: int = 16
     SGLANG_DIFFUSION_ATTENTION_MAP_QK_STEPS: str = "0"
     SGLANG_DIFFUSION_ATTENTION_MAP_QK_LAYERS: str | None = None
+    SGLANG_DIFFUSION_ATTENTION_MAP_QK_HEADS: str | None = None
+    SGLANG_DIFFUSION_ATTENTION_MAP_QK_ONLY: bool = False
+    SGLANG_DIFFUSION_CHUNK_TIMING_DIR: str | None = None
+    SGLANG_DIFFUSION_FRAME_SIMILARITY_DIR: str | None = None
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
@@ -274,9 +278,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # directory with a pre-generated noise bank: causal DMD denoising then
     # consumes init_noise_bcthw.pt / renoise_<i>.pt instead of sampling, and
     # dumps the final denoised latents to sglang_latents.pt in the same dir.
-    "SGLANG_DIFFUSION_TEST_PARITY_DIR": _lazy_path(
-        "SGLANG_DIFFUSION_TEST_PARITY_DIR"
-    ),
+    "SGLANG_DIFFUSION_TEST_PARITY_DIR": _lazy_path("SGLANG_DIFFUSION_TEST_PARITY_DIR"),
     # Query subsampling stride of the attention-map probe. Higher is cheaper and
     # noisier; the probe recomputes softmax(q k^T) for every stride-th query.
     "SGLANG_DIFFUSION_ATTENTION_MAP_QUERY_STRIDE": _lazy_int(
@@ -319,6 +321,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Unset = every layer. Dump size scales linearly with the layer count.
     "SGLANG_DIFFUSION_ATTENTION_MAP_QK_LAYERS": _lazy_str(
         "SGLANG_DIFFUSION_ATTENTION_MAP_QK_LAYERS", None
+    ),
+    # Head indices to include in the QK-matrix dump. Either a flat list applied
+    # to every layer ("0,3,7") or per-layer groups ("0:0,3;29:2,9"), layers
+    # separated by ";". Unset = every head. Dump size scales linearly with the
+    # head count, so a four-head selection is ~10x smaller than a 40-head DiT's
+    # default dump.
+    "SGLANG_DIFFUSION_ATTENTION_MAP_QK_HEADS": _lazy_str(
+        "SGLANG_DIFFUSION_ATTENTION_MAP_QK_HEADS", None
+    ),
+    # Dump only the selected QK matrices and skip the always-on per-frame
+    # attention-mass accumulation. The mass pass recomputes a full softmax for
+    # every layer of every step of every chunk, so skipping it makes a
+    # QK-only capture several times faster; chunk_<c>.npz is then not written.
+    "SGLANG_DIFFUSION_ATTENTION_MAP_QK_ONLY": _lazy_bool(
+        "SGLANG_DIFFUSION_ATTENTION_MAP_QK_ONLY"
+    ),
+    # Enables the per-chunk forward/attention wall-time probe for block-causal
+    # video DiTs if set. Path to the directory where chunk_timing.json is
+    # written. CUDA events only; no synchronization inside a chunk.
+    "SGLANG_DIFFUSION_CHUNK_TIMING_DIR": _lazy_path(
+        "SGLANG_DIFFUSION_CHUNK_TIMING_DIR"
+    ),
+    # Enables the intra-chunk frame-similarity probe if set. Path to the
+    # directory where frame_similarity.npz is written: per (chunk, step, layer)
+    # cosine similarity between every pair of latent frames of the chunk.
+    "SGLANG_DIFFUSION_FRAME_SIMILARITY_DIR": _lazy_path(
+        "SGLANG_DIFFUSION_FRAME_SIMILARITY_DIR"
     ),
     # If set, sgl_diffusion will run in development mode, which will enable
     # some additional endpoints for developing and debugging,

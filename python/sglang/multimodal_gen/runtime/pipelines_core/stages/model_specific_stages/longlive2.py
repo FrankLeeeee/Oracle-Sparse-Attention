@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from collections.abc import Callable
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -23,6 +24,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.attention_map_probe import (
+    CACHE_UPDATE_PASS,
+    get_attention_map_recorder,
+)
+from sglang.multimodal_gen.runtime.utils.chunk_timing_probe import (
+    timing_pass_kind_scope,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 
@@ -892,19 +900,26 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
             device=context_input.device,
             dtype=torch.float32,
         )
-        self._forward_causal_transformer(
-            batch,
-            latent_model_input=context_input.to(target_dtype),
-            prompt_embeds=prompt_embeds,
-            timestep=timestep,
-            kv_cache=kv_cache,
-            crossattn_cache=crossattn_cache,
-            current_start_tokens=current_start_tokens,
-            start_frame=start_frame,
-            image_kwargs=image_kwargs,
-            pos_cond_kwargs=pos_cond_kwargs,
-            current_timestep=0,
-            attn_metadata=attn_metadata,
-            target_dtype=target_dtype,
-            autocast_enabled=autocast_enabled,
+        recorder = get_attention_map_recorder()
+        pass_scope = (
+            recorder.pass_kind_scope(CACHE_UPDATE_PASS)
+            if recorder is not None
+            else nullcontext()
         )
+        with pass_scope, timing_pass_kind_scope(CACHE_UPDATE_PASS):
+            self._forward_causal_transformer(
+                batch,
+                latent_model_input=context_input.to(target_dtype),
+                prompt_embeds=prompt_embeds,
+                timestep=timestep,
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start_tokens=current_start_tokens,
+                start_frame=start_frame,
+                image_kwargs=image_kwargs,
+                pos_cond_kwargs=pos_cond_kwargs,
+                current_timestep=0,
+                attn_metadata=attn_metadata,
+                target_dtype=target_dtype,
+                autocast_enabled=autocast_enabled,
+            )

@@ -78,6 +78,12 @@ from sglang.multimodal_gen.runtime.utils.attention_map_probe import (
     get_attention_map_recorder,
     warn_unsupported_once,
 )
+from sglang.multimodal_gen.runtime.utils.chunk_timing_probe import (
+    CROSS_ATTENTION,
+    SELF_ATTENTION,
+    attention_timing,
+    get_chunk_timing_recorder,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
@@ -528,16 +534,17 @@ class CausalWanTransformerBlock(nn.Module):
         key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
         value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
 
-        attn_output = self.attn1(
-            query,
-            key,
-            value,
-            freqs_cis,
-            block_mask,
-            kv_cache,
-            current_start,
-            cache_start,
-        )
+        with attention_timing(SELF_ATTENTION):
+            attn_output = self.attn1(
+                query,
+                key,
+                value,
+                freqs_cis,
+                block_mask,
+                kv_cache,
+                current_start,
+                cache_start,
+            )
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -553,11 +560,12 @@ class CausalWanTransformerBlock(nn.Module):
         ), hidden_states.to(orig_dtype)
 
         # 2. Cross-attention (text K/V cached across denoising steps)
-        attn_output = self._cross_attn_with_cache(
-            norm_hidden_states,
-            encoder_hidden_states,
-            crossattn_cache,
-        )
+        with attention_timing(CROSS_ATTENTION):
+            attn_output = self._cross_attn_with_cache(
+                norm_hidden_states,
+                encoder_hidden_states,
+                crossattn_cache,
+            )
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
@@ -845,6 +853,13 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 grid_height=post_patch_height,
                 grid_width=post_patch_width,
             )
+        timing = get_chunk_timing_recorder()
+        if timing is not None and kv_cache is not None:
+            chunk_tokens = (
+                self.num_frame_per_block * post_patch_height * post_patch_width
+            )
+            timing.note_layer_count(len(self.blocks))
+            timing.begin_forward(chunk_index=current_start // chunk_tokens)
         sparse_attention = get_sparse_attention_backend()
         if sparse_attention is not None and kv_cache is not None:
             sparse_attention.begin_forward(
@@ -892,6 +907,8 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         if recorder is not None:
             recorder.end_forward()
+        if timing is not None:
+            timing.end_forward()
 
         # 5. Output norm, projection & unpatchify
         temb = temb.unflatten(dim=0, sizes=timestep.shape).unsqueeze(2)

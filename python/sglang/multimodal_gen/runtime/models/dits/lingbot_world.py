@@ -98,6 +98,12 @@ from sglang.multimodal_gen.runtime.utils.attention_map_probe import (
     get_attention_map_recorder,
     warn_unsupported_once,
 )
+from sglang.multimodal_gen.runtime.utils.chunk_timing_probe import (
+    CROSS_ATTENTION,
+    SELF_ATTENTION,
+    attention_timing,
+    get_chunk_timing_recorder,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
@@ -1103,17 +1109,18 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
         value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
 
-        attn_output = self.attn1(
-            query,
-            key,
-            value,
-            freqs_cis,
-            block_mask,
-            kv_cache,
-            current_start,
-            cache_start,
-            update_cache_only=update_cache_only,
-        )
+        with attention_timing(SELF_ATTENTION):
+            attn_output = self.attn1(
+                query,
+                key,
+                value,
+                freqs_cis,
+                block_mask,
+                kv_cache,
+                current_start,
+                cache_start,
+                update_cache_only=update_cache_only,
+            )
         if update_cache_only:
             return hidden_states
         attn_output = attn_output.flatten(2)
@@ -1139,9 +1146,10 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             orig_dtype
         )
 
-        attn_output = self._cross_attn_with_cache(
-            norm_hidden_states, encoder_hidden_states, crossattn_cache
-        )
+        with attention_timing(CROSS_ATTENTION):
+            attn_output = self._cross_attn_with_cache(
+                norm_hidden_states, encoder_hidden_states, crossattn_cache
+            )
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
@@ -1616,6 +1624,13 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 grid_height=post_patch_height,
                 grid_width=post_patch_width,
             )
+        timing = get_chunk_timing_recorder()
+        if timing is not None and kv_cache is not None:
+            chunk_tokens = (
+                self.num_frame_per_block * post_patch_height * post_patch_width
+            )
+            timing.note_layer_count(len(self.blocks))
+            timing.begin_forward(chunk_index=current_start // chunk_tokens)
 
         for block_index, block in enumerate(self.blocks):
             hidden_states = block(
@@ -1640,6 +1655,8 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
 
         if recorder is not None:
             recorder.end_forward()
+        if timing is not None:
+            timing.end_forward()
 
         if skip_final_projection:
             return hidden_states

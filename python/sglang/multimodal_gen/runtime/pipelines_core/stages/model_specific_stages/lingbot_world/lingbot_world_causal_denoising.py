@@ -3,6 +3,7 @@
 
 """LingBot-World causal DMD denoising stage."""
 
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -35,6 +36,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.attention_map_probe import (
+    CACHE_UPDATE_PASS,
+    get_attention_map_recorder,
+)
+from sglang.multimodal_gen.runtime.utils.chunk_timing_probe import (
+    timing_pass_kind_scope,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -540,6 +548,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             device=context_input.device,
             dtype=torch.long,
         )
+        recorder = get_attention_map_recorder()
         with (
             torch.autocast(
                 device_type=current_platform.device_type,
@@ -551,6 +560,12 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
                 attn_metadata=attn_metadata,
                 forward_batch=batch,
             ),
+            (
+                recorder.pass_kind_scope(CACHE_UPDATE_PASS)
+                if recorder is not None
+                else nullcontext()
+            ),
+            timing_pass_kind_scope(CACHE_UPDATE_PASS),
         ):
             self.transformer(
                 context_input.to(target_dtype),
