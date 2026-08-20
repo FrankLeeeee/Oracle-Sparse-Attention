@@ -1,0 +1,55 @@
+<h3>逐 chunk 耗时：forward 与 attention</h3>
+<p>上面的拆分是整段视频的聚合值，看不出「越往后越慢，还是一直恒定」。这里给每个 chunk 单独计时，得到耗时随 chunk index 的曲线。</p>
+<p><b>测量方式</b></p>
+<ul>
+<li>新增探针 <code>SGLANG_DIFFUSION_CHUNK_TIMING_DIR</code>：用 CUDA event 包住每次 DiT forward，以及每一层的 self-attention 与 cross-attention 模块，按 chunk 汇总（对该 chunk 的所有去噪步求和）。event 只在 chunk 边界统一结算，chunk 内不做任何同步，对被测延迟影响很小。</li>
+<li>图里 <b>attention = self-attention + cross-attention</b>；虚线是每个 chunk 去噪结束后刷新 KV cache 的那次额外 forward，它不属于去噪步，单独画出。</li>
+<li>24 个配置 = 4 模型 × {480p, 720p} × {5, 10, 20 s}，单卡 H200 <b>串行独占</b>（多卡并发会明显抬高计时）。prompt 为「暴雨森林中奔跑的女孩」，seed 42。</li>
+<li>chunk 0 在明显偏高时不入图：一次性 kernel autotune 会让它到 4～6 s，而稳态只有 0.2～1.4 s，具体数值已标在图内。LingBot 由 server 预热，它的 chunk 0 是有效数据点。</li>
+</ul>
+<p><b>结论 1：三种截然不同的曲线形状</b></p>
+<ul>
+<li><b>Self-Forcing（全上下文）——逐 chunk 线性增长。</b>720p/20 s 从 0.50 s（chunk 1）涨到 3.66 s（chunk 26），7.3×；480p 从 0.16 s 到 0.82 s，5.1×。逐 chunk 线性即整段二次增长，这正是它随时长超线性的直接来源。</li>
+<li><b>Rolling Forcing（5 块滚动窗口）——ramp-up 后完全恒定。</b>720p 稳态 1.40 s/窗口，480p 0.34 s；稳态下每个窗口只做 1 个去噪步、产出 1 个 chunk。最后 4 个窗口进入排空阶段，逐步降到 0.30 s。</li>
+<li><b>LongLive-2（8 帧 chunk + 窗口封顶）——3 个 chunk 后锁死。</b>720p 0.88 s/chunk，480p 0.30 s，之后一路平直到视频结束。</li>
+<li><b>LingBot-World v2（3 帧 chunk + sink 与窗口封顶）——5 个 chunk 后锁死。</b>720p 5.90 s/chunk，480p 1.78 s。</li>
+</ul>
+<p><b>结论 2：稳态下 attention 就是 forward 的主体</b></p>
+<ul>
+<li>720p attention 占 forward：Self-Forcing 90%、Rolling Forcing 83%、LingBot 65%、LongLive-2 59%；480p 对应 81% / 69% / 48% / 45%。<b>分辨率越高占比越高</b>——attention 随 token 数二次增长，GEMM 只随 token 数线性增长。</li>
+<li>Self-Forcing 的占比还随 chunk 单调上升（720p/20 s 从 59% 升到 94%），窗口封顶的三个模型爬坡结束后占比就固定不动了。</li>
+<li><b>cross-attention 很小且恒定</b>：720p 每 chunk 分别为 0.03 / 0.04 / 0.06 / 0.31 s（LingBot 因为 40 层 + I2V 条件而偏大）。把它并入 attention 曲线不改变任何结论。</li>
+<li><b>KV cache 刷新 forward 不可忽略</b>：720p/20 s 全程额外占 Self-Forcing 13.6 s、LingBot 38.4 s，约为去噪 forward 的 1/4。</li>
+</ul>
+<p><b>720p 稳态数值</b>（取中间 1/3 chunk 的中位数；Self-Forcing 无稳态，给首尾值）：</p>
+<table>
+<thead>
+<tr><th><p>模型</p></th><th><p>chunk 结构</p></th><th><p>forward / chunk</p></th><th><p>attention / chunk</p></th><th><p>attention 占比</p></th><th><p>cache 刷新 / chunk</p></th><th><p>形状</p></th></tr>
+</thead>
+<tbody>
+<tr><td><p>Self-Forcing 1.3B</p></td><td><p>3 帧 × 4 步</p></td><td><p>0.50 → 3.66 s</p></td><td><p>0.29 → 3.45 s</p></td><td><p>59% → 94%</p></td><td><p>0.14 → 0.92 s</p></td><td><p>线性增长</p></td></tr>
+<tr><td><p>Rolling Forcing 1.3B</p></td><td><p>3 帧 × 1 步 / 窗口</p></td><td><p>1.40 s</p></td><td><p>1.16 s</p></td><td><p>83%</p></td><td><p>0.28 s</p></td><td><p>恒定</p></td></tr>
+<tr><td><p>LongLive-2.0 5B</p></td><td><p>8 帧 × 4 步</p></td><td><p>0.88 s</p></td><td><p>0.52 s</p></td><td><p>59%</p></td><td><p>0.22 s</p></td><td><p>恒定</p></td></tr>
+<tr><td><p>LingBot-World v2 14B</p></td><td><p>3 帧 × 4 步</p></td><td><p>5.90 s</p></td><td><p>3.81 s</p></td><td><p>65%</p></td><td><p>1.45 s</p></td><td><p>恒定</p></td></tr>
+</tbody>
+</table>
+<p><b>与上文聚合数字的一致性检查</b>：把 720p/20 s 逐 chunk 的 forward 与 cache 刷新相加得到 Self-Forcing 71.9 s、Rolling Forcing 47.0 s、LongLive-2 20.0 s，与上表的去噪耗时（72 / 48 / 25 s）吻合，差值是调度、加噪等非 forward 开销。LingBot 为 195.0 s，高于上表的 170 s，因为 realtime 会话的 chunk 数与 prompt 都不同，不能直接对齐。</p>
+<p><b>已知噪声</b>：LingBot 480p/10 s 的前 5 个 chunk 抖动较大（2.2～2.6 s），因为它是同一个 server 上紧接着 5 s 会话跑的第二个会话；它最终收敛到与其他时长一致的 1.78 s 平台，不影响结论。</p>
+<p><b>复现命令</b></p>
+<pre lang="bash"><code># 1) 跑 24 个配置（单卡串行；--gpus auto 会自动挑空闲卡）
+python scripts/investigation/chunk_runtime/run_sweep.py --gpus 7
+
+# 2) 出图 + summary.json
+python scripts/investigation/chunk_runtime/plot.py
+
+# 单个配置手动测量：探针即插即用，任何 causal 视频模型都可以
+PYTHONPATH=python SGLANG_DIFFUSION_CHUNK_TIMING_DIR=/tmp/chunk_timing \
+sglang generate \
+  --model-path /data/projects/vision-gen/models/SelfForcing-Wan2.1-T2V-1.3B-Diffusers-fullctx-null \
+  --prompt "A dynamic and chaotic scene in a dense forest during a heavy rainstorm, ..." \
+  --width 1280 --height 720 --num-frames 321 --seed 42 --save-output
+# 结果： /tmp/chunk_timing/&lt;ModelTag&gt;-&lt;时间戳&gt;/chunk_timing.json
+
+# 3) 回写本文档（插入下面的 3 张图与 24 个视频）
+python scripts/investigation/chunk_runtime/doc_update.py</code></pre>
+<p>脚本在 <code>scripts/investigation/chunk_runtime/</code>（随代码版本管理），产出在 <code>results/investigation/chunk_runtime/</code>：每个配置的 <code>chunk_timing.json</code>（逐 chunk、逐去噪步的毫秒数）、<code>summary.json</code>、以及 24 个视频。</p>
