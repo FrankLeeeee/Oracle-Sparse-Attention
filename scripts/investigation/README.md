@@ -24,6 +24,16 @@ Models:
 | LongLive-2.0 5B | `Rabinovich/LongLive-2.0-5B-Diffusers` | 8-frame chunks, 4 steps, 8-frame sink + 32-frame window |
 | LingBot-World v2 14B | `robbyant/lingbot-world-v2-14b-…` (realtime WebSocket sessions — one-shot generate does a single chunk) | 3-frame chunks, 4 steps, I2V condition |
 
+**LingBot is I2V — its condition image must match the prompt.** It is the only
+image-conditioned model of the four, and the condition image dominates the
+scene: pointing it at a leftover picture produces that picture's world with the
+text prompt only bleeding in, while the other three models render the prompt.
+`chunk_runtime/run_sweep.py:lingbot_first_frame()` derives it from frame 0 of
+the Self-Forcing run for the same prompt, seed and resolution. The older
+`attention_token_maps/run_captures.py` still points at
+`inputs/uploads/a816103ba740450f9ded724ea1bf11e7_first_frame`, which is the red
+fox — correct for that round's fox prompt, wrong for any other prompt.
+
 ## 1. Runtime breakdown (`runtime_breakdown/`)
 
 Sweep: 4 models × {480p, 720p} × {5, 10, 20, 30}s. Per config a clean

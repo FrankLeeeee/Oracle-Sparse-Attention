@@ -28,6 +28,8 @@ from paths import REPO, results_dir  # noqa: E402
 
 ROOT = results_dir("attention_token_maps")
 PROMPT = "A red fox trotting across a snowy field, camera slowly tracking sideways"
+# LingBot is I2V and its condition image dominates the scene, so this frame
+# only matches PROMPT above (the red fox). Change both together.
 FIRST_FRAME = REPO / "inputs/uploads/a816103ba740450f9ded724ea1bf11e7_first_frame"
 TIMEOUT_S = 14400
 

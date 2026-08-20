@@ -47,7 +47,6 @@ PROMPT = (
     "wide-angle shot from a low angle, emphasizing the urgency and chaos of "
     "the moment."
 )
-FIRST_FRAME = REPO / "inputs/uploads/a816103ba740450f9ded724ea1bf11e7_first_frame"
 
 # 16 fps Wan models: pixel frames = 4 * latent - 3, latent divisible by 3.
 WAN_FRAMES = {5: 81, 10: 165, 20: 321}
@@ -110,6 +109,31 @@ def idle_gpus(max_used_mib: int = 1024) -> list[int]:
         if int(used) <= max_used_mib:
             found.append(int(index))
     return found
+
+
+def lingbot_first_frame(res: str) -> pathlib.Path:
+    """The I2V condition image for LingBot, matching this run's prompt.
+
+    LingBot is the only image-conditioned model here, and the condition image
+    dominates the scene: point it at an unrelated picture and the video shows
+    that picture's world with the prompt only bleeding in. Derive it instead
+    from frame 0 of the T2V run for the same prompt, seed and resolution, so
+    all four models depict the same thing.
+    """
+    target = ROOT / "first_frames" / f"{res}.png"
+    if target.exists():
+        return target
+    source = RUNS / "self_forcing" / f"{res}_20s" / "video.mp4"
+    if not source.exists():
+        raise RuntimeError(
+            f"no Self-Forcing video to take LingBot's condition frame from: {source}"
+        )
+    import imageio.v2 as imageio
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    imageio.imwrite(target, imageio.get_reader(source).get_data(0))
+    print(f"wrote LingBot condition frame {target}", flush=True)
+    return target
 
 
 def gpu_used_mib(gpu: int) -> int:
@@ -244,6 +268,7 @@ def run_realtime_jobs(
     spec = MODELS[model]
     width, height = spec["resolutions"][res]
     port = port_base + 2
+    first_frame = lingbot_first_frame(res)
     server_dir = RUNS / model / f"{res}_server"
     server_dir.mkdir(parents=True, exist_ok=True)
     timing_dir = server_dir / "timing_raw"
@@ -292,7 +317,7 @@ def run_realtime_jobs(
                         "--prompt",
                         PROMPT,
                         "--first-frame",
-                        str(FIRST_FRAME),
+                        str(first_frame),
                         "--size",
                         f"{width}x{height}",
                         "--num-frames",
