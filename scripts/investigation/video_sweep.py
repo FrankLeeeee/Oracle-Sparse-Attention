@@ -206,17 +206,35 @@ def base_env(
     return env
 
 
+def _snapshot(directory: pathlib.Path) -> list[tuple[str, int]]:
+    return sorted((item.name, item.stat().st_size) for item in directory.iterdir())
+
+
+def _settled(directory: pathlib.Path, *, quiet_s: float = 3.0) -> bool:
+    """Whether a dump directory has stopped being written to.
+
+    A probe writes several files and its meta.json last, so a directory that
+    merely exists can still be half-written; copying it then silently loses the
+    metadata.
+    """
+    before = _snapshot(directory)
+    if not before:
+        return False
+    time.sleep(quiet_s)
+    return before == _snapshot(directory)
+
+
 def collect_probe_output(probe_dir: pathlib.Path, out_dir: pathlib.Path) -> bool:
     """Copy the probe's newest dump next to the config's video and log.
 
     Probes write ``<dir>/<ModelTag>-<timestamp>/`` and flush asynchronously for
     realtime sessions (on session dispose), so this polls for the directory to
-    appear rather than assuming it is already there.
+    appear and then to settle, rather than assuming it is already complete.
     """
     deadline = time.time() + FLUSH_TIMEOUT_S
     while time.time() < deadline:
         dumps = sorted(d for d in probe_dir.iterdir() if d.is_dir())
-        if dumps:
+        if dumps and _settled(dumps[-1]):
             for item in dumps[-1].iterdir():
                 shutil.copy(item, out_dir / item.name)
             return True

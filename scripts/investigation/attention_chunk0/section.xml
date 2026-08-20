@@ -1,0 +1,56 @@
+<h2>Chunk 0 的注意力形成过程</h2>
+<p>chunk 0 是唯一没有任何历史上下文的 chunk：它的注意力结构必须在自己这几帧里从纯噪声中长出来。把它的<b>每一个去噪步</b>都 dump 出来，就能看到这个图案是怎么形成的。</p>
+<p><b>测量方式</b></p>
+<ul>
+<li>为此给注意力探针加了两个开关：<code>SGLANG_DIFFUSION_ATTENTION_MAP_QK_HEADS</code>（按层选头，支持 <code>层:头,头;层:头,头</code>）和 <code>SGLANG_DIFFUSION_ATTENTION_MAP_QK_ONLY</code>（跳过那个始终开着、对每层每步每 chunk 都重算一次完整 softmax 的逐帧质量统计）。没有这两个，多层 dump 的体积和耗时都不可接受。</li>
+<li>每个配置：<b>chunk 0、它的全部去噪步、5 个深度百分位的层（0/25/50/75/100%）、每层 4 个随机头</b>。头是按 (模型, 层) 用固定种子抽的——「随机 4 个头」只在层内有意义，第 0 层的 head 3 和第 29 层的 head 3 毫无关系；同一模型的所有图因此可以互相对照。</li>
+<li>24 个配置 = 4 模型 × {480p, 720p} × {5, 10, 20 s}，prompt 与 seed 42 同前两节。query/key 都按 16 抽样。</li>
+<li>图的读法：<b>每张图一个（配置, 层）</b>，行是去噪步、列是 4 个头，格子是 query × key 的注意力矩阵，颜色为对数概率。两个轴都只有 chunk 0 自己的 token。</li>
+</ul>
+<p><b>结论 1：去噪过程会把注意力「收紧」</b></p>
+<ul>
+<li>用「每行取多少个 key 才凑够 90% 概率质量」衡量（中位数，占可见 key 的比例），中间层在去噪过程中显著变稀疏：Self-Forcing 第 22 层 <b>11.6% → 1.6%</b>（稀疏 7 倍）、第 7 层 18.2% → 5.0%；LongLive-2 第 7 层 17.8% → 3.2%；Rolling Forcing 第 22 层 3.9% → 0.7%。</li>
+<li>也就是说第一步（纯噪声）时注意力最弥散，越去噪越集中——稀疏注意力在早期步上能省的最少，在末期步上最多。</li>
+</ul>
+<p><b>结论 2：稠密的是首尾两层，中间层才稀疏</b></p>
+<ul>
+<li>第 0 层始终稠密：Self-Forcing 41%、LongLive-2 49%、LingBot 16%，而且几乎不随去噪步变化。</li>
+<li>最后一层对 LongLive-2（43%）和 LingBot（34.5%）同样稠密，Self-Forcing 则是 5.0%。</li>
+<li>最稀疏的都在中段偏深处：LingBot 第 29 层只要 <b>1.2%</b> 的 key，Rolling Forcing 第 22 层 0.7%。</li>
+</ul>
+<p><b>结论 3：图案在中间层形成，首尾两层一开始就定型了</b></p>
+<ul>
+<li>用「每一步的图与最后一步的图在对数空间的相关系数」衡量（1.0 表示这一步图案已经和最终一致）：<b>最浅和最深的层第一步就已经很接近最终图案</b>——Self-Forcing 第 29 层 0.843、LingBot 第 0 层 0.827、LongLive-2 第 0 层 0.760。</li>
+<li><b>中间层变化最大</b>：LongLive-2 第 14 层第一步只有 <b>0.125</b>（几乎与最终图案无关），Self-Forcing 第 14 层 0.345。去噪真正在重塑的是网络中段的注意力。</li>
+<li>Rolling Forcing 无法用这个指标：它的 ramp-up 是靠<b>把窗口从 1 块长到 5 块</b>，每一步的矩阵尺寸都不同，没法逐格对照（它的 key 集中度趋势仍然一致：第 0 层 17.3% → 5.0%）。</li>
+</ul>
+<p><b>720p / 20 s 的数字</b>（key 占比 = 每行凑够 90% 质量所需 key 的中位数比例，第一步 → 最后一步；相关系数 = 第一步的图与最终图的对数空间相关）：</p>
+<table>
+<thead>
+<tr><th><p>模型</p></th><th><p>第 0 层 key 占比</p></th><th><p>最稀疏层</p></th><th><p>最后一层 key 占比</p></th><th><p>第一步相关系数（最浅 / 中间 / 最深）</p></th></tr>
+</thead>
+<tbody>
+<tr><td><p>Self-Forcing 1.3B</p></td><td><p>42.6% → 41.0%</p></td><td><p>第 22 层 1.6%</p></td><td><p>5.0%</p></td><td><p>0.55 / 0.35 / 0.84</p></td></tr>
+<tr><td><p>Rolling Forcing 1.3B</p></td><td><p>17.3% → 5.0%</p></td><td><p>第 22 层 0.7%</p></td><td><p>3.3%</p></td><td><p>窗口尺寸变化，不适用</p></td></tr>
+<tr><td><p>LongLive-2.0 5B</p></td><td><p>58.4% → 48.9%</p></td><td><p>第 7 层 3.2%</p></td><td><p>43.0%</p></td><td><p>0.76 / 0.13 / 0.64</p></td></tr>
+<tr><td><p>LingBot-World v2 14B</p></td><td><p>20.1% → 15.7%</p></td><td><p>第 29 层 1.2%</p></td><td><p>34.5%</p></td><td><p>0.83 / 0.60 / 0.78</p></td></tr>
+</tbody>
+</table>
+<p><b>看图时注意</b>：float16 会把很小的概率下溢成 0，图里已经把这些格子画成配色的最暗端（否则会渲染成白色，看起来反而像高值）。另外 3 帧 chunk 的图上能看到明显的 3×3 分块（帧对帧），LingBot 第 0 层的 head 38 甚至是接近三角形的结构。</p>
+<p><b>复现命令</b></p>
+<pre lang="bash"><code># 1) 24 个配置的 chunk 0 全步数抓取（不测耗时，可多卡并行）
+python scripts/investigation/attention_chunk0/run_captures.py --gpus 2,4,7
+
+# 2) 出图：120 张逐层网格 + 2 张形成曲线 + summary.json
+python scripts/investigation/attention_chunk0/plot.py
+# 只刷新 summary 与形成曲线（不重画网格）
+python scripts/investigation/attention_chunk0/plot.py --no-sheets
+
+# 想看单张大图（带 coverage 侧栏与完整坐标轴）用通用工具：
+PYTHONPATH=python python -m sglang.multimodal_gen.tools.plot_attention_token_maps \
+    results/investigation/attention_chunk0/runs/self_forcing/720p_20s \
+    --steps 0,3 --layers 29
+
+# 3) 回写本文档
+python scripts/investigation/attention_chunk0/doc_update.py</code></pre>
+<p>下面先放两张「图案何时定型」的曲线，再放逐层网格：四个模型 720p/20 s 的第 0 层与最深层各一张（对比首尾两层的差别）。全部 24 配置 × 5 层 = 120 张网格在 <code>results/investigation/attention_chunk0/sheets/</code>，原始 dump 是每个配置的 <code>qk_chunk_000_step_*.npz</code>（共 7.8 GB）。视频与前两节逐字节相同，不重复上传。</p>

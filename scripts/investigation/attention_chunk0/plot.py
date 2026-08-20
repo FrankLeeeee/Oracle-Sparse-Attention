@@ -29,6 +29,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from matplotlib.colors import LogNorm  # noqa: E402
+from matplotlib.ticker import MaxNLocator  # noqa: E402
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -161,11 +162,111 @@ def concentration(entry: dict, layer: int) -> list[float]:
     return shares
 
 
+def step_correlation(entry: dict, layer: int) -> list[float]:
+    """How close each denoising step's map already is to the final one.
+
+    Pearson correlation in log space (attention spans decades, so a linear
+    correlation would only see the few brightest cells), averaged over heads.
+    1.0 means the pattern was already in place at that step.
+    """
+    steps = sorted(entry["steps"])
+    maps = []
+    for step in steps:
+        payload = entry["steps"][step]
+        if layer not in payload["layer_ids"]:
+            return []
+        scores = payload["scores"][payload["layer_ids"].index(layer)]
+        maps.append(np.log10(np.maximum(scores.astype(np.float32), 1e-9)))
+    final = maps[-1]
+    if final.shape != maps[0].shape:
+        # Rolling Forcing's ramp-up windows grow, so the maps are not aligned
+        return []
+    values = []
+    for current in maps:
+        per_head = []
+        for head in range(final.shape[0]):
+            a, b = current[head].ravel(), final[head].ravel()
+            a = a - a.mean()
+            b = b - b.mean()
+            denominator = np.linalg.norm(a) * np.linalg.norm(b)
+            per_head.append(float(a @ b / denominator) if denominator else float("nan"))
+        values.append(float(np.nanmean(per_head)))
+    return values
+
+
+def plot_formation(data: dict, res: str, duration: int, out_dir: pathlib.Path) -> None:
+    """How early each depth's pattern settles, per model."""
+    models = [m for m in MODEL_ORDER if (m, res, duration) in data]
+    if not models:
+        return
+    fig, axes = plt.subplots(
+        1, len(models), figsize=(3.2 * len(models), 3.2), dpi=170, squeeze=False
+    )
+    for column, model in enumerate(models):
+        ax = axes[0][column]
+        entry = data[(model, res, duration)]
+        layers = entry["steps"][sorted(entry["steps"])[0]]["layer_ids"]
+        drawn = 0
+        for layer in layers:
+            values = step_correlation(entry, layer)
+            if not values:
+                continue
+            drawn += 1
+            ax.plot(
+                range(1, len(values) + 1),
+                values,
+                marker="o",
+                markersize=3,
+                linewidth=1.3,
+                label=f"layer {layer}",
+            )
+        ax.set_title(MODEL_LABELS[model], fontsize=9)
+        ax.set_xlabel("denoising step", fontsize=8)
+        if column == 0:
+            ax.set_ylabel("correlation with the final step", fontsize=8)
+        ax.set_ylim(0, 1.02)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.grid(alpha=0.25, linewidth=0.4)
+        ax.tick_params(labelsize=7)
+        if drawn:
+            ax.legend(fontsize=6, frameon=False, loc="lower right")
+        else:
+            # Rolling Forcing ramps up by *growing* the joint window, so its
+            # chunk-0 maps change shape from step to step and cannot be
+            # correlated against the last one.
+            ax.text(
+                0.5,
+                0.5,
+                "not comparable:\nthe ramp-up window grows\n1→5 blocks across the steps",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+                fontsize=8,
+                color="#777777",
+            )
+            ax.set_xlim(1, 5)
+    fig.suptitle(
+        f"How early chunk 0's attention pattern settles · {res} · {duration}s "
+        "(log-space correlation of each step's map with the last step's)",
+        fontsize=11,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    path = out_dir / f"formation_{res}_{duration}s.png"
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--configs", default=None)
     parser.add_argument("--layers", default=None, help="default: every dumped layer")
     parser.add_argument("--out", type=pathlib.Path, default=ROOT)
+    parser.add_argument(
+        "--no-sheets",
+        action="store_true",
+        help="refresh only summary.json and the formation figures",
+    )
     args = parser.parse_args()
     out_dir = args.out
     sheets = out_dir / "sheets"
@@ -173,6 +274,7 @@ def main() -> None:
 
     wanted = set(args.configs.split(",")) if args.configs else None
     summary = []
+    loaded: dict[tuple[str, str, int], dict] = {}
     for model in MODEL_ORDER:
         for res in RESOLUTIONS:
             for duration in DURATIONS:
@@ -181,6 +283,7 @@ def main() -> None:
                 entry = load(model, res, duration)
                 if entry is None:
                     continue
+                loaded[(model, res, duration)] = entry
                 dumped = entry["steps"][sorted(entry["steps"])[0]]["layer_ids"]
                 layers = (
                     [int(x) for x in args.layers.split(",")] if args.layers else dumped
@@ -188,7 +291,8 @@ def main() -> None:
                 for layer in layers:
                     if layer not in dumped:
                         continue
-                    plot_sheet(entry, model, res, duration, layer, sheets)
+                    if not args.no_sheets:
+                        plot_sheet(entry, model, res, duration, layer, sheets)
                     summary.append(
                         {
                             "model": model,
@@ -197,8 +301,13 @@ def main() -> None:
                             "layer": layer,
                             "num_steps": len(entry["steps"]),
                             "key_share_for_90pct_by_step": concentration(entry, layer),
+                            "correlation_with_final_step": step_correlation(
+                                entry, layer
+                            ),
                         }
                     )
+    for res in RESOLUTIONS:
+        plot_formation(loaded, res, 20, out_dir)
     path = out_dir / "summary.json"
     path.write_text(json.dumps(summary, indent=2))
     print(f"wrote {path}")

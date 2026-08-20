@@ -189,3 +189,38 @@ Headlines (720p / 20s, last denoising step, mean over chunks and pairs):
   similarity is 0.793 at delta=1 and 0.765 from delta=6 on.
 - LingBot starts highest (0.66) because it is I2V — all frames of a chunk share
   one condition image.
+
+## 5. Chunk 0's attention forming (`attention_chunk0/`) — task 3.1
+
+Chunk 0 is the only chunk with no prior context, so whatever attention
+structure it has must form inside its own frames. Dumps every denoising step
+of chunk 0 at 5 depth percentiles x 4 heads per layer, using two new probe
+switches: `SGLANG_DIFFUSION_ATTENTION_MAP_QK_HEADS` (flat or per-layer head
+lists) and `..._QK_ONLY` (skips the always-on per-frame mass pass). Heads are
+drawn per (model, layer) from a seeded RNG, so every figure of a model is
+comparable. Rerun: `run_captures.py --gpus 2,4,7` then `plot.py`
+(`--no-sheets` refreshes only summary.json and the formation curves).
+
+Headlines (720p / 20s; key share = median fraction of keys needed for 90% of
+a row's mass, first step -> last):
+
+- **Denoising tightens attention**: middle layers sparsify sharply over the
+  steps — Self-Forcing layer 22 goes 11.6% -> 1.6%, LongLive-2 layer 7
+  17.8% -> 3.2%. Sparse attention saves least on the first step, most on the
+  last.
+- **The dense layers are the first and last**; the middle is where it is
+  sparse. Layer 0 stays at 16-49% and barely moves; LingBot's layer 29 needs
+  only 1.2% of its keys.
+- **The pattern forms in the middle of the network.** Correlating each step's
+  map with the final one (log space): the shallowest and deepest layers are
+  already at 0.76-0.84 on step 1, while middle layers start far away —
+  LongLive-2's layer 14 at 0.125, essentially unrelated to what it converges
+  to.
+- Rolling Forcing cannot be correlated this way: its ramp-up grows the joint
+  window 1 -> 5 blocks, so each step's matrix has a different shape. Its key
+  concentration follows the same trend (layer 0: 17.3% -> 5.0%).
+
+Two traps worth remembering: `np.percentile` over a large float16 array
+overflows its own index arithmetic and returns NaN (cast to float32 first),
+and float16 underflows small probabilities to exactly 0, which LogNorm masks
+and would draw white — i.e. looking like the high end.
