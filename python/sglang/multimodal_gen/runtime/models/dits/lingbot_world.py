@@ -104,6 +104,9 @@ from sglang.multimodal_gen.runtime.utils.chunk_timing_probe import (
     attention_timing,
     get_chunk_timing_recorder,
 )
+from sglang.multimodal_gen.runtime.utils.frame_similarity_probe import (
+    get_frame_similarity_recorder,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
@@ -1631,8 +1634,19 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
             )
             timing.note_layer_count(len(self.blocks))
             timing.begin_forward(chunk_index=current_start // chunk_tokens)
+        frame_similarity = get_frame_similarity_recorder()
+        if frame_similarity is not None and kv_cache is not None:
+            frame_similarity.begin_forward(
+                frame_seqlen=post_patch_height * post_patch_width,
+                num_frames_per_block=self.num_frame_per_block,
+                query_token_start=current_start,
+            )
 
         for block_index, block in enumerate(self.blocks):
+            if frame_similarity is not None:
+                frame_similarity.record_layer(
+                    layer_index=block_index, hidden_states=hidden_states
+                )
             hidden_states = block(
                 hidden_states,
                 encoder_hidden_states,
@@ -1653,6 +1667,11 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 and block_index == len(self.blocks) - 1,
             )
 
+        if frame_similarity is not None:
+            frame_similarity.record_layer(
+                layer_index=len(self.blocks), hidden_states=hidden_states
+            )
+            frame_similarity.end_forward()
         if recorder is not None:
             recorder.end_forward()
         if timing is not None:

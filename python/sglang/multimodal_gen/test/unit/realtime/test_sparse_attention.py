@@ -28,13 +28,13 @@ from sglang.multimodal_gen.runtime.layers.attention.sparse.blocks import (
     block_bounds,
     intra_frame_coverage,
 )
-from sglang.multimodal_gen.runtime.layers.attention.sparse.fastar import (
-    temporal_merge,
-)
 from sglang.multimodal_gen.runtime.layers.attention.sparse.context import (
     ChunkGeometry,
     frame_mask_to_ranges,
     visible_layout,
+)
+from sglang.multimodal_gen.runtime.layers.attention.sparse.fastar import (
+    temporal_merge,
 )
 from sglang.multimodal_gen.runtime.layers.attention.sparse.kernel import (
     plan_from_block_mask,

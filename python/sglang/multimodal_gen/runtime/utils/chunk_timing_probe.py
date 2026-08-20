@@ -36,9 +36,10 @@ from contextlib import contextmanager, nullcontext
 import torch
 
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.runtime.utils.attention_map_probe import (
+from sglang.multimodal_gen.runtime.utils.probe_pass_kind import (
     CACHE_UPDATE_PASS,
     DENOISE_PASS,
+    current_pass_kind,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,6 @@ class ChunkTimingRecorder:
 
     def __init__(self, *, output_dir: str) -> None:
         self.output_dir = pathlib.Path(output_dir)
-        self.current_pass_kind = DENOISE_PASS
         self.enabled = True
         # (chunk, pass_kind) -> region -> accumulated milliseconds
         self._totals: dict[tuple[int, str], dict[str, float]] = {}
@@ -73,16 +73,6 @@ class ChunkTimingRecorder:
         self._key: tuple[int, str] | None = None
         self._forward_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
         self._num_layers = 0
-
-    @contextmanager
-    def pass_kind_scope(self, pass_kind: str):
-        """Tag the forwards run inside the block (e.g. KV cache refreshes)."""
-        previous = self.current_pass_kind
-        self.current_pass_kind = pass_kind
-        try:
-            yield
-        finally:
-            self.current_pass_kind = previous
 
     @contextmanager
     def recording_scope(self, enabled: bool):
@@ -101,7 +91,7 @@ class ChunkTimingRecorder:
         if not self.enabled or not torch.cuda.is_available():
             self._key = None
             return
-        key = (chunk_index, pass_kind or self.current_pass_kind)
+        key = (chunk_index, pass_kind or current_pass_kind())
         if self._key is not None and key != self._key:
             # Chunk boundary: the pipeline synchronizes here anyway.
             self._resolve()
@@ -225,14 +215,3 @@ def attention_timing(name: str):
     if recorder is None:
         return _NULL_SCOPE
     return recorder.region(name)
-
-
-@contextmanager
-def timing_pass_kind_scope(pass_kind: str):
-    """Tag a block of forwards, whether or not the probe is enabled."""
-    recorder = get_chunk_timing_recorder()
-    if recorder is None:
-        yield
-        return
-    with recorder.pass_kind_scope(pass_kind):
-        yield

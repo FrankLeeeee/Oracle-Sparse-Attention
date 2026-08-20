@@ -47,8 +47,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
-    SelfForcingWanT2V480PConfig,
     LongVie2Config,
+    SelfForcingWanT2V480PConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,

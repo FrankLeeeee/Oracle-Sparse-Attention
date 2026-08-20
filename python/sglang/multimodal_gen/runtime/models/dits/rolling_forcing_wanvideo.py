@@ -47,10 +47,10 @@ from sglang.multimodal_gen.runtime.utils.attention_map_probe import (
     CACHE_UPDATE_PASS,
     get_attention_map_recorder,
 )
-from sglang.multimodal_gen.runtime.utils.chunk_timing_probe import (
-    timing_pass_kind_scope,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.probe_pass_kind import (
+    pass_kind_scope as probe_pass_kind_scope,
+)
 
 logger = init_logger(__name__)
 
@@ -466,7 +466,7 @@ class RollingForcingWanTransformer3DModel(CausalWanTransformer3DModel):
             else nullcontext()
         )
         timing_scope = (
-            timing_pass_kind_scope(CACHE_UPDATE_PASS)
+            probe_pass_kind_scope(CACHE_UPDATE_PASS)
             if updating_cache
             else nullcontext()
         )

@@ -6,14 +6,16 @@ import pathlib
 import pytest
 import torch
 
-from sglang.multimodal_gen.runtime.utils.attention_map_probe import (
-    CACHE_UPDATE_PASS,
-    DENOISE_PASS,
-)
 from sglang.multimodal_gen.runtime.utils.chunk_timing_probe import (
     CROSS_ATTENTION,
     SELF_ATTENTION,
     ChunkTimingRecorder,
+)
+from sglang.multimodal_gen.runtime.utils.probe_pass_kind import (
+    CACHE_UPDATE_PASS,
+    DENOISE_PASS,
+    current_pass_kind,
+    pass_kind_scope,
 )
 
 requires_cuda = pytest.mark.skipif(
@@ -27,12 +29,11 @@ def _busy(device: torch.device, size: int = 512) -> None:
     left @ right
 
 
-def test_pass_kind_scope_nests_and_restores(tmp_path: pathlib.Path):
-    recorder = ChunkTimingRecorder(output_dir=str(tmp_path))
-    assert recorder.current_pass_kind == DENOISE_PASS
-    with recorder.pass_kind_scope(CACHE_UPDATE_PASS):
-        assert recorder.current_pass_kind == CACHE_UPDATE_PASS
-    assert recorder.current_pass_kind == DENOISE_PASS
+def test_pass_kind_scope_nests_and_restores():
+    assert current_pass_kind() == DENOISE_PASS
+    with pass_kind_scope(CACHE_UPDATE_PASS):
+        assert current_pass_kind() == CACHE_UPDATE_PASS
+    assert current_pass_kind() == DENOISE_PASS
 
 
 def test_recording_scope_only_narrows(tmp_path: pathlib.Path):
@@ -63,7 +64,7 @@ def test_flush_groups_regions_by_chunk_and_pass(tmp_path: pathlib.Path):
                 with recorder.region(CROSS_ATTENTION):
                     _busy(device, size=128)
             recorder.end_forward()
-        with recorder.pass_kind_scope(CACHE_UPDATE_PASS):
+        with pass_kind_scope(CACHE_UPDATE_PASS):
             recorder.begin_forward(chunk_index=chunk)
             with recorder.region(SELF_ATTENTION):
                 _busy(device)

@@ -28,11 +28,11 @@ from sglang.multimodal_gen.runtime.utils.attention_map_probe import (
     CACHE_UPDATE_PASS,
     get_attention_map_recorder,
 )
-from sglang.multimodal_gen.runtime.utils.chunk_timing_probe import (
-    timing_pass_kind_scope,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.probe_pass_kind import (
+    pass_kind_scope as probe_pass_kind_scope,
+)
 
 logger = init_logger(__name__)
 LONG_LIVE2_DEFAULT_SCENE_CUT_PREFIX = "The scene transitions. "
@@ -906,7 +906,7 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
             if recorder is not None
             else nullcontext()
         )
-        with pass_scope, timing_pass_kind_scope(CACHE_UPDATE_PASS):
+        with pass_scope, probe_pass_kind_scope(CACHE_UPDATE_PASS):
             self._forward_causal_transformer(
                 batch,
                 latent_model_input=context_input.to(target_dtype),

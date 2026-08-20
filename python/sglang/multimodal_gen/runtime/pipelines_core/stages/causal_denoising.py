@@ -44,11 +44,16 @@ from sglang.multimodal_gen.runtime.utils.attention_map_probe import (
 )
 from sglang.multimodal_gen.runtime.utils.chunk_timing_probe import (
     get_chunk_timing_recorder,
-    timing_pass_kind_scope,
+)
+from sglang.multimodal_gen.runtime.utils.frame_similarity_probe import (
+    get_frame_similarity_recorder,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled as precision_autocast_enabled,
+)
+from sglang.multimodal_gen.runtime.utils.probe_pass_kind import (
+    pass_kind_scope as probe_pass_kind_scope,
 )
 
 logger = init_logger(__name__)
@@ -884,7 +889,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
             if sparse_backend is not None
             else nullcontext()
         )
-        with pass_scope, sparse_scope, timing_pass_kind_scope(CACHE_UPDATE_PASS):
+        with pass_scope, sparse_scope, probe_pass_kind_scope(CACHE_UPDATE_PASS):
             self._forward_causal_transformer(
                 batch,
                 latent_model_input=context_input.to(target_dtype),
@@ -1012,12 +1017,12 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 model_tag=model_tag,
                 meta=self._attention_map_meta(batch),
             )
-        timing = get_chunk_timing_recorder()
-        if timing is not None:
-            timing.flush(
-                model_tag=model_tag,
-                meta=self._attention_map_meta(batch),
-            )
+        for probe in (get_chunk_timing_recorder(), get_frame_similarity_recorder()):
+            if probe is not None:
+                probe.flush(
+                    model_tag=model_tag,
+                    meta=self._attention_map_meta(batch),
+                )
 
     def _defer_attention_map_flush(
         self, state: RealtimeCausalDiTState, batch: Req
@@ -1027,15 +1032,18 @@ class CausalDMDDenoisingStage(DenoisingStage):
         A realtime session generates one chunk per request, so flushing per
         request would scatter a single video over one run directory per chunk.
         """
-        recorder = get_attention_map_recorder()
-        timing = get_chunk_timing_recorder()
-        if recorder is None and timing is None:
+        probes = (
+            get_attention_map_recorder(),
+            get_chunk_timing_recorder(),
+            get_frame_similarity_recorder(),
+        )
+        if all(probe is None for probe in probes):
             return
         model_tag = type(self.transformer).__name__
         meta = self._attention_map_meta(batch)
 
         def dispose() -> None:
-            for probe in (recorder, timing):
+            for probe in probes:
                 if probe is not None:
                     probe.flush(model_tag=model_tag, meta=meta)
 

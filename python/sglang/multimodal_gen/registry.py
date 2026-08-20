@@ -59,6 +59,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuanvideo15 import (
+    CausalHunyuanVideo15TI2VConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
     Ideogram4DistilledPipelineConfig,
     Ideogram4PipelineConfig,
@@ -86,9 +89,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPlusPipelineConfig,
     QwenImageLayeredPipelineConfig,
     QwenImagePipelineConfig,
-)
-from sglang.multimodal_gen.configs.pipeline_configs.hunyuanvideo15 import (
-    CausalHunyuanVideo15TI2VConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
@@ -126,6 +126,9 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
+from sglang.multimodal_gen.configs.sample.hunyuanvideo15 import (
+    CausalHunyuanVideo15TI2VSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.ideogram import (
     Ideogram4FastSamplingParams,
     Ideogram4InstantSamplingParams,
@@ -157,9 +160,6 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageEditPlusSamplingParams,
     QwenImageLayeredSamplingParams,
     QwenImageSamplingParams,
-)
-from sglang.multimodal_gen.configs.sample.hunyuanvideo15 import (
-    CausalHunyuanVideo15TI2VSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
