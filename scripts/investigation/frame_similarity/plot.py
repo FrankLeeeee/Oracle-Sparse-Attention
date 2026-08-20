@@ -80,9 +80,10 @@ def plot_grid(entry: dict, model: str, res: str, duration: int, out_dir: pathlib
         fig, axes = plt.subplots(
             rows,
             columns,
-            figsize=(2.6 * columns + 1.2, 2.5 * rows + 0.9),
+            figsize=(2.6 * columns + 1.2, 2.75 * rows + 0.9),
             dpi=170,
             squeeze=False,
+            gridspec_kw={"hspace": 0.42, "wspace": 0.32},
         )
         image = None
         for index in range(rows * columns):

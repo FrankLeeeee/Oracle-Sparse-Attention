@@ -152,3 +152,40 @@ Headlines (720p / 20s, steady state = median of the middle third of chunks):
 - Caveat: a one-shot `sglang generate` pays CUDA kernel autotuning on chunk 0
   (4-6 s vs 0.2-1.4 s steady), so plots drop chunk 0 when it exceeds 1.5x
   chunk 1. A realtime server warms up first, so LingBot's chunk 0 is real.
+
+## 4. Intra-chunk frame similarity (`frame_similarity/`)
+
+New probe `SGLANG_DIFFUSION_FRAME_SIMILARITY_DIR`
+(`runtime/utils/frame_similarity_probe.py`): for every (chunk, denoising step,
+layer boundary, frame pair), the mean per-spatial-position cosine between the
+two latent frames of the chunk. Layer *i* is the hidden state *entering* block
+*i*; the last index is the final block's output. The KV-cache refresh pass is
+excluded via `probe_pass_kind`.
+
+Same 24 configs as section 3, but no wall time is measured so it fans out over
+several GPUs. Rerun: `run_sweep.py --gpus 4,7` then `plot.py`; `doc_update.py`
+writes the section. The probe does not perturb generation — its 24 videos are
+byte-identical to section 3's, which is why the doc does not re-upload them.
+
+Headlines (720p / 20s, last denoising step, mean over chunks and pairs):
+
+| model | chunk frames | input latents | after block 0 | body | final output |
+|---|---|---|---|---|---|
+| Self-Forcing 1.3B | 3 | 0.42 | 0.85 | 0.75 | 0.90 |
+| Rolling Forcing 1.3B | 3 | 0.46 | 0.88 | 0.77 | 0.89 |
+| LongLive-2.0 5B | 8 | 0.27 | 0.90 | 0.59 | 0.78 |
+| LingBot-World v2 14B | 3 | 0.66 | 0.88 | 0.71 | 0.95 |
+
+- **Block 0 erases the difference**: whatever the input similarity, every model
+  lands at 0.85-0.90 after the first block, independent of scale (1.3B-14B),
+  depth (30/40), chunk frames (3/8), resolution and duration. The models only
+  differ in the body.
+- Variation lives along depth, not time: the std across layers is 2.2x
+  (LingBot) to 10.3x (Rolling Forcing) the std across chunks.
+- Frames converge as denoising proceeds (body 0.58 -> 0.75 for Self-Forcing),
+  **except LongLive-2**, whose 0.593 -> 0.585 is flat — the one model with
+  8-frame chunks.
+- Similarity falls with frame distance but saturates: LongLive-2's output-layer
+  similarity is 0.793 at delta=1 and 0.765 from delta=6 on.
+- LingBot starts highest (0.66) because it is I2V — all frames of a chunk share
+  one condition image.

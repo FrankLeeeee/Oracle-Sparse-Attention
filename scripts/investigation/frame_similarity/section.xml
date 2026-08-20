@@ -1,0 +1,64 @@
+<h2>Chunk 内帧间相似度</h2>
+<p>块因果模型一次联合去噪 3 帧（LongLive-2 是 8 帧）。这些帧在网络内部到底有多像？这既决定了一个 chunk 能携带多少时间细节，也决定了稀疏注意力或缓存能吃掉多少冗余。</p>
+<p><b>测量方式</b></p>
+<ul>
+<li>新增探针 <code>SGLANG_DIFFUSION_FRAME_SIMILARITY_DIR</code>：取每个 transformer block 的<b>输入</b>隐藏态，外加最后一块的输出——30 层模型共 31 个层位，LingBot 40 层共 41 个。</li>
+<li>相似度口径：<b>对同一空间位置逐 token 求余弦，再对所有空间位置取平均</b>，即 sim(i, j) = mean_p cos(h_i[p], h_j[p])。不采用「整帧拉平成一个向量再求余弦」，否则少数大范数 token 会替整帧发言。</li>
+<li>输出是 <code>[chunks, steps, layers, pairs]</code>。<b>每个去噪步单独一张图</b>，图内每个子图是一对帧，横轴 chunk、纵轴 layer、颜色是相似度。3 帧 chunk 有 3 对，LongLive-2 的 8 帧 chunk 有 28 对。</li>
+<li>24 个配置 = 4 模型 × {480p, 720p} × {5, 10, 20 s}，prompt 与 seed 42 都与上一节相同。KV cache 刷新的那次前向不算去噪步，已排除。</li>
+<li><b>探针不改变生成结果</b>：本轮 24 个视频与 Runtime Breakdown 一节的视频逐字节相同，因此这里不重复上传视频。</li>
+</ul>
+<p><b>结论 1：第一个 block 就把帧间差异抹平了</b></p>
+<ul>
+<li>输入潜变量（layer 0）差异最大，且模型之间差别很大：LongLive-2 0.27、Self-Forcing 0.42、Rolling Forcing 0.46、LingBot 0.66（LingBot 是 I2V，所有帧共用同一张条件图，起点自然最像）。</li>
+<li><b>过完第 1 个 block 之后一律跳到 0.85～0.90</b>，与模型规模（1.3B → 14B）、层数（30 / 40）、chunk 帧数（3 / 8）、分辨率、时长统统无关。这是四个模型唯一完全一致的地方。</li>
+<li>最终输出又回到高位（LongLive-2 0.78 ～ LingBot 0.95）。<b>差异只存在于中间层</b>，那才是各模型分化的地方。</li>
+</ul>
+<p><b>结论 2：变化几乎只发生在深度方向，不随视频推进</b></p>
+<ul>
+<li>720p/20 s 最后一步：沿层方向的标准差是沿 chunk 方向的 2.2×（LingBot）到 10.3×（Rolling Forcing）。</li>
+<li>反映在图上就是<b>只有横向条纹、几乎没有竖向结构</b>——这是网络的结构性性质，不是随视频变长而漂移的现象。上一节里耗时随 chunk 大幅变化的 Self-Forcing，在这里也是平的。</li>
+</ul>
+<p><b>结论 3：去噪越往后帧越像——但 LongLive-2 例外</b></p>
+<ul>
+<li>中间层均值从第 1 步到最后一步：Self-Forcing 0.58 → 0.75、Rolling Forcing 0.55 → 0.77、LingBot 0.60 → 0.71。噪声退去后，同一 chunk 的帧收敛到同一个场景。</li>
+<li><b>LongLive-2 是 0.593 → 0.585，几乎不动</b>，四个去噪步的曲线在图上重合。它是唯一 8 帧 chunk 的模型，chunk 内时间跨度最大，去噪过程并不会让这些帧彼此靠拢。</li>
+</ul>
+<p><b>结论 4：相似度随帧间距下降，但很快饱和</b></p>
+<ul>
+<li>LongLive-2（8 帧 chunk，720p/20 s，最终输出）：Δ帧=1 → 0.793、2 → 0.781、3 → 0.772、4 → 0.768、5 → 0.766、6 和 7 → 0.765。<b>超过约 5 帧就不再进一步分化</b>。</li>
+<li>3 帧 chunk 的模型跨度太小，看不出趋势：Self-Forcing Δ=1 为 0.907、Δ=2 为 0.900。</li>
+</ul>
+<p><b>720p / 20 s 最后一个去噪步</b>（对 chunk 与帧对取平均）：</p>
+<table>
+<thead>
+<tr><th><p>模型</p></th><th><p>chunk 帧数</p></th><th><p>层位数</p></th><th><p>输入潜变量</p></th><th><p>第 1 块之后</p></th><th><p>中间层均值</p></th><th><p>最终输出</p></th></tr>
+</thead>
+<tbody>
+<tr><td><p>Self-Forcing 1.3B</p></td><td><p>3</p></td><td><p>31</p></td><td><p>0.42</p></td><td><p>0.85</p></td><td><p>0.75</p></td><td><p>0.90</p></td></tr>
+<tr><td><p>Rolling Forcing 1.3B</p></td><td><p>3</p></td><td><p>31</p></td><td><p>0.46</p></td><td><p>0.88</p></td><td><p>0.77</p></td><td><p>0.89</p></td></tr>
+<tr><td><p>LongLive-2.0 5B</p></td><td><p>8</p></td><td><p>31</p></td><td><p>0.27</p></td><td><p>0.90</p></td><td><p>0.59</p></td><td><p>0.78</p></td></tr>
+<tr><td><p>LingBot-World v2 14B</p></td><td><p>3</p></td><td><p>41</p></td><td><p>0.66</p></td><td><p>0.88</p></td><td><p>0.71</p></td><td><p>0.95</p></td></tr>
+</tbody>
+</table>
+<p><b>Rolling Forcing 的「步」怎么读</b>：它把 5 个块联合去噪，同一个 chunk 会先后出现在 5 个窗口里，因此它每个 chunk 也有完整的 5 个去噪步（step 1 = 该块刚进窗口、最噪，step 5 = 它是窗口里最老的一块、最干净）。</p>
+<p><b>复现命令</b></p>
+<pre lang="bash"><code># 1) 跑 24 个配置（不测耗时，可以多卡并行）
+python scripts/investigation/frame_similarity/run_sweep.py --gpus 4,7
+
+# 2) 出图：102 张逐步网格 + 2 张深度剖面 + summary.json
+python scripts/investigation/frame_similarity/plot.py
+
+# 只重画某个配置的网格
+python scripts/investigation/frame_similarity/plot.py --kind grid \
+    --configs longlive2/720p_20s
+
+# 单个配置手动测量：探针即插即用
+PYTHONPATH=python SGLANG_DIFFUSION_FRAME_SIMILARITY_DIR=/tmp/frame_sim \
+sglang generate --model-path &lt;ckpt&gt; --prompt "..." \
+  --width 1280 --height 720 --num-frames 321 --seed 42
+# 结果： /tmp/frame_sim/&lt;ModelTag&gt;-&lt;时间戳&gt;/frame_similarity.npz
+
+# 3) 回写本文档
+python scripts/investigation/frame_similarity/doc_update.py</code></pre>
+<p>下面先放两张跨模型的深度剖面图，再放逐步网格：Self-Forcing 720p/20 s 的全部 4 个去噪步（看步与步之间的变化），以及其余三个模型的最后一步。全部 24 个配置 × 每步一张、共 102 张图在 <code>results/investigation/frame_similarity/grids/</code>，原始数据是每个配置的 <code>frame_similarity.npz</code>。</p>
