@@ -72,6 +72,15 @@ MODELS = {
         "kind": "generate",
         "fps": 24,
     },
+    # Bidirectional baseline: the model the causal ones are distilled from.
+    # Full attention over the whole video, no chunks, no KV cache.
+    "wan2_1_t2v_1_3b": {
+        "path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        "frames": WAN_FRAMES,
+        "resolutions": {"480p": (832, 480), "720p": (1280, 720)},
+        "kind": "generate",
+        "fps": 16,
+    },
     "lingbot_world_v2": {
         "path": "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
         "frames": WAN_FRAMES,
@@ -448,18 +457,21 @@ def main(
     probe_env: dict,
     description: str,
     default_port_base: int = 35000,
-    extra_env: Callable[[str, str, int], dict] | None = None,
+    extra_env: Callable[[str, str, list[int]], dict] | None = None,
+    default_models: list[str] | None = None,
 ) -> None:
     """Run one sweep for ``topic`` with ``probe_env`` switched on.
 
     ``probe_env`` maps env var names to the probe's output directory (the value
     is filled in per config), e.g.
     ``{"SGLANG_DIFFUSION_CHUNK_TIMING_DIR": None}``. ``extra_env`` returns any
-    further env vars for a given (model, resolution, duration) — attention
-    captures need per-model layer and head selections.
+    further env vars for a (model, resolution, durations) job — attention
+    captures need per-model layer and head selections. It receives the whole
+    duration *list* of the job because a realtime model serves every duration
+    from one process, so its environment is fixed once for all of them.
     """
     parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--models", default=",".join(MODELS))
+    parser.add_argument("--models", default=",".join(default_models or MODELS))
     parser.add_argument(
         "--gpus",
         default="auto",
@@ -509,7 +521,7 @@ def main(
                         runs=runs,
                         probe_env=probe_env,
                         extra_env=(
-                            extra_env(model, res, job_durations[0]) if extra_env else {}
+                            extra_env(model, res, job_durations) if extra_env else {}
                         ),
                     )
                 else:
@@ -522,7 +534,7 @@ def main(
                         runs=runs,
                         probe_env=probe_env,
                         extra_env=(
-                            extra_env(model, res, job_durations[0]) if extra_env else {}
+                            extra_env(model, res, job_durations) if extra_env else {}
                         ),
                     )
             except Exception as error:

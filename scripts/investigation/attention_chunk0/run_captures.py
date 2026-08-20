@@ -19,7 +19,6 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import video_sweep  # noqa: E402
 from geometry import head_spec, layer_ids  # noqa: E402
@@ -33,7 +32,7 @@ QUERY_STRIDE = 16
 KEY_STRIDE = 16
 
 
-def capture_env(model: str, res: str, duration: int) -> dict:
+def capture_env(model: str, res: str, durations: list[int]) -> dict:
     layers = layer_ids(model)
     return {
         "SGLANG_DIFFUSION_ATTENTION_MAP_QK_CHUNKS": "0",

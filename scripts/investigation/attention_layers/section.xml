@@ -1,0 +1,54 @@
+<h2>注意力随视频推进与网络深度的变化</h2>
+<p>上一节只看了 chunk 0。这一节把 <b>chunk</b>（视频从头到尾均匀取 6 个）和 <b>层</b>（深度 0/25/50/75/100%）两个轴都铺开：3.2 关心第 0 层随 chunk 的变化，3.3 关心更深的层，两者只差在取哪几层，所以合并成一次抓取——头的选择也因此完全一致（沿用 3.1 的按 (模型, 层) 定种子抽的 4 个头）。</p>
+<p><b>测量方式</b></p>
+<ul>
+<li>每个配置：5 个深度百分位 × 6 个 chunk 百分位 × 每层 4 个头，<b>只 dump 每个 chunk 的最后一个去噪步</b>（步的维度已由 3.1 覆盖；全上下文模型后期 chunk 的可见 key 有几十万，每步都存会是几十 GB 而回答不了新问题）。</li>
+<li>Rolling Forcing 的「最后一步」是 step 0：它按窗口最老的那一块给 dump 编号，而那一块在该窗口里正处于最干净的状态。</li>
+<li>图的读法：<b>每张图一个（配置, 层）</b>，行是 chunk、列是 4 个头。<b>同一列里各行的宽度不同</b>——全上下文模型越靠后的 chunk 可见 key 越多，这正是要看的东西。</li>
+<li>key 轴按 32 抽样，所以「占比」是抽样估计；对极端集中的头（只需千分之几的 key）样本较少，数值有噪声，趋势可靠。</li>
+</ul>
+<p><b>先验证一下几何：探针看到的可见窗口</b>（720p/20 s 最后一个 chunk，token 数 ÷ 每帧 token 数）：</p>
+<ul>
+<li>Self-Forcing：291,616 token = <b>81 潜帧，1 段连续</b>——确实是全上下文。</li>
+<li>Rolling Forcing：75,616 = <b>21 帧，2 段</b>（sink + 滚动窗口）。LongLive-2：28,160 = <b>32 帧，2 段</b>。LingBot：64,800 = <b>18 帧，2 段</b>。</li>
+<li>三个封顶模型的可见集合在 chunk 0 之后就不再增长，Self-Forcing 从 10,816 一路涨到 291,616。</li>
+</ul>
+<p><b>结论 1：封顶模型稳态完全平，Self-Forcing 的绝对成本线性增长</b></p>
+<ul>
+<li>Rolling Forcing 第 7 层：chunk 0 需要 19.2% 的 key，之后一路稳定在 2.4～2.5%，最后一个 chunk 1.6%。LongLive-2、LingBot 同样在 chunk 0 之后就不动了。</li>
+<li>Self-Forcing 第 0 层的<b>占比</b>几乎不变（42.0% → 40.6%），但可见 key 涨了 27 倍，于是<b>绝对需要的 key 从约 4,500 涨到约 118,000 个 token</b>。这就是上一节「逐 chunk 耗时线性增长」在注意力侧的对应物：它不是变得更弥散，而是要看的东西按比例变多了。</li>
+</ul>
+<p><b>结论 2：首尾层稠密、中间层稀疏——整段视频都成立</b></p>
+<ul>
+<li>720p/20 s 最后一个 chunk 的占比：Self-Forcing 第 0 层 <b>40.6%</b> vs 第 7 层 <b>1.4%</b>；LongLive-2 第 0 层 30.9%、最后一层 20.7%，而第 7 层只要 <b>1.0%</b>；LingBot 第 39 层 13.5%，第 29 层只要 <b>0.4%</b>（约 260 个 token）。</li>
+<li>这和 3.1 在 chunk 0 上看到的完全一致，而且不随视频变长而改变——是网络的结构性性质。</li>
+</ul>
+<p><b>结论 3：Self-Forcing 的中间层随上下文变长反而略微变「宽」</b></p>
+<ul>
+<li>第 14 层 2.8% → 4.7%、第 22 层 2.4% → 3.9%（chunk 5 → chunk 26）。占比上升叠加可见集合本身增长，意味着这些层需要的绝对 key 数<b>快于线性</b>增长。</li>
+<li>封顶模型没有这个现象（占比恒定），因为它们根本看不到更多东西。</li>
+</ul>
+<p><b>720p / 20 s 最后一个 chunk：每行凑够 90% 质量所需 key 占可见 key 的比例</b></p>
+<table>
+<thead>
+<tr><th><p>模型</p></th><th><p>可见上下文</p></th><th><p>0% 深度</p></th><th><p>25%</p></th><th><p>50%</p></th><th><p>75%</p></th><th><p>100% 深度</p></th></tr>
+</thead>
+<tbody>
+<tr><td><p>Self-Forcing 1.3B</p></td><td><p>81 帧（全上下文）</p></td><td><p>40.6%</p></td><td><p>1.4%</p></td><td><p>4.7%</p></td><td><p>3.9%</p></td><td><p>1.9%</p></td></tr>
+<tr><td><p>Rolling Forcing 1.3B</p></td><td><p>21 帧（sink+窗口）</p></td><td><p>2.5%</p></td><td><p>1.6%</p></td><td><p>1.3%</p></td><td><p>0.8%</p></td><td><p>1.1%</p></td></tr>
+<tr><td><p>LongLive-2.0 5B</p></td><td><p>32 帧（sink+窗口）</p></td><td><p>30.9%</p></td><td><p>1.0%</p></td><td><p>4.2%</p></td><td><p>4.1%</p></td><td><p>20.7%</p></td></tr>
+<tr><td><p>LingBot-World v2 14B</p></td><td><p>18 帧（sink+窗口）</p></td><td><p>4.4%</p></td><td><p>5.4%</p></td><td><p>2.8%</p></td><td><p>0.4%</p></td><td><p>13.5%</p></td></tr>
+</tbody>
+</table>
+<p>480p 的结论相同，数值接近（例如 25% 深度层的最后一个 chunk：Self-Forcing 0.8% vs 720p 1.4%、Rolling Forcing 1.4% vs 1.6%、LongLive-2 1.4% vs 1.0%）。</p>
+<p><b>复现命令</b></p>
+<pre lang="bash"><code># 1) 24 个配置（5 层 × 6 chunk × 4 头，只取每个 chunk 最后一个去噪步）
+python scripts/investigation/attention_layers/run_captures.py --gpus 2,4,6,7
+
+# 2) 出图：120 张网格（每个配置每层一张）+ 2 张集中度曲线 + summary.json
+python scripts/investigation/attention_layers/plot.py
+python scripts/investigation/attention_layers/plot.py --no-sheets   # 只刷新数值
+
+# 3) 回写本文档
+python scripts/investigation/attention_layers/doc_update.py</code></pre>
+<p>下面先放两张集中度曲线（横轴 chunk、纵轴 90% 质量所需 key 占比、每条线一层），再放网格：<b>3.2</b> 是四个模型的第 0 层，<b>3.3</b> 是更深的层（Self-Forcing 取 25/50/100% 三个深度，其余模型取最深层）。全部 24 配置 × 5 层 = 120 张在 <code>results/investigation/attention_layers/sheets/</code>，原始 dump 13 GB。视频与前几节逐字节相同，不重复上传。</p>

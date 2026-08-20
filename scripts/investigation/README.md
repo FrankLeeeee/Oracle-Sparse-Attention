@@ -224,3 +224,43 @@ Two traps worth remembering: `np.percentile` over a large float16 array
 overflows its own index arithmetic and returns NaN (cast to float32 first),
 and float16 underflows small probabilities to exactly 0, which LogNorm masks
 and would draw white — i.e. looking like the high end.
+
+## 6. Attention over the video and over depth (`attention_layers/`) — tasks 3.2 + 3.3
+
+Same capture for both subtasks (they differ only in which layers are read), so
+the head selection is identical: 5 depth percentiles x 6 chunk percentiles x
+the same 4 seeded heads per layer as task 3.1, at each chunk's **last**
+denoising step only. Rerun: `run_captures.py --gpus 2,4,6,7` then `plot.py`.
+
+Geometry cross-check (720p/20s, last chunk, visible tokens / tokens-per-frame):
+Self-Forcing 81 latent frames in one contiguous segment (full context), Rolling
+Forcing 21 frames in 2 segments, LongLive-2 32 in 2, LingBot 18 in 2 — the sink
+plus window split shows up as the second segment, matching the geometry table.
+
+Headlines (720p/20s, last chunk, share of visible keys for 90% of a row's mass):
+
+| model | 0% depth | 25% | 50% | 75% | 100% |
+|---|---|---|---|---|---|
+| Self-Forcing 1.3B | 40.6% | 1.4% | 4.7% | 3.9% | 1.9% |
+| Rolling Forcing 1.3B | 2.5% | 1.6% | 1.3% | 0.8% | 1.1% |
+| LongLive-2.0 5B | 30.9% | 1.0% | 4.2% | 4.1% | 20.7% |
+| LingBot-World v2 14B | 4.4% | 5.4% | 2.8% | 0.4% | 13.5% |
+
+- **Capped models are flat in steady state**; only chunk 0 differs (it can see
+  nothing but itself). Self-Forcing's *share* also barely moves (42.0% ->
+  40.6% at layer 0) but its visible set grows 27x, so the absolute cost grows
+  from ~4.5k to ~118k tokens — the attention-side counterpart of its linear
+  per-chunk slowdown in section 3.
+- **First and last layers dense, middle sparse**, across the whole video, not
+  just chunk 0.
+- Self-Forcing's middle layers get *wider* with context (layer 14: 2.8% ->
+  4.7%), so their absolute key count grows faster than linearly. The capped
+  models show no such drift.
+
+Caveat: the key axis is sampled at stride 32, so shares are estimates; very
+concentrated heads (a few 0.1%) rest on few samples.
+
+Gotcha found here: `extra_env` used to be called with `durations[0]`, but a
+realtime model serves every duration from **one** server process, so LingBot
+got the 5s chunk percentiles for all three durations. It now receives the whole
+duration list and requests the union; the plotter filters back down.

@@ -32,7 +32,6 @@ from matplotlib.colors import LogNorm  # noqa: E402
 from matplotlib.ticker import MaxNLocator  # noqa: E402
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from geometry import GEOMETRY  # noqa: E402
 from paths import results_dir  # noqa: E402
 
