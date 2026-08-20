@@ -264,3 +264,29 @@ Gotcha found here: `extra_env` used to be called with `durations[0]`, but a
 realtime model serves every duration from **one** server process, so LingBot
 got the 5s chunk percentiles for all three durations. It now receives the whole
 duration list and requests the union; the plotter filters back down.
+
+## 7. Bidirectional baseline (`attention_bidirectional/`) — task 4
+
+Wan2.1-T2V-1.3B attends over the whole video at once — no chunks, no KV cache,
+no causal mask — and is the model the causal ones are distilled from (identical
+transformer shape as Self-Forcing: 30 layers x 12 heads). 6 configs x 5 depth
+percentiles x 4 seeded heads x the 0/25/50/75/100% steps of its 50-step
+schedule. The sampling stride adapts to the sequence length (16 at 480p/5s,
+256 at 720p/20s) since the matrix is (total tokens)^2.
+
+- **The depth profile is inverted versus the causal models.** Layer 0 is the
+  *sparsest* here — 10 to 57 tokens (0.02-0.03%), nearly constant as the
+  sequence grows from 32k to 292k tokens, i.e. a strictly local diagonal band.
+  The dense layers are the middle ones (layer 7: 5.7-11.8%). The causal models
+  are the other way round (layer 0 at 40-58%, middle sparse). Same architecture,
+  same parent model — causal distillation moves where attention concentrates.
+- **Denoising tightens attention**, exactly as in task 3.1 (layer 7: 27-31% ->
+  5.7%), so that property comes from diffusion itself, not from block-causality.
+- **Longer sequences need a larger fraction**: layer 7's final share is 5.7% ->
+  6.8% -> 11.8% for 5/10/20s at 480p, so its absolute count grows
+  super-linearly (1.9k -> 4.5k -> 14.9k tokens).
+
+Caveat: 720p/20s is far out of distribution for a 480p-native 1.3B model (9x
+the tokens of 480p/5s) and is the one config where the middle layers *re-widen*
+at the last steps (layer 7: 21.9% -> 28.0%). Treat it as a stress test; the
+other five agree. It took 43 min on one GPU.
