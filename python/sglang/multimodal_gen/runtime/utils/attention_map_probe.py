@@ -220,31 +220,33 @@ def strided_qk_probs(
     )
     for start in range(0, query.shape[0], query_tile):
         tile = query[start : start + query_tile].permute(1, 0, 2)
-        probs = torch.softmax(
-            torch.bmm(tile, key_by_head).float() * scale, dim=-1
-        )
+        probs = torch.softmax(torch.bmm(tile, key_by_head).float() * scale, dim=-1)
         out[:, start : start + tile.shape[1]] = probs[:, :, ::key_stride].to(
             torch.float16
         )
         ranked = torch.sort(probs, dim=-1, descending=True).values
         coverage[:, start : start + tile.shape[1]] = (
-            (ranked.cumsum(dim=-1) <= coverage_threshold).sum(dim=-1) + 1
-        ).clamp(max=key.shape[0]).to(torch.int32)
+            ((ranked.cumsum(dim=-1) <= coverage_threshold).sum(dim=-1) + 1)
+            .clamp(max=key.shape[0])
+            .to(torch.int32)
+        )
     return out, coverage
 
 
 def _concentration_ranks(frame_seqlen: int, *, device: torch.device) -> torch.Tensor:
     """Top-k cut-offs (0-based indices) for the per-query concentration curve."""
-    ranks = [k for k in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024) if k < frame_seqlen]
+    ranks = [
+        k for k in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024) if k < frame_seqlen
+    ]
     ranks.append(frame_seqlen)
     return torch.tensor([k - 1 for k in ranks], device=device)
 
 
 def _grow_token_buffer(buffer: torch.Tensor, *sizes: int) -> torch.Tensor:
     """Grow ``buffer`` so every axis is at least the requested size."""
-    assert len(sizes) == buffer.ndim, (
-        f"expected {buffer.ndim} sizes for a {buffer.ndim}-d buffer, got {len(sizes)}"
-    )
+    assert (
+        len(sizes) == buffer.ndim
+    ), f"expected {buffer.ndim} sizes for a {buffer.ndim}-d buffer, got {len(sizes)}"
     target = tuple(max(have, want) for have, want in zip(buffer.shape, sizes))
     if target == tuple(buffer.shape):
         return buffer
@@ -321,9 +323,7 @@ def spatial_displacement_mass(
     recorded = 0
     for frame in query_frames.unique().tolist():
         in_frame = (query_frames == frame).nonzero().flatten()
-        key_bin = (
-            temporal_bucket_ids(frame - key_frames) * frame_seqlen + key_spatial
-        )
+        key_bin = temporal_bucket_ids(frame - key_frames) * frame_seqlen + key_spatial
         for start in range(0, in_frame.numel(), query_tile):
             rows = in_frame[start : start + query_tile]
             tile = rows.numel()
@@ -341,9 +341,15 @@ def spatial_displacement_mass(
             per_cell.index_add_(2, key_bin, probs)
 
             spatial = query_positions[rows] % frame_seqlen
-            offset_y = cell_y[None, :] - (spatial // grid_width)[:, None] + grid_height - 1
-            offset_x = cell_x[None, :] - (spatial % grid_width)[:, None] + grid_width - 1
-            bins = (offset_y * width_bins + offset_x).reshape(-1)  # [tile * frame_seqlen]
+            offset_y = (
+                cell_y[None, :] - (spatial // grid_width)[:, None] + grid_height - 1
+            )
+            offset_x = (
+                cell_x[None, :] - (spatial % grid_width)[:, None] + grid_width - 1
+            )
+            bins = (offset_y * width_bins + offset_x).reshape(
+                -1
+            )  # [tile * frame_seqlen]
 
             by_bucket = per_cell.view(num_heads, tile, buckets, frame_seqlen)
             source = by_bucket.permute(0, 2, 1, 3).reshape(
@@ -409,6 +415,8 @@ class ChunkAttentionRecorder:
         qk_key_stride: int = 16,
         qk_steps: frozenset[int] = frozenset({0}),
         qk_layers: frozenset[int] | None = None,
+        qk_heads: dict[int, tuple[int, ...]] | None = None,
+        qk_only: bool = False,
         qk_coverage_threshold: float = 0.9,
     ) -> None:
         self.output_dir = pathlib.Path(output_dir)
@@ -422,7 +430,19 @@ class ChunkAttentionRecorder:
         self.qk_key_stride = max(1, qk_key_stride)
         self.qk_steps = qk_steps
         self.qk_layers = qk_layers
+        # layer -> head ids to dump; ``None`` under key -1 means "every head".
+        # Restricting heads is what makes a many-layer dump affordable: the
+        # matrices are the same size, there are just far fewer of them.
+        self.qk_heads = qk_heads
+        # Skip the per-frame attention-mass accumulation and dump only the
+        # selected QK matrices. The mass pass recomputes a full softmax for
+        # every layer of every step of every chunk, so it dominates the cost of
+        # a capture that only wants a handful of matrices.
+        self.qk_only = qk_only
         self.qk_coverage_threshold = qk_coverage_threshold
+        # layer -> the head ids actually dumped, for the plotter's labels
+        self._qk_head_ids: dict[int, list[int]] = {}
+        self._num_heads = 0
         # (chunk, step) -> layer -> [heads, nq, nk] float16. Keyed per step
         # because the query geometry can differ between a chunk's steps
         # (Rolling Forcing ramp-up windows grow), so steps cannot be stacked.
@@ -540,6 +560,19 @@ class ChunkAttentionRecorder:
             f"attention probe key segments cover {key_frame_ids.shape[0]} tokens "
             f"but the attention call sees {visible_key.shape[0]}"
         )
+        self._num_heads = max(self._num_heads, visible_key.shape[1])
+        if self.qk_chunks and scope.pass_kind == DENOISE_PASS:
+            self._maybe_dump_qk(
+                layer_index=layer_index,
+                sampled_query=sampled_query,
+                visible_key=visible_key,
+                query_positions=query_positions,
+                key_segments=key_segments,
+                scope=scope,
+            )
+        if self.qk_only:
+            return
+
         num_chunks = int(query_chunk_ids.max().item()) + 1
         num_frames = int(key_frame_ids.max().item()) + 1
         want_tokens = self.token_scores and scope.pass_kind == DENOISE_PASS
@@ -564,37 +597,6 @@ class ChunkAttentionRecorder:
             token_mass=token_mass,
             query_tile=self.query_tile,
         )
-        if self.qk_chunks and scope.pass_kind == DENOISE_PASS:
-            query_chunk = scope.query_token_start // scope.chunk_tokens
-            if query_chunk in self.qk_chunks:
-                step_key = (query_chunk, layer_index)
-                step_index = self._qk_step_counter.get(step_key, 0)
-                self._qk_step_counter[step_key] = step_index + 1
-                if step_index in self.qk_steps and (
-                    self.qk_layers is None or layer_index in self.qk_layers
-                ):
-                    probs, coverage = strided_qk_probs(
-                        sampled_query,
-                        visible_key,
-                        key_stride=self.qk_key_stride,
-                        coverage_threshold=self.qk_coverage_threshold,
-                        query_tile=self.query_tile,
-                    )
-                    dump_key = (query_chunk, step_index)
-                    self._qk_scores.setdefault(dump_key, {})[layer_index] = (
-                        probs.cpu().numpy()
-                    )
-                    self._qk_coverage.setdefault(dump_key, {})[layer_index] = (
-                        coverage.cpu().numpy()
-                    )
-                    if dump_key not in self._qk_positions:
-                        key_positions = segment_positions(
-                            key_segments, device=query.device
-                        )
-                        self._qk_positions[dump_key] = (
-                            query_positions.cpu().numpy(),
-                            key_positions[:: self.qk_key_stride].cpu().numpy(),
-                        )
         if token_mass is not None:
             self._accumulate_token_scores(
                 layer_index=layer_index,
@@ -619,6 +621,66 @@ class ChunkAttentionRecorder:
             )
 
     @torch.no_grad()
+    def _maybe_dump_qk(
+        self,
+        *,
+        layer_index: int,
+        sampled_query: torch.Tensor,
+        visible_key: torch.Tensor,
+        query_positions: torch.Tensor,
+        key_segments: Sequence[tuple[int, int]],
+        scope: ForwardScope,
+    ) -> None:
+        """Dump this layer's raw QK matrix if this (chunk, step, layer) is wanted."""
+        query_chunk = scope.query_token_start // scope.chunk_tokens
+        if query_chunk not in self.qk_chunks:
+            return
+        step_key = (query_chunk, layer_index)
+        step_index = self._qk_step_counter.get(step_key, 0)
+        self._qk_step_counter[step_key] = step_index + 1
+        if step_index not in self.qk_steps:
+            return
+        if self.qk_layers is not None and layer_index not in self.qk_layers:
+            return
+
+        heads = self.selected_heads(layer_index, visible_key.shape[1])
+        if heads is not None:
+            index = torch.as_tensor(heads, device=sampled_query.device)
+            sampled_query = sampled_query.index_select(1, index)
+            visible_key = visible_key.index_select(1, index)
+        self._qk_head_ids[layer_index] = (
+            list(heads) if heads is not None else list(range(visible_key.shape[1]))
+        )
+
+        probs, coverage = strided_qk_probs(
+            sampled_query,
+            visible_key,
+            key_stride=self.qk_key_stride,
+            coverage_threshold=self.qk_coverage_threshold,
+            query_tile=self.query_tile,
+        )
+        dump_key = (query_chunk, step_index)
+        self._qk_scores.setdefault(dump_key, {})[layer_index] = probs.cpu().numpy()
+        self._qk_coverage.setdefault(dump_key, {})[layer_index] = coverage.cpu().numpy()
+        if dump_key not in self._qk_positions:
+            key_positions = segment_positions(key_segments, device=sampled_query.device)
+            self._qk_positions[dump_key] = (
+                query_positions.cpu().numpy(),
+                key_positions[:: self.qk_key_stride].cpu().numpy(),
+            )
+
+    def selected_heads(
+        self, layer_index: int, num_heads: int
+    ) -> tuple[int, ...] | None:
+        """Head ids to dump for ``layer_index``, or ``None`` for every head."""
+        if self.qk_heads is None:
+            return None
+        heads = self.qk_heads.get(layer_index, self.qk_heads.get(-1))
+        if heads is None:
+            return None
+        return tuple(h for h in heads if 0 <= h < num_heads)
+
+    @torch.no_grad()
     def _accumulate_token_scores(
         self,
         *,
@@ -636,12 +698,18 @@ class ChunkAttentionRecorder:
         )
         if self._token_mass is None:
             self._token_mass = torch.zeros(
-                num_chunks, layer_index + 1, num_heads, num_tokens,
-                dtype=torch.float32, device=token_mass.device,
+                num_chunks,
+                layer_index + 1,
+                num_heads,
+                num_tokens,
+                dtype=torch.float32,
+                device=token_mass.device,
             )
             self._token_counts = torch.zeros(
-                num_chunks, layer_index + 1,
-                dtype=torch.float32, device=token_mass.device,
+                num_chunks,
+                layer_index + 1,
+                dtype=torch.float32,
+                device=token_mass.device,
             )
             self._token_visible = torch.zeros(
                 num_chunks, num_tokens, dtype=torch.bool, device=token_mass.device
@@ -693,17 +761,30 @@ class ChunkAttentionRecorder:
                 scope.frame_seqlen, device=query.device
             )
             self._displacement = torch.zeros(
-                1, heads, buckets,
-                2 * scope.grid_height - 1, 2 * scope.grid_width - 1,
-                dtype=torch.float32, device=query.device,
+                1,
+                heads,
+                buckets,
+                2 * scope.grid_height - 1,
+                2 * scope.grid_width - 1,
+                dtype=torch.float32,
+                device=query.device,
             )
             self._absolute = torch.zeros(
-                1, heads, buckets, scope.grid_height, scope.grid_width,
-                dtype=torch.float32, device=query.device,
+                1,
+                heads,
+                buckets,
+                scope.grid_height,
+                scope.grid_width,
+                dtype=torch.float32,
+                device=query.device,
             )
             self._concentration = torch.zeros(
-                1, heads, buckets, self._concentration_ranks.numel(),
-                dtype=torch.float32, device=query.device,
+                1,
+                heads,
+                buckets,
+                self._concentration_ranks.numel(),
+                dtype=torch.float32,
+                device=query.device,
             )
         self._displacement = _grow_to_layer(self._displacement, layer_index)
         self._absolute = _grow_to_layer(self._absolute, layer_index)
@@ -780,18 +861,22 @@ class ChunkAttentionRecorder:
         self._absolute = None
         self._concentration = None
         self._displacement_queries = {}
-        if not events:
+        head_ids = self._qk_head_ids
+        num_heads = self._num_heads
+        self._qk_head_ids = {}
+        self._num_heads = 0
+        if not events and not qk_scores:
             return None
 
         run_dir = self.output_dir / f"{model_tag}-{time.strftime('%Y%m%d-%H%M%S')}"
         run_dir.mkdir(parents=True, exist_ok=True)
-        num_frames = max(event.scores.shape[1] for event in events)
-        num_chunks = max(event.query_chunk for event in events) + 1
+        num_frames = max((e.scores.shape[1] for e in events), default=0)
+        num_chunks = max((e.query_chunk for e in events), default=-1) + 1
         by_chunk: dict[int, list[ChunkAttentionEvent]] = {}
         for event in events:
             by_chunk.setdefault(event.query_chunk, []).append(event)
 
-        num_layers = max(event.layer_index for event in events) + 1
+        num_layers = max((e.layer_index for e in events), default=-1) + 1
         for query_chunk, chunk_events in sorted(by_chunk.items()):
             arrays = {}
             for pass_kind in (DENOISE_PASS, CACHE_UPDATE_PASS):
@@ -866,6 +951,11 @@ class ChunkAttentionRecorder:
             spatial_meta["qk_key_stride"] = self.qk_key_stride
             spatial_meta["qk_chunks"] = sorted({c for c, _ in qk_scores})
             spatial_meta["qk_steps"] = sorted({s for _, s in qk_scores})
+            spatial_meta["qk_only"] = self.qk_only
+            # the plotter labels the dumped head axis with the real head ids
+            spatial_meta["qk_head_ids"] = {
+                str(layer): ids for layer, ids in sorted(head_ids.items())
+            }
         if grid is not None:
             spatial_meta["grid_height"], spatial_meta["grid_width"] = grid
         if frames_per_block:
@@ -882,7 +972,9 @@ class ChunkAttentionRecorder:
                     "num_layers": num_layers,
                     # the key axis of the dumps; callers pass pixel `num_frames`
                     "num_latent_frames": num_frames,
-                    "num_heads": int(events[0].scores.shape[0]),
+                    "num_heads": (
+                        int(events[0].scores.shape[0]) if events else num_heads
+                    ),
                     "query_stride": self.query_stride,
                     **spatial_meta,
                     **(meta or {}),
@@ -909,6 +1001,29 @@ _recorder: ChunkAttentionRecorder | None = None
 _recorder_resolved = False
 
 
+def parse_head_spec(raw: str | None) -> dict[int, tuple[int, ...]] | None:
+    """Parse ``SGLANG_DIFFUSION_ATTENTION_MAP_QK_HEADS``.
+
+    Either a flat list applied to every layer (``"0,3,7"``), or per-layer
+    groups (``"0:1,2,3;29:2,9,11"``). The flat form is stored under key -1.
+    Per-layer selection matters because "four random heads" is only meaningful
+    within a layer — head 3 of layer 0 and head 3 of layer 29 are unrelated.
+    """
+    if not raw:
+        return None
+    if ";" not in raw and ":" not in raw:
+        return {-1: tuple(int(part) for part in raw.split(",") if part.strip())}
+    selection: dict[int, tuple[int, ...]] = {}
+    for group in raw.split(";"):
+        if not group.strip():
+            continue
+        layer, _, heads = group.partition(":")
+        selection[int(layer)] = tuple(
+            int(part) for part in heads.split(",") if part.strip()
+        )
+    return selection
+
+
 def get_attention_map_recorder() -> ChunkAttentionRecorder | None:
     """The process-wide recorder, or ``None`` when the probe is disabled."""
     global _recorder, _recorder_resolved
@@ -923,6 +1038,7 @@ def get_attention_map_recorder() -> ChunkAttentionRecorder | None:
 
     if get_world_rank() != 0:
         return None
+
     def parse_id_set(raw: str | None) -> frozenset[int]:
         return (
             frozenset(int(part) for part in raw.split(",") if part.strip())
@@ -941,9 +1057,9 @@ def get_attention_map_recorder() -> ChunkAttentionRecorder | None:
         qk_chunks=qk_chunks,
         qk_key_stride=envs.SGLANG_DIFFUSION_ATTENTION_MAP_QK_KEY_STRIDE,
         qk_steps=parse_id_set(envs.SGLANG_DIFFUSION_ATTENTION_MAP_QK_STEPS),
-        qk_layers=(
-            parse_id_set(qk_layers_raw) if qk_layers_raw is not None else None
-        ),
+        qk_layers=(parse_id_set(qk_layers_raw) if qk_layers_raw is not None else None),
+        qk_heads=parse_head_spec(envs.SGLANG_DIFFUSION_ATTENTION_MAP_QK_HEADS),
+        qk_only=envs.SGLANG_DIFFUSION_ATTENTION_MAP_QK_ONLY,
     )
     logger.info(
         "Chunk attention-map probe enabled (dir=%s, query_stride=%d, spatial=%s)",

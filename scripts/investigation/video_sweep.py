@@ -26,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from paths import REPO, results_dir  # noqa: E402
@@ -186,7 +187,12 @@ def wait_for_free_gpu(gpu: int, *, max_used_mib: int = 2048) -> int:
     raise RuntimeError(f"gpu {gpu} still busy after {GPU_WAIT_TIMEOUT_S}s")
 
 
-def base_env(gpu: int, probe_dir: pathlib.Path, probe_env: dict) -> dict:
+def base_env(
+    gpu: int,
+    probe_dir: pathlib.Path,
+    probe_env: dict,
+    extra: dict | None = None,
+) -> dict:
     env = dict(os.environ)
     env.update(
         PYTHONPATH=str(REPO / "python"),
@@ -195,6 +201,7 @@ def base_env(gpu: int, probe_dir: pathlib.Path, probe_env: dict) -> dict:
         SGLANG_DIFFUSION_STAGE_LOGGING="1",
         SGLANG_DIFFUSION_SYNC_STAGE_PROFILING="1",
         **{name: str(probe_dir) for name in probe_env},
+        **(extra or {}),
     )
     return env
 
@@ -226,6 +233,7 @@ def run_generate_job(
     port_base: int,
     runs: pathlib.Path,
     probe_env: dict,
+    extra_env: dict,
 ) -> None:
     spec = MODELS[model]
     width, height = spec["resolutions"][res]
@@ -268,7 +276,7 @@ def run_generate_job(
             args,
             stdout=handle,
             stderr=subprocess.STDOUT,
-            env=base_env(gpu, probe_dir, probe_env),
+            env=base_env(gpu, probe_dir, probe_env, extra_env),
             cwd=out_dir,
             timeout=GENERATE_TIMEOUT_S,
         )
@@ -296,6 +304,7 @@ def run_realtime_jobs(
     port_base: int,
     runs: pathlib.Path,
     probe_env: dict,
+    extra_env: dict,
 ) -> None:
     """One server per resolution, one realtime session per duration."""
     spec = MODELS[model]
@@ -308,7 +317,7 @@ def run_realtime_jobs(
     if probe_dir.exists():
         shutil.rmtree(probe_dir)
     probe_dir.mkdir()
-    env = base_env(gpu, probe_dir, probe_env)
+    env = base_env(gpu, probe_dir, probe_env, extra_env)
     resident_before = wait_for_free_gpu(gpu)
     server_log = server_dir / "server.log"
     print(f"[gpu{gpu}] START server {model} {res}", flush=True)
@@ -421,12 +430,15 @@ def main(
     probe_env: dict,
     description: str,
     default_port_base: int = 35000,
+    extra_env: Callable[[str, str, int], dict] | None = None,
 ) -> None:
     """Run one sweep for ``topic`` with ``probe_env`` switched on.
 
     ``probe_env`` maps env var names to the probe's output directory (the value
     is filled in per config), e.g.
-    ``{"SGLANG_DIFFUSION_CHUNK_TIMING_DIR": None}``.
+    ``{"SGLANG_DIFFUSION_CHUNK_TIMING_DIR": None}``. ``extra_env`` returns any
+    further env vars for a given (model, resolution, duration) — attention
+    captures need per-model layer and head selections.
     """
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--models", default=",".join(MODELS))
@@ -478,6 +490,9 @@ def main(
                         port_base=port_base,
                         runs=runs,
                         probe_env=probe_env,
+                        extra_env=(
+                            extra_env(model, res, job_durations[0]) if extra_env else {}
+                        ),
                     )
                 else:
                     run_generate_job(
@@ -488,6 +503,9 @@ def main(
                         port_base=port_base,
                         runs=runs,
                         probe_env=probe_env,
+                        extra_env=(
+                            extra_env(model, res, job_durations[0]) if extra_env else {}
+                        ),
                     )
             except Exception as error:
                 print(

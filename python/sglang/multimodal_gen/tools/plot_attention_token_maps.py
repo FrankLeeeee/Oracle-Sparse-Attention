@@ -109,26 +109,21 @@ def plot_head(
     for column in sorted(chunk_columns):
         ax.axvline(column, color="w", linewidth=1.0, alpha=0.8)
     own = np.nonzero(
-        (key_positions >= query_positions[0])
-        & (key_positions <= query_positions[-1])
+        (key_positions >= query_positions[0]) & (key_positions <= query_positions[-1])
     )[0]
     if own.size:
         ax.axvline(float(own[0]), color="c", linewidth=0.9, alpha=0.9)
         ax.axvline(float(own[-1]) + 1, color="c", linewidth=0.9, alpha=0.9)
     tick_columns = np.linspace(0, num_keys - 1, 8).astype(int)
     ax.set_xticks(tick_columns.astype(np.float64) + 0.5)
-    ax.set_xticklabels(
-        [str(int(key_positions[c])) for c in tick_columns], fontsize=7
-    )
+    ax.set_xticklabels([str(int(key_positions[c])) for c in tick_columns], fontsize=7)
     ax.set_xlim(0.0, float(num_keys))
     ax.set_xlabel(
         "key token (labels = global index; green = frame, white = chunk, "
         "cyan = own chunk)"
     )
     # Frame boundaries along the query axis (contiguous, position space).
-    first_row_boundary = (
-        int(query_positions[0]) // frame_seqlen + 1
-    ) * frame_seqlen
+    first_row_boundary = (int(query_positions[0]) // frame_seqlen + 1) * frame_seqlen
     for boundary in range(
         first_row_boundary, int(query_positions[-1]) + 1, frame_seqlen
     ):
@@ -168,9 +163,15 @@ def plot_head(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dir", type=pathlib.Path)
-    parser.add_argument("--chunks", default=None, help="e.g. 8,26 (default: all dumped)")
-    parser.add_argument("--steps", default=None, help="e.g. 0,1,3 (default: all dumped)")
-    parser.add_argument("--layers", default=None, help="e.g. 0,15,29 (default: all dumped)")
+    parser.add_argument(
+        "--chunks", default=None, help="e.g. 8,26 (default: all dumped)"
+    )
+    parser.add_argument(
+        "--steps", default=None, help="e.g. 0,1,3 (default: all dumped)"
+    )
+    parser.add_argument(
+        "--layers", default=None, help="e.g. 0,15,29 (default: all dumped)"
+    )
     parser.add_argument("--heads", default=None, help="e.g. 0-3,7 (default: all)")
     parser.add_argument("--out-dir", type=pathlib.Path, default=None)
     args = parser.parse_args()
@@ -179,6 +180,11 @@ def main() -> None:
     frame_seqlen = meta["grid_height"] * meta["grid_width"]
     chunk_tokens = frame_seqlen * meta["num_frames_per_block"]
     coverage_threshold = meta.get("qk_coverage_threshold", 0.9)
+    # When the probe dumped only a few heads, the dump's head axis is dense but
+    # the real head ids are not; label figures with the real ones.
+    dumped_head_ids = {
+        int(layer): list(ids) for layer, ids in (meta.get("qk_head_ids") or {}).items()
+    }
 
     dumps = sorted(args.run_dir.glob("qk_chunk_*_step_*.npz"))
     if not dumps:
@@ -186,12 +192,8 @@ def main() -> None:
             f"no qk_chunk_*_step_*.npz in {args.run_dir} — record with "
             "SGLANG_DIFFUSION_ATTENTION_MAP_QK_CHUNKS set"
         )
-    wanted_chunks = (
-        {int(c) for c in args.chunks.split(",")} if args.chunks else None
-    )
-    wanted_steps = (
-        {int(s) for s in args.steps.split(",")} if args.steps else None
-    )
+    wanted_chunks = {int(c) for c in args.chunks.split(",")} if args.chunks else None
+    wanted_steps = {int(s) for s in args.steps.split(",")} if args.steps else None
     out_dir = args.out_dir or (args.run_dir / "token_map_plots")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -214,10 +216,15 @@ def main() -> None:
             if layer not in layer_lookup:
                 continue
             per_layer = scores[layer_lookup[layer]]
-            for head in _parse_ids(args.heads, per_layer.shape[0]):
+            head_ids = dumped_head_ids.get(layer) or list(range(per_layer.shape[0]))
+            # --heads selects real head ids; map them onto the dumped axis
+            selected = _parse_ids(args.heads, max(head_ids) + 1)
+            for column, head in enumerate(head_ids):
+                if args.heads is not None and head not in selected:
+                    continue
                 plot_head(
-                    scores=per_layer[head],
-                    coverage=coverage[layer_lookup[layer], head],
+                    scores=per_layer[column],
+                    coverage=coverage[layer_lookup[layer], column],
                     coverage_threshold=coverage_threshold,
                     query_positions=query_positions,
                     key_positions=key_positions,

@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+import pathlib
+
 import numpy as np
 import torch
 
@@ -41,9 +44,10 @@ def test_segment_frame_ids_maps_disjoint_ranges():
     )
     assert ids.shape == (3 * BLOCK_TOKENS,)
     # first block -> latent frames 0,1,2; the far segment -> frames 15..20
-    assert ids[:BLOCK_TOKENS].tolist() == [0] * FRAME_SEQLEN + [1] * FRAME_SEQLEN + [
-        2
-    ] * FRAME_SEQLEN
+    assert (
+        ids[:BLOCK_TOKENS].tolist()
+        == [0] * FRAME_SEQLEN + [1] * FRAME_SEQLEN + [2] * FRAME_SEQLEN
+    )
     assert ids[BLOCK_TOKENS:].min().item() == 15
     assert ids[BLOCK_TOKENS:].max().item() == 20
 
@@ -281,8 +285,13 @@ def test_spatial_displacement_matches_reference_softmax():
     frame_seqlen = grid_height * grid_width
     heads, head_dim = 3, 8
     query_positions = torch.tensor(
-        [2 * frame_seqlen, 2 * frame_seqlen + 7, 2 * frame_seqlen + 13,
-         3 * frame_seqlen + 1, 3 * frame_seqlen + 19]
+        [
+            2 * frame_seqlen,
+            2 * frame_seqlen + 7,
+            2 * frame_seqlen + 13,
+            3 * frame_seqlen + 1,
+            3 * frame_seqlen + 19,
+        ]
     )
     key_positions = torch.arange(4 * frame_seqlen)
     query = torch.randn(query_positions.numel(), heads, head_dim)
@@ -373,3 +382,102 @@ def test_attention_mass_by_token_matches_reference_and_frame_reduction():
     torch.testing.assert_close(reduced, mass, atol=1e-5, rtol=1e-4)
     # every query row is a distribution, so a chunk's rows sum to its query count
     torch.testing.assert_close(token_mass.sum(-1)[:, 0], counts, atol=1e-4, rtol=1e-4)
+
+
+def test_parse_head_spec_flat_and_per_layer():
+    from sglang.multimodal_gen.runtime.utils.attention_map_probe import parse_head_spec
+
+    assert parse_head_spec(None) is None
+    assert parse_head_spec("") is None
+    # a flat list applies to every layer, stored under the -1 wildcard
+    assert parse_head_spec("0,3,7") == {-1: (0, 3, 7)}
+    assert parse_head_spec("0:1,2;29:9,11") == {0: (1, 2), 29: (9, 11)}
+
+
+def test_selected_heads_falls_back_to_the_wildcard_and_clamps():
+    from sglang.multimodal_gen.runtime.utils.attention_map_probe import (
+        ChunkAttentionRecorder,
+    )
+
+    recorder = ChunkAttentionRecorder(
+        output_dir="/tmp", qk_heads={-1: (0, 5), 3: (1, 99)}
+    )
+    assert recorder.selected_heads(0, num_heads=12) == (0, 5)
+    # a per-layer entry wins over the wildcard, and out-of-range ids are dropped
+    assert recorder.selected_heads(3, num_heads=12) == (1,)
+    assert ChunkAttentionRecorder(output_dir="/tmp").selected_heads(0, 12) is None
+
+
+def test_qk_dump_records_only_the_selected_heads(tmp_path):
+    from sglang.multimodal_gen.runtime.utils.attention_map_probe import (
+        ChunkAttentionRecorder,
+    )
+
+    heads, head_dim, queries = 8, 4, 2 * FRAME_SEQLEN
+    recorder = ChunkAttentionRecorder(
+        output_dir=str(tmp_path),
+        query_stride=1,
+        qk_chunks=frozenset({0}),
+        qk_key_stride=1,
+        qk_steps=frozenset({0}),
+        qk_heads={-1: (1, 6)},
+        qk_only=True,
+    )
+    recorder.begin_forward(
+        frame_seqlen=FRAME_SEQLEN,
+        num_frames_per_block=2,
+        query_token_start=0,
+        grid_height=2,
+        grid_width=FRAME_SEQLEN // 2,
+    )
+    torch.manual_seed(0)
+    recorder.record(
+        layer_index=0,
+        query=torch.randn(1, queries, heads, head_dim),
+        key=torch.randn(1, queries, heads, head_dim),
+        key_segments=((0, queries),),
+    )
+    run_dir = pathlib.Path(recorder.flush(model_tag="Fake"))
+
+    dump = np.load(run_dir / "qk_chunk_000_step_0.npz")
+    # [layers, heads, queries, keys] -- only the two selected heads
+    assert dump["scores"].shape == (1, 2, queries, queries)
+    meta = json.loads((run_dir / "meta.json").read_text())
+    assert meta["qk_head_ids"] == {"0": [1, 6]}
+    assert meta["qk_only"] is True
+    # qk-only mode skips the per-frame mass pass, so no chunk_*.npz is written
+    assert not list(run_dir.glob("chunk_*.npz"))
+
+
+def test_qk_only_still_matches_a_reference_softmax(tmp_path):
+    from sglang.multimodal_gen.runtime.utils.attention_map_probe import (
+        ChunkAttentionRecorder,
+    )
+
+    heads, head_dim, queries = 4, 6, FRAME_SEQLEN
+    torch.manual_seed(1)
+    query = torch.randn(1, queries, heads, head_dim)
+    key = torch.randn(1, queries, heads, head_dim)
+    recorder = ChunkAttentionRecorder(
+        output_dir=str(tmp_path),
+        query_stride=1,
+        qk_chunks=frozenset({0}),
+        qk_key_stride=1,
+        qk_steps=frozenset({0}),
+        qk_heads={-1: (2,)},
+        qk_only=True,
+    )
+    recorder.begin_forward(
+        frame_seqlen=FRAME_SEQLEN,
+        num_frames_per_block=1,
+        query_token_start=0,
+        grid_height=1,
+        grid_width=FRAME_SEQLEN,
+    )
+    recorder.record(layer_index=0, query=query, key=key, key_segments=((0, queries),))
+    run_dir = pathlib.Path(recorder.flush(model_tag="Fake"))
+    dumped = np.load(run_dir / "qk_chunk_000_step_0.npz")["scores"][0, 0]
+
+    scale = head_dim**-0.5
+    expected = torch.softmax((query[0, :, 2] @ key[0, :, 2].T).float() * scale, dim=-1)
+    np.testing.assert_allclose(dumped, expected.numpy(), atol=2e-3)
