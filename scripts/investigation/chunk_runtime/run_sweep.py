@@ -136,6 +136,25 @@ def lingbot_first_frame(res: str) -> pathlib.Path:
     return target
 
 
+def wait_for_idle_gpus(*, max_used_mib: int = 1024) -> list[int]:
+    """Idle GPU indices, blocking until at least one shows up.
+
+    On a shared box every card can be busy when a sweep is queued; waiting
+    beats failing, since these runs are long and unattended.
+    """
+    deadline = time.time() + GPU_WAIT_TIMEOUT_S
+    warned = False
+    while time.time() < deadline:
+        found = idle_gpus(max_used_mib)
+        if found:
+            return found
+        if not warned:
+            print("no idle GPU yet, waiting", flush=True)
+            warned = True
+        time.sleep(60)
+    raise SystemExit(f"no GPU freed up within {GPU_WAIT_TIMEOUT_S}s")
+
+
 def gpu_used_mib(gpu: int) -> int:
     output = subprocess.run(
         [
@@ -388,7 +407,7 @@ def main() -> None:
     parser.add_argument(
         "--gpus",
         default="auto",
-        help="'auto' picks every GPU with <1 GiB resident, else e.g. 4,7",
+        help="'auto' waits for and uses every GPU with <1 GiB resident, else e.g. 4,7",
     )
     parser.add_argument("--durations", default=",".join(str(d) for d in DURATIONS))
     parser.add_argument("--resolutions", default="480p,720p")
@@ -396,11 +415,10 @@ def main() -> None:
     parser.add_argument("--port-base", type=int, default=35000)
     args = parser.parse_args()
 
-    gpus = (
-        idle_gpus() if args.gpus == "auto" else [int(g) for g in args.gpus.split(",")]
-    )
-    if not gpus:
-        raise SystemExit("no idle GPU found; pass --gpus explicitly to override")
+    if args.gpus == "auto":
+        gpus = wait_for_idle_gpus()
+    else:
+        gpus = [int(g) for g in args.gpus.split(",")]
     print(f"using GPUs {gpus}", flush=True)
     durations = [int(d) for d in args.durations.split(",")]
     resolutions = args.resolutions.split(",")

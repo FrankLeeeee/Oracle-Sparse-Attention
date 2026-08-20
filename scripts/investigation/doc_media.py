@@ -81,6 +81,75 @@ def last_block_id(doc: str, section_start_id: str) -> str:
     return ids[-1]
 
 
+def published_media(doc: str, section_start_id: str) -> dict[str, str]:
+    """Media already published in a section, as ``{file name: block id}``.
+
+    Images sit at top level (``<img id=... name=...>``); videos and other file
+    blocks are wrapped in a ``<figure id=...>``. Lets a re-run replace what it
+    published last time instead of appending a second copy.
+    """
+    data = cli(
+        "docs",
+        "+fetch",
+        "--doc",
+        doc,
+        "--scope",
+        "section",
+        "--start-block-id",
+        section_start_id,
+        "--detail",
+        "with-ids",
+    )
+    content = data["document"]["content"]
+    found: dict[str, str] = {}
+    for block_id, name in re.findall(
+        r'<img id="([^"]+)"[^>]*? name="([^"]+)"', content
+    ):
+        found[name] = block_id
+    for block_id, name in re.findall(
+        r'<figure id="([^"]+)"[^>]*>.*?name="([^"]+)"', content
+    ):
+        found[name] = block_id
+    return found
+
+
+def replace_media(
+    doc: str,
+    old_block_id: str,
+    path: str,
+    *,
+    caption: str | None = None,
+    media_type: str = "image",
+    file_view: str | None = None,
+    width: int | None = None,
+) -> str:
+    """Swap one already-published image/video for a new local file in place.
+
+    Inserts the new block, moves it behind the old one, then deletes the old
+    one, so the surrounding order is preserved. Returns the new block id.
+    """
+    new_id = insert_after(
+        doc,
+        old_block_id,
+        path,
+        caption=caption,
+        media_type=media_type,
+        file_view=file_view,
+        width=width,
+    )
+    cli(
+        "docs",
+        "+update",
+        "--doc",
+        doc,
+        "--command",
+        "block_delete",
+        "--block-id",
+        old_block_id,
+    )
+    return new_id
+
+
 def insert_after(
     doc: str,
     anchor_id: str,

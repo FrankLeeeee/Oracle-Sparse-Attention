@@ -15,7 +15,13 @@ import shutil
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-from doc_media import insert_after, insert_blocks, last_block_id  # noqa: E402
+from doc_media import (  # noqa: E402
+    insert_after,
+    insert_blocks,
+    last_block_id,
+    published_media,
+    replace_media,
+)
 from paths import results_dir  # noqa: E402
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -75,28 +81,44 @@ def main() -> None:
 
     if args.stage in ("all", "text"):
         insert_blocks(DOC, args.anchor, (HERE / "section.xml").read_text())
+    published = published_media(DOC, SECTION_START)
     anchor = last_block_id(DOC, SECTION_START)
     if args.stage in ("all", "text", "figures"):
         for name, caption in FIGURES:
-            anchor = insert_after(
-                DOC, anchor, str(ROOT / name), caption=caption, width=760
-            )
+            if name in published:
+                replace_media(
+                    DOC, published[name], str(ROOT / name), caption=caption, width=760
+                )
+            else:
+                anchor = insert_after(
+                    DOC, anchor, str(ROOT / name), caption=caption, width=760
+                )
     if args.stage in ("text", "figures"):
         print(f"done (stage={args.stage})")
         return
 
     videos = stage_videos()
-    insert_blocks(
-        DOC,
-        anchor,
-        "<p><b>本轮 24 个配置生成的视频</b>（同一 prompt、seed 42，"
-        "文件名为 <code>模型_分辨率_时长</code>）：</p>",
-    )
-    anchor = last_block_id(DOC, SECTION_START)
-    for _label, path in videos:
-        anchor = insert_after(
-            DOC, anchor, str(path), media_type="file", file_view="preview"
+    if not published:
+        insert_blocks(
+            DOC,
+            anchor,
+            "<p><b>本轮 24 个配置生成的视频</b>（同一 prompt、seed 42，"
+            "文件名为 <code>模型_分辨率_时长</code>）：</p>",
         )
+        anchor = last_block_id(DOC, SECTION_START)
+    for _label, path in videos:
+        if path.name in published:
+            replace_media(
+                DOC,
+                published[path.name],
+                str(path),
+                media_type="file",
+                file_view="preview",
+            )
+        else:
+            anchor = insert_after(
+                DOC, anchor, str(path), media_type="file", file_view="preview"
+            )
     print(f"done: {len(videos)} videos")
 
 
