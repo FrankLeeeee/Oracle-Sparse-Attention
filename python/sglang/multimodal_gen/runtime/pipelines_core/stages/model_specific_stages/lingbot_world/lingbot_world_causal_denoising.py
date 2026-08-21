@@ -13,6 +13,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.layers.attention.sparse import (
+    get_sparse_attention_backend,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
@@ -549,6 +552,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             dtype=torch.long,
         )
         recorder = get_attention_map_recorder()
+        sparse_backend = get_sparse_attention_backend()
         with (
             torch.autocast(
                 device_type=current_platform.device_type,
@@ -563,6 +567,11 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             (
                 recorder.pass_kind_scope(CACHE_UPDATE_PASS)
                 if recorder is not None
+                else nullcontext()
+            ),
+            (
+                sparse_backend.cache_update_scope()
+                if sparse_backend is not None
                 else nullcontext()
             ),
             probe_pass_kind_scope(CACHE_UPDATE_PASS),

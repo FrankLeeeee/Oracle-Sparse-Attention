@@ -28,6 +28,10 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.attention.sparse import (
+    SparseAttentionCall,
+    get_sparse_attention_backend,
+)
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     RollingForcingSelfAttentionKVCache,
 )
@@ -315,6 +319,7 @@ class RollingForcingWanSelfAttention(nn.Module):
 
         block_tokens = kv_cache.rolling_block_tokens
         recorder = get_attention_map_recorder()
+        sparse_attention = get_sparse_attention_backend()
         key_segments = (
             visible_key_segments(
                 layout,
@@ -323,7 +328,7 @@ class RollingForcingWanSelfAttention(nn.Module):
                 current_start=current_start,
                 num_query_tokens=q.shape[1],
             )
-            if recorder is not None
+            if recorder is not None or sparse_attention is not None
             else ()
         )
 
@@ -336,9 +341,30 @@ class RollingForcingWanSelfAttention(nn.Module):
                     key_segments=key_segments,
                 )
 
+        def sparse(key: torch.Tensor, value: torch.Tensor) -> torch.Tensor | None:
+            if sparse_attention is None:
+                return None
+            return sparse_attention.attend(
+                SparseAttentionCall(
+                    layer_index=self.layer_index,
+                    query=roped_query,
+                    key=key,
+                    value=value,
+                    key_segments=key_segments,
+                    head_start=0,
+                    num_local_heads=self.num_heads,
+                    softmax_scale=self.attn.softmax_scale,
+                )
+            )
+
         if layout.local_start_index == 0:
             # Ramp-up windows: everything visible is inside the current window.
+            # Sparse methods still see the call — OSA calibrates on these
+            # dense-anyway passes — but any selection they make applies too.
             record(roped_key)
+            sparse_output = sparse(roped_key, v)
+            if sparse_output is not None:
+                return sparse_output
             return self.attn(roped_query, roped_key, v)
 
         working = slice(layout.working_start, layout.working_end)
@@ -349,6 +375,9 @@ class RollingForcingWanSelfAttention(nn.Module):
                 working_k = working_k.clone()
                 working_k[:, :block_tokens] = self._rerope_anchor(kv_cache, v)
             record(working_k)
+            sparse_output = sparse(working_k, working_v)
+            if sparse_output is not None:
+                return sparse_output
             return self.attn(roped_query, working_k, working_v)
 
         anchor_k = self._rerope_anchor(kv_cache, v)
@@ -356,6 +385,9 @@ class RollingForcingWanSelfAttention(nn.Module):
         input_k = torch.cat([anchor_k, kv_cache.k[:, working], roped_key], dim=1)
         input_v = torch.cat([anchor_v, kv_cache.v[:, working], v], dim=1)
         record(input_k)
+        sparse_output = sparse(input_k, input_v)
+        if sparse_output is not None:
+            return sparse_output
         return self.attn(roped_query, input_k, input_v)
 
 
@@ -470,7 +502,13 @@ class RollingForcingWanTransformer3DModel(CausalWanTransformer3DModel):
             if updating_cache
             else nullcontext()
         )
-        with pass_scope, timing_scope:
+        sparse_attention = get_sparse_attention_backend()
+        sparse_scope = (
+            sparse_attention.cache_update_scope()
+            if sparse_attention is not None and updating_cache
+            else nullcontext()
+        )
+        with pass_scope, timing_scope, sparse_scope:
             return super().forward(
                 hidden_states,
                 encoder_hidden_states,

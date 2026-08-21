@@ -27,6 +27,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
+from sglang.multimodal_gen.runtime.layers.attention.sparse import (
+    ChunkGeometry,
+    SparseAttentionCall,
+    get_sparse_attention_backend,
+)
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CausalSelfAttentionKVCache,
@@ -328,8 +333,16 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             debug_name="LingBot KV cache",
         )
         recorder = get_attention_map_recorder()
+        sparse_attention = (
+            get_sparse_attention_backend() if not sequence_shard_enabled else None
+        )
+        key_segments = (
+            visible_key_segments(kv_cache, cache_view)
+            if (recorder is not None and not sequence_shard_enabled)
+            or sparse_attention is not None
+            else None
+        )
         if recorder is not None and not sequence_shard_enabled:
-            key_segments = visible_key_segments(kv_cache, cache_view)
             if key_segments is None:
                 warn_unsupported_once(
                     "pinned / global-sink KV cache views are not mapped to chunks"
@@ -344,6 +357,21 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
 
         if update_cache_only:
             return v
+        if sparse_attention is not None:
+            sparse_output = sparse_attention.attend(
+                SparseAttentionCall(
+                    layer_index=self.layer_index,
+                    query=roped_query,
+                    key=cache_view.k,
+                    value=cache_view.v,
+                    key_segments=key_segments,
+                    head_start=self.head_start,
+                    num_local_heads=self.num_heads,
+                    softmax_scale=self.attn.softmax_scale,
+                )
+            )
+            if sparse_output is not None:
+                return sparse_output
         attn_impl = self.ulysses_attn if sequence_shard_enabled else self.attn
         x = attn_impl(
             roped_query,
@@ -1640,6 +1668,17 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 frame_seqlen=post_patch_height * post_patch_width,
                 num_frames_per_block=self.num_frame_per_block,
                 query_token_start=current_start,
+            )
+        sparse_attention = get_sparse_attention_backend()
+        if sparse_attention is not None and kv_cache is not None:
+            sparse_attention.begin_forward(
+                ChunkGeometry(
+                    frame_seqlen=post_patch_height * post_patch_width,
+                    frames_per_block=self.num_frame_per_block,
+                    query_token_start=current_start,
+                    grid_height=post_patch_height,
+                    grid_width=post_patch_width,
+                )
             )
 
         for block_index, block in enumerate(self.blocks):

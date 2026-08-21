@@ -132,10 +132,33 @@ def measure_spatial_tile_mass(
     return padded.view(num_heads, num_tiles, spatial_tile).sum(-1)
 
 
-def frame_ages(layout: VisibleLayout) -> np.ndarray:
-    """Age of each visible frame in latent frames; own chunk is age <= 0."""
-    own_start = int(layout.global_frame_ids[layout.own_frames].min())
+def frame_ages(layout: VisibleLayout, *, query_chunk_offset: int = 0) -> np.ndarray:
+    """Age of each visible frame in latent frames; the query chunk is age <= 0.
+
+    ``query_chunk_offset`` selects which chunk of a multi-chunk query (a
+    rolling-forcing window) the ages are relative to; 0 is the first.
+    """
+    own = layout.frames_of_offset(query_chunk_offset)
+    own_start = int(layout.global_frame_ids[own].min())
     return own_start - layout.global_frame_ids
+
+
+class WindowGatherPlan(msgspec.Struct, frozen=True):
+    """Per-query-chunk gather plans for a multi-chunk (rolling-window) query.
+
+    One block-causal call may carry several query chunks at once (Rolling
+    Forcing denoises a whole window per forward). Each chunk keeps its own
+    whole frames — its own chunk, the sink, its recent band — so each gets its
+    own gather plan over ``chunk_query_tokens`` query rows, executed as
+    separate varlen batches over the same K/V view.
+    """
+
+    chunk_plans: tuple[ReplicateGatherPlan, ...]
+    chunk_query_tokens: int
+
+    @property
+    def density(self) -> float:
+        return sum(plan.density for plan in self.chunk_plans) / len(self.chunk_plans)
 
 
 class OracleSparseAttention(SparseAttentionBackend):
@@ -154,8 +177,7 @@ class OracleSparseAttention(SparseAttentionBackend):
         )
         if density is None or not 0.0 < density <= 1.0:
             raise ValueError(
-                "osa needs density in (0, 1] "
-                "(or the equivalent sparsity in [0, 1))"
+                "osa needs density in (0, 1] " "(or the equivalent sparsity in [0, 1))"
             )
         self._density = density
         self._config = config
@@ -203,17 +225,30 @@ class OracleSparseAttention(SparseAttentionBackend):
             self._record_density(None, kv_len=call.key.shape[1])
             return None
         self._record_density(None, kv_len=call.key.shape[1], fraction=plan.density)
-        return replicate_gather_attention(
-            query=call.query,
-            key=call.key,
-            value=call.value,
-            plan=plan,
-            softmax_scale=call.softmax_scale,
-        )
+        if isinstance(plan, ReplicateGatherPlan):
+            return replicate_gather_attention(
+                query=call.query,
+                key=call.key,
+                value=call.value,
+                plan=plan,
+                softmax_scale=call.softmax_scale,
+            )
+        tokens = plan.chunk_query_tokens
+        outputs = [
+            replicate_gather_attention(
+                query=call.query[:, index * tokens : (index + 1) * tokens],
+                key=call.key,
+                value=call.value,
+                plan=chunk_plan,
+                softmax_scale=call.softmax_scale,
+            )
+            for index, chunk_plan in enumerate(plan.chunk_plans)
+        ]
+        return torch.cat(outputs, dim=1)
 
     def _prepare_plan(
         self, call: SparseAttentionCall, layout: VisibleLayout
-    ) -> ReplicateGatherPlan | None:
+    ) -> ReplicateGatherPlan | WindowGatherPlan | None:
         if self._config.dense_cache_update and self.in_cache_update:
             return None
         if layout.query_chunk_index == 0:
@@ -246,9 +281,7 @@ class OracleSparseAttention(SparseAttentionBackend):
             # same token count — the gather execution needs a uniform varlen
             # batch. Whole frames still include the tail.
             full_tiles = layout.frame_seqlen // self._config.spatial_tile
-            order = torch.argsort(
-                mass[:, :full_tiles], dim=1, descending=True
-            )
+            order = torch.argsort(mass[:, :full_tiles], dim=1, descending=True)
             self._tile_order[call.layer_index] = order
             self._spatial_mass.pop(call.layer_index, None)
         return self._plan(call, layout, order)
@@ -258,7 +291,7 @@ class OracleSparseAttention(SparseAttentionBackend):
         call: SparseAttentionCall,
         layout: VisibleLayout,
         order: torch.Tensor,  # [heads, full_tiles] tile ids by descending mass
-    ) -> ReplicateGatherPlan | None:
+    ) -> ReplicateGatherPlan | WindowGatherPlan | None:
         signature = (
             call.key_segments,
             layout.query_frames,
@@ -268,13 +301,79 @@ class OracleSparseAttention(SparseAttentionBackend):
         hit, cached = self._plans.get(call.layer_index, signature)
         if hit:
             return cached
-        num_heads, num_tiles = order.shape
+        num_heads = order.shape[0]
         if num_heads != call.num_local_heads:
             self.warn_dense_once(
                 f"calibrated {num_heads} heads but layer "
                 f"{call.layer_index} has {call.num_local_heads}"
             )
             return None
+        num_query_chunks, ragged = divmod(layout.query_frames, layout.frames_per_block)
+        if ragged:
+            self.warn_dense_once(
+                f"query spans {layout.query_frames} frames, not a whole number "
+                f"of {layout.frames_per_block}-frame chunks"
+            )
+            return None
+        if num_query_chunks == 1:
+            plan = self._chunk_plan(
+                layout, order, query_chunk_offset=0, q_len=call.query.shape[1]
+            )
+        else:
+            # A rolling window: one plan per query chunk, dense-everything
+            # chunks materialised as keep-all plans so the whole call still
+            # runs through the gather execution. Only when every chunk keeps
+            # everything is dense strictly better.
+            chunk_tokens = layout.frames_per_block * layout.frame_seqlen
+            chunk_plans = [
+                self._chunk_plan(
+                    layout, order, query_chunk_offset=offset, q_len=chunk_tokens
+                )
+                for offset in range(num_query_chunks)
+            ]
+            if all(chunk_plan is None for chunk_plan in chunk_plans):
+                plan = None
+            else:
+                plan = WindowGatherPlan(
+                    chunk_plans=tuple(
+                        (
+                            chunk_plan
+                            if chunk_plan is not None
+                            else self._keep_all_plan(
+                                layout, num_heads, chunk_tokens, device=order.device
+                            )
+                        )
+                        for chunk_plan in chunk_plans
+                    ),
+                    chunk_query_tokens=chunk_tokens,
+                )
+        self._plans.put(call.layer_index, signature, plan)
+        self._log_summary(layout)
+        return plan
+
+    def _keep_all_plan(
+        self,
+        layout: VisibleLayout,
+        num_heads: int,
+        q_len: int,
+        *,
+        device: torch.device,
+    ) -> ReplicateGatherPlan:
+        indices = torch.arange(layout.kv_len, dtype=torch.int64, device=device).expand(
+            num_heads, -1
+        )
+        return build_gather_plan(indices=indices, q_len=q_len, kv_len=layout.kv_len)
+
+    def _chunk_plan(
+        self,
+        layout: VisibleLayout,
+        order: torch.Tensor,  # [heads, full_tiles] tile ids by descending mass
+        *,
+        query_chunk_offset: int,
+        q_len: int,
+    ) -> ReplicateGatherPlan | None:
+        """The gather plan of one query chunk, or ``None`` if it keeps everything."""
+        num_heads, num_tiles = order.shape
         frame_seqlen = layout.frame_seqlen
         tile_size = self._config.spatial_tile
         num_frames = layout.num_frames
@@ -282,9 +381,14 @@ class OracleSparseAttention(SparseAttentionBackend):
 
         # Frames kept whole: the query's own chunk, the sink, and the most
         # recent past frames. Everything else gets the replicated tile set.
-        ages = frame_ages(layout)
+        own = layout.frames_of_offset(query_chunk_offset)
+        if not own.any():
+            # The query chunk's own keys are always in the view for the models
+            # this supports; an unmapped chunk keeps everything to stay safe.
+            return None
+        ages = frame_ages(layout, query_chunk_offset=query_chunk_offset)
         full = (
-            layout.own_frames
+            own
             | layout.sink_frames(self._sink_frames())
             | ((ages > 0) & (ages <= self._config.num_recent_frames))
         )
@@ -293,47 +397,44 @@ class OracleSparseAttention(SparseAttentionBackend):
         budget = self._density * num_frames * frame_seqlen
         remaining = budget - num_full * frame_seqlen
         if num_other == 0 or remaining >= num_other * frame_seqlen:
-            plan = None  # everything is kept — dense is strictly better
-        else:
-            tiles_kept = min(
-                max(0, int(round(remaining / (num_other * tile_size)))),
-                num_tiles,
-            )
-            full_frames = torch.from_numpy(full).to(device)
-            frame_starts = (
-                torch.arange(num_frames, dtype=torch.int64, device=device)
-                * frame_seqlen
-            )
-            # Whole frames: every token, identical for all heads.
-            full_tokens = (
-                frame_starts[full_frames][:, None]
-                + torch.arange(frame_seqlen, dtype=torch.int64, device=device)
-            ).reshape(-1)
-            # Replicated tiles: each head's top tiles in every other frame.
-            kept_offsets = (
-                order[:, :tiles_kept].to(torch.int64)[:, :, None] * tile_size
-                + torch.arange(tile_size, dtype=torch.int64, device=device)
-            ).reshape(num_heads, -1)  # [heads, tiles_kept * tile]
-            other_starts = frame_starts[~full_frames]
-            replicated = (
-                other_starts[None, :, None] + kept_offsets[:, None, :]
-            ).reshape(num_heads, -1)
-            indices = torch.cat(
-                [
-                    full_tokens[None, :].expand(num_heads, -1),
-                    replicated,
-                ],
-                dim=1,
-            )
-            indices, _ = torch.sort(indices, dim=1)
-            plan = build_gather_plan(
-                indices=indices,
-                q_len=call.query.shape[1],
-                kv_len=layout.kv_len,
-            )
-        self._plans.put(call.layer_index, signature, plan)
-        self._log_summary(layout)
-        return plan
+            return None  # everything is kept
+        tiles_kept = min(
+            max(0, int(round(remaining / (num_other * tile_size)))),
+            num_tiles,
+        )
+        full_frames = torch.from_numpy(full).to(device)
+        frame_starts = (
+            torch.arange(num_frames, dtype=torch.int64, device=device) * frame_seqlen
+        )
+        # Whole frames: every token, identical for all heads.
+        full_tokens = (
+            frame_starts[full_frames][:, None]
+            + torch.arange(frame_seqlen, dtype=torch.int64, device=device)
+        ).reshape(-1)
+        # Replicated tiles: each head's top tiles in every other frame.
+        kept_offsets = (
+            order[:, :tiles_kept].to(torch.int64)[:, :, None] * tile_size
+            + torch.arange(tile_size, dtype=torch.int64, device=device)
+        ).reshape(
+            num_heads, -1
+        )  # [heads, tiles_kept * tile]
+        other_starts = frame_starts[~full_frames]
+        replicated = (other_starts[None, :, None] + kept_offsets[:, None, :]).reshape(
+            num_heads, -1
+        )
+        indices = torch.cat(
+            [
+                full_tokens[None, :].expand(num_heads, -1),
+                replicated,
+            ],
+            dim=1,
+        )
+        indices, _ = torch.sort(indices, dim=1)
+        return build_gather_plan(
+            indices=indices,
+            q_len=q_len,
+            kv_len=layout.kv_len,
+        )
 
     def _log_summary(self, layout: VisibleLayout) -> None:
         # Freezing is lazy per layer during the first post-calibration chunk;

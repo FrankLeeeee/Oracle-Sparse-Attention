@@ -5,6 +5,9 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.layers.attention.sparse import (
+    get_sparse_attention_backend,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CAUSAL_BLOCK_PROMPTS_KEY,
@@ -906,7 +909,13 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
             if recorder is not None
             else nullcontext()
         )
-        with pass_scope, probe_pass_kind_scope(CACHE_UPDATE_PASS):
+        sparse_backend = get_sparse_attention_backend()
+        sparse_scope = (
+            sparse_backend.cache_update_scope()
+            if sparse_backend is not None
+            else nullcontext()
+        )
+        with pass_scope, sparse_scope, probe_pass_kind_scope(CACHE_UPDATE_PASS):
             self._forward_causal_transformer(
                 batch,
                 latent_model_input=context_input.to(target_dtype),

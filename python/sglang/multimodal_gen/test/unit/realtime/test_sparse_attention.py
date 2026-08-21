@@ -131,9 +131,7 @@ def test_kernel_matches_masked_sdpa_per_query_block_and_bias():
     value = torch.randn_like(key)
 
     rng = torch.Generator(device=device).manual_seed(3)
-    block_mask = (
-        torch.rand(heads, 4, 9, device=device, generator=rng) < 0.4
-    )
+    block_mask = torch.rand(heads, 4, 9, device=device, generator=rng) < 0.4
     block_mask[..., -1] = True
     bias = torch.randn(heads, kv_len, device=device, generator=rng)
     plan = plan_from_block_mask(
@@ -163,8 +161,12 @@ def test_kernel_accepts_strided_cache_views():
     batch, heads, head_dim, num_frames = 1, 2, 64, 4
     kv_len = num_frames * FRAME_SEQLEN
     cache = torch.randn(
-        batch, kv_len + 2 * FRAME_SEQLEN, heads, head_dim,
-        device=device, dtype=torch.bfloat16,
+        batch,
+        kv_len + 2 * FRAME_SEQLEN,
+        heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
     )
     key = cache[:, FRAME_SEQLEN : FRAME_SEQLEN + kv_len]
     value = cache[:, 2 * FRAME_SEQLEN : 2 * FRAME_SEQLEN + kv_len]
@@ -182,8 +184,12 @@ def test_kernel_accepts_strided_cache_views():
         query=query, key=key, value=value, plan=plan, softmax_scale=scale
     )
     reference = masked_reference(
-        query, key, value, plan_key_mask(plan, kv_len=kv_len),
-        block_m=128, softmax_scale=scale,
+        query,
+        key,
+        value,
+        plan_key_mask(plan, kv_len=kv_len),
+        block_m=128,
+        softmax_scale=scale,
     )
     torch.testing.assert_close(out.float(), reference, atol=2e-2, rtol=2e-2)
 
@@ -242,7 +248,9 @@ def test_intra_frame_coverage_handles_blocks_that_straddle_frames():
     lo, hi = block_bounds(35, 4, device=device)
     coverage = intra_frame_coverage(lo, hi, frame_seqlen=10)
     for index in range(len(lo)):
-        expected = sorted({token % 10 for token in range(int(lo[index]), int(hi[index]))})
+        expected = sorted(
+            {token % 10 for token in range(int(lo[index]), int(hi[index]))}
+        )
         assert torch.nonzero(coverage[index]).flatten().tolist() == expected
     # A block at least a frame long covers every offset.
     wide_lo, wide_hi = block_bounds(24, 12, device=device)
@@ -260,9 +268,7 @@ def test_radial_band_narrows_with_temporal_distance():
         device=torch.device("cpu"),
     )
     block = 64
-    key_frame = (
-        torch.arange(mask.shape[1]) * block // FRAME_SEQLEN
-    )
+    key_frame = torch.arange(mask.shape[1]) * block // FRAME_SEQLEN
     query_frame = layout.num_frames - layout.query_frames
     widths = {}
     for distance in (1, 2, 4):
@@ -434,9 +440,9 @@ def test_current_chunk_keys_are_never_cached_across_denoising_steps(method, conf
         if out is None:
             pytest.skip(f"{method} runs dense at chunk {chunk_index}")
         outputs.append(out)
-    assert not torch.equal(outputs[0], outputs[1]), (
-        f"{method} reused stale current-chunk keys"
-    )
+    assert not torch.equal(
+        outputs[0], outputs[1]
+    ), f"{method} reused stale current-chunk keys"
 
 
 @requires_cuda
@@ -477,8 +483,10 @@ def test_tempcache_merge_is_exact_for_identical_keys():
     heads, frames, positions, head_dim = 2, 6, 5, 16
     repeated = torch.randn(heads, 1, positions, head_dim, device=device)
     keys = torch.cat(
-        [repeated.expand(heads, 4, positions, head_dim),
-         torch.randn(heads, 2, positions, head_dim, device=device)],
+        [
+            repeated.expand(heads, 4, positions, head_dim),
+            torch.randn(heads, 2, positions, head_dim, device=device),
+        ],
         dim=1,
     ).contiguous()
     values = torch.randn(heads, frames, positions, head_dim, device=device)
@@ -490,13 +498,13 @@ def test_tempcache_merge_is_exact_for_identical_keys():
     query = torch.randn(heads, 3, head_dim, device=device)
     flat_keys = keys.reshape(heads, -1, head_dim)
     scale = head_dim**-0.5
-    exact = (
-        torch.softmax(query @ flat_keys.transpose(1, 2) * scale, -1)
-        @ values.reshape(heads, -1, head_dim)
+    exact = torch.softmax(
+        query @ flat_keys.transpose(1, 2) * scale, -1
+    ) @ values.reshape(heads, -1, head_dim)
+    scores = (
+        query @ flat_keys.transpose(1, 2) * scale
+        + group_size.reshape(heads, 1, -1).log()
     )
-    scores = query @ flat_keys.transpose(1, 2) * scale + group_size.reshape(
-        heads, 1, -1
-    ).log()
     scores = scores.masked_fill(~keep.reshape(heads, 1, -1), float("-inf"))
     compacted = torch.softmax(scores, -1) @ merged.reshape(heads, -1, head_dim)
     torch.testing.assert_close(compacted, exact, atol=1e-5, rtol=1e-5)
@@ -563,9 +571,136 @@ def test_osa_freezes_the_last_chunk0_step_and_replicates():
         * call.softmax_scale
     )
     scores = scores.masked_fill(~allow[:, None, :], float("-inf"))
-    reference = torch.softmax(scores, dim=-1) @ call.value[0].float().permute(
-        1, 0, 2
-    )
+    reference = torch.softmax(scores, dim=-1) @ call.value[0].float().permute(1, 0, 2)
     torch.testing.assert_close(
         out[0].float(), reference.permute(1, 0, 2), atol=3e-2, rtol=3e-2
     )
+
+
+@requires_cuda
+def test_osa_window_query_plans_per_chunk_and_executes():
+    """A rolling-window call (multi-chunk query, Rolling Forcing) gets one plan
+    per query chunk: each chunk keeps its *own* whole frames — its chunk, the
+    sink frame and its recent frame — and the gather execution over the shared
+    K/V view matches a masked reference chunk by chunk."""
+    from sglang.multimodal_gen.runtime.layers.attention.sparse.osa import (
+        WindowGatherPlan,
+    )
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    heads, head_dim = 4, 64
+    chunk_tokens = FRAMES_PER_BLOCK * FRAME_SEQLEN
+    window_chunks = 3
+    backend = build_sparse_attention_backend(
+        "osa",
+        {
+            "density": 0.6,
+            "num_recent_frames": 1,
+            "sink_latent_frames": 1,
+            "calibration_query_stride": 4,
+        },
+    )
+
+    # Calibration: the last ramp-up window starts at chunk 0 and covers the
+    # whole (window-sized) query; its keys are the window's own tokens.
+    ramp_query = torch.randn(
+        1,
+        window_chunks * chunk_tokens,
+        heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    ramp_call = SparseAttentionCall(
+        layer_index=0,
+        query=ramp_query,
+        key=torch.randn_like(ramp_query),
+        value=torch.randn_like(ramp_query),
+        key_segments=((0, window_chunks * chunk_tokens),),
+        head_start=0,
+        num_local_heads=heads,
+        softmax_scale=head_dim**-0.5,
+    )
+    backend.begin_forward(_geometry(0))
+    assert backend.attend(ramp_call) is None  # ramp-up runs dense, measuring
+
+    # Steady state: window of chunks [5, 8), keys = sink chunk 0 (re-roped
+    # anchor) + working chunk 4 + the window's own fresh keys.
+    window_start_chunk = 5
+    key_segments = (
+        (0, chunk_tokens),
+        (4 * chunk_tokens, chunk_tokens),
+        (window_start_chunk * chunk_tokens, window_chunks * chunk_tokens),
+    )
+    kv_len = sum(length for _, length in key_segments)
+    query = torch.randn(
+        1,
+        window_chunks * chunk_tokens,
+        heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    key = torch.randn(1, kv_len, heads, head_dim, device=device, dtype=torch.bfloat16)
+    call = SparseAttentionCall(
+        layer_index=0,
+        query=query,
+        key=key,
+        value=torch.randn_like(key),
+        key_segments=key_segments,
+        head_start=0,
+        num_local_heads=heads,
+        softmax_scale=head_dim**-0.5,
+    )
+    backend.begin_forward(_geometry(window_start_chunk))
+    out = backend.attend(call)
+    assert out is not None and out.shape == query.shape
+
+    plan = backend._plans._entries[0][1]
+    assert isinstance(plan, WindowGatherPlan)
+    assert len(plan.chunk_plans) == window_chunks
+
+    global_frame_ids = np.concatenate(
+        [
+            np.arange(start // FRAME_SEQLEN, (start + length) // FRAME_SEQLEN)
+            for start, length in key_segments
+        ]
+    )
+    num_frames = kv_len // FRAME_SEQLEN
+    for offset, chunk_plan in enumerate(plan.chunk_plans):
+        allow = torch.zeros(heads, kv_len, dtype=torch.bool, device=device)
+        allow.scatter_(1, chunk_plan.indices, True)
+        frames = allow.view(heads, num_frames, FRAME_SEQLEN)
+        own_first = (window_start_chunk + offset) * FRAMES_PER_BLOCK
+        whole = (
+            (global_frame_ids == 0)  # sink frame
+            | (global_frame_ids == own_first - 1)  # recent frame
+            | (
+                (global_frame_ids >= own_first)
+                & (global_frame_ids < own_first + FRAMES_PER_BLOCK)
+            )
+        )
+        assert frames[:, torch.from_numpy(whole).to(device)].all()
+        # Every non-whole frame repeats one per-head tile pattern.
+        others = np.flatnonzero(~whole)
+        for frame in others[1:]:
+            assert torch.equal(frames[:, int(frame)], frames[:, int(others[0])])
+        assert 0.3 < allow.float().mean().item() < 0.6
+
+        # The per-chunk execution equals masked attention over the shared view.
+        rows = slice(offset * chunk_tokens, (offset + 1) * chunk_tokens)
+        scores = (
+            torch.einsum("qhd,khd->hqk", query[0, rows].float(), key[0].float())
+            * call.softmax_scale
+        )
+        scores = scores.masked_fill(~allow[:, None, :], float("-inf"))
+        reference = torch.softmax(scores, dim=-1) @ call.value[0].float().permute(
+            1, 0, 2
+        )
+        torch.testing.assert_close(
+            out[0, rows].float(),
+            reference.permute(1, 0, 2),
+            atol=3e-2,
+            rtol=3e-2,
+        )

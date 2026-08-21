@@ -893,6 +893,7 @@ def test_lingbot_context_cache_update_skips_unused_projection(monkeypatch):
         "current_platform",
         SimpleNamespace(device_type="cpu"),
     )
+    monkeypatch.setattr(lingbot_denoising, "get_sparse_attention_backend", lambda: None)
 
     context_input = torch.ones(2, 3, 4, 5, 6)
     batch = SimpleNamespace()
