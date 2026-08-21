@@ -1,0 +1,63 @@
+<h2>1. 实验设置</h2>
+<ul>
+<li><b>模型</b>：LongLive-2.0 5B（24 fps）。逐 chunk 因果生成，chunk 为 <b>8 潜帧</b>（四个模型中最大），注意力窗口封顶 <b>32 潜帧</b>（含 8 帧 sink block），稳态可见键 = sink + 滚动近期窗口两段。单卡 H200。</li>
+<li><b>配置</b>：720p（1280×704）/ 20 s（477 像素帧 = 120 潜帧 = 15 chunk），seed 42；主实验 prompt 为 p0 · 东京夜街（见第 4 节）。</li>
+<li><b>方法</b>：dense 与 OSA。OSA density 参数直接给定：主扫描 0.5 / 0.4 / 0.3 / 0.2 四档，多 prompt 验证用 0.3 档。</li>
+<li><b>匹配口径</b>：整段生成的<b>实际累计读取密度</b>（后端采样统计上报；回退 dense 的调用按 1.0 计，包括 chunk 0 的校准全程）。</li>
+<li><b>集成</b>：LongLive-2 的 DiT 直接继承 CausalWan 自注意力的稀疏挂点，<b>无需改模型代码</b>；唯一改动是其 KV 刷新 pass 补上 cache_update 作用域（否则刷新 forward 会覆盖 chunk 0 的校准测量）。OSA 行为与 Self-Forcing 完全一致：chunk 0 全部去噪步稠密执行、覆盖测量各头帧内 64-token tile 质量分布，冻结后每头保留自身 chunk 8 帧、1 帧 sink、1 帧近期整帧，其余可见帧复制 top-mass tile 集。代码 commit <code>c59b5d492</code>，稀疏单测 92 项通过。</li>
+<li><b>几何下限</b>：稳态每次调用整帧保留 (8+1+1)/32 ≈ 0.31——8 帧大 chunk 使"自身 chunk 整帧保留"就占掉可见键的四分之一，是四个模型中密度下限最高、稀疏化余地最小的：0.3 档 knob 实测累计密度 0.398。</li>
+</ul>
+<h2>2. Walltime</h2>
+<p><span background-color="light-yellow">⏳ 主扫描（独占 GPU、dense + OSA 四密度档）仍在排队等空闲卡，本节数字待补齐后更新。</span>下表为多 prompt 批次（0.3 档）在共享 GPU 上串行执行的初步均值（5 个 prompt 平均）：</p>
+<table>
+<colgroup><col/><col/><col/><col/></colgroup>
+<thead><tr><th><p>方法</p></th><th><p>去噪耗时</p></th><th><p>端到端</p></th><th><p>实际累计密度</p></th></tr></thead>
+<tbody>
+<tr><td><p>dense</p></td><td><p>22.5 s</p></td><td><p>51.5 s</p></td><td><p>—</p></td></tr>
+<tr><td><p>OSA（knob 0.3）</p></td><td><p><b>19.1 s（1.18×）</b></p></td><td><p>48.0 s（1.07×）</p></td><td><p>0.398</p></td></tr>
+</tbody>
+</table>
+<ul>
+<li>收益是四个模型中最小的，且同样是<b>结构性的</b>：密度只能压到 ~0.40（整帧保留占 0.31）；此外 LongLive-2 的去噪本身只占端到端约 44%（32 帧封顶窗口 + 少步蒸馏使注意力负担天然小），attention 之外的部分不受稀疏化影响。</li>
+<li>去噪耗时随密度的完整曲线（0.5 / 0.4 / 0.3 / 0.2 档）与图表待主扫描完成后补充。</li>
+</ul>
+<h2>3. 生成质量</h2>
+<p><b>PSNR（OSA 0.3 档相对各自 dense 输出，dB）</b>：自回归 rollout 中任何扰动都会复合成内容轨迹分歧，因此该指标衡量的是"偏离 dense 轨迹的速度"而非画质本身；前 5 s 更有参考价值。LongLive-2 的前 5 s PSNR（10.7–16.4）系统性低于 Rolling Forcing 同档（17.6–21.0）——它偏离 dense 轨迹更快。</p>
+<table>
+<colgroup><col/><col/><col/></colgroup>
+<thead><tr><th><p>prompt</p></th><th><p>整段 PSNR</p></th><th><p>前 5 s PSNR</p></th></tr></thead>
+<tbody>
+<tr><td><p>p1 · 雨林逃亡</p></td><td><p>11.9</p></td><td><p>13.7</p></td></tr>
+<tr><td><p>p2 · 主厨摆盘</p></td><td><p>9.4</p></td><td><p>10.7</p></td></tr>
+<tr><td><p>p3 · 浣熊吉他</p></td><td><p>10.1</p></td><td><p>12.9</p></td></tr>
+<tr><td><p>p4 · 茶杯倒水</p></td><td><p>12.9</p></td><td><p>16.4</p></td></tr>
+<tr><td><p>p5 · 巷道海啸</p></td><td><p>12.1</p></td><td><p>14.5</p></td></tr>
+</tbody>
+</table>
+<p><b>视觉检查</b>（帧对比图见第 4 节）：OSA 在全部 prompt 上无崩坏、无花屏类伪影，但<b>内容漂移比 Rolling Forcing 明显</b>——物体身份与场景细节会被逐步重构：</p>
+<ul>
+<li>p3 浣熊：dense 全程保持同一把 sunburst 吉他；OSA 的吉他多次变换颜色与琴型（sunburst → 白 → 黑），墙上海报也被重绘。</li>
+<li>p1 雨林（本模型渲染为卡通风格）：dense 中人物近乎静止；OSA 画面更动态、动物更多，但女孩服装随时间变化（人物身份漂移）。</li>
+<li>p4 茶杯：OSA 后段桌面从花纹台面漂移为木桌、杯柄朝向改变；注水动作本身始终连贯。</li>
+<li>p5 海啸：dense 后段浪涌逐渐平息、巷道洗白；<b>OSA 反而把巷道结构与浪的冲击力保持到 19 s</b>，仅 16 s 处有少量飞溅碎片状噪点。</li>
+<li>主 prompt（p0 · 东京夜街）的多密度档帧对比图待主扫描完成后补充。</li>
+</ul>
+<h2>4. 多 prompt 验证与原始视频</h2>
+<ul>
+<li><b>设置</b>：5 个验证 prompt × {dense, OSA 0.3 档}，均为 720p / 20 s、seed 42，共 10 条视频；每个 prompt 下方为帧对比图（行：Dense / OSA；列：7 帧，t = 1–19 s）与两条原始视频。</li>
+<li><b>密度稳定性</b>：OSA 的实际累计密度在 5 个 prompt 上完全一致（均为 0.398）——选择集合由几何与冻结的 tile 排序决定，对内容不敏感。</li>
+<li><b>跨 prompt 结论</b>：OSA 去噪耗时 18.9–19.4 s vs dense 22.4–22.6 s，全部 prompt 稳定小幅加速；质量结论见第 3 节。</li>
+</ul>
+<p><b>p0 · 东京夜街</b>（主实验 prompt，视频待主扫描完成后补充：A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, creating a mirror effect of the colorful lights. Many pedestrians walk about.）：</p>
+<p><b>p1 · 雨林逃亡</b>（A dynamic and chaotic scene in a dense forest during a heavy rainstorm, capturing a real girl frantically running through the foliage. Her wild hair flows behind her as she sprints, her arms flailing and her face contorted in fear and desperation. Behind her, various animals—rabbits, deer, and birds—are also running, creating a frenzied atmosphere. The girl's clothes are soaked, clinging to her body, and she is screaming and shouting as she tries to escape. The background is a blur of greenery and rain-drenched trees, with occasional glimpses of the darkening sky. A wide-angle shot from a low angle, emphasizing the urgency and chaos of the moment.）：</p>
+<p><b>p2 · 主厨摆盘</b>（A dynamic over-the-shoulder perspective of a chef meticulously plating a dish in a bustling kitchen. The chef, a middle-aged man with a neatly trimmed beard and focused expression, deftly arranges ingredients on a pristine white plate. His hands move with precision, each gesture deliberate and practiced. The background shows a crowded kitchen with steaming pots, whirring blenders, and the clatter of utensils. Bright lights highlight the scene, casting shadows across the busy workspace. The camera angle captures the chef's detailed work from behind, emphasizing his skill and dedication.）：</p>
+<p><b>p3 · 浣熊吉他</b>（A playful raccoon is seen playing an electronic guitar, strumming the strings with its front paws. The raccoon has distinctive black facial markings and a bushy tail. It sits comfortably on a small stool, its body slightly tilted as it focuses intently on the instrument. The setting is a cozy, dimly lit room with vintage posters on the walls, adding a retro vibe. The raccoon's expressive eyes convey a sense of joy and concentration. Medium close-up shot, focusing on the raccoon's face and hands interacting with the guitar.）：</p>
+<p><b>p4 · 茶杯倒水</b>（A close-up shot of a ceramic teacup slowly pouring water into a glass mug. The water flows smoothly from the spout of the teacup into the mug, creating gentle ripples as it fills up. Both cups have detailed textures, with the teacup having a matte finish and the glass mug showcasing clear transparency. The background is a blurred kitchen countertop, adding context without distracting from the central action. The pouring motion is fluid and natural, emphasizing the interaction between the two cups.）：</p>
+<p><b>p5 · 巷道海啸</b>（A dramatic and dynamic scene in the style of a disaster movie, depicting a powerful tsunami rushing through a narrow alley in Bulgaria. The water is turbulent and chaotic, with waves crashing violently against the walls and buildings on either side. The alley is lined with old, weathered houses, their facades partially submerged and splintered. The camera angle is low, capturing the full force of the tsunami as it surges forward, creating a sense of urgency and danger. People can be seen running frantically, adding to the chaotic atmosphere. The scene is filled with dramatic lighting and intense motion, emphasizing the destructive power of the tsunami.）：</p>
+<h2>复现命令</h2>
+<p>环境：单机 8×H200，代码 <code>FrankLeeeee/Oracle-Sparse-Attention</code> @ <code>c59b5d492</code> 或更新；模型 <code>Rabinovich/LongLive-2.0-5B-Diffusers</code>（HF 自动下载）。脚本位于 <code>scripts/investigation/sparse_osa_models/</code>，产物在 <code>results/investigation/sparse_osa_models/longlive2/</code>；计时跑建议独占 GPU 串行执行。</p>
+<pre lang="bash" caption="0. 环境与单测"><code>cd /data/projects/vision-gen/sglang<br/>export PYTHONPATH=$PWD/python<br/>python -m pytest python/sglang/multimodal_gen/test/unit/realtime/test_sparse_attention.py -q</code></pre>
+<pre lang="bash" caption="1. 主扫描：720p/20s，dense + OSA x 4 档（第 2 节表格与视频）"><code>cd scripts/investigation/sparse_osa_models<br/>python run_sweep.py --model longlive2 --gpus 0<br/># -&gt; longlive2/results.json、runs/&lt;tag&gt;/ 下各 run 的视频与日志</code></pre>
+<pre lang="bash" caption="2. 质量：PSNR + 帧对比图（第 3 节）"><code>python quality.py --model longlive2<br/># -&gt; results.json（追加 psnr_overall_db / psnr_first5s_db）、quality_sheet.png</code></pre>
+<pre lang="bash" caption="3. 多 prompt 验证：5 prompt x {dense, OSA@0.3}（第 4 节帧对比图与视频）"><code>python multi_prompt.py --model longlive2 --gpus 0<br/># -&gt; runs_prompts/&lt;prompt&gt;_&lt;method&gt;/、prompt_sheet_p*.png、results_prompts.json</code></pre>
+<pre lang="bash" caption="4. 图表与文档回写"><code>python plot.py --model longlive2        # -&gt; walltime_vs_density.png<br/>python doc_update.py --model longlive2  # 文本 + 图 + 视频写回本文档</code></pre>

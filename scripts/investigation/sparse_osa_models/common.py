@@ -336,12 +336,14 @@ class LingbotServer:
         server_dir: pathlib.Path,
         method: str | None,
         method_config: dict | None,
+        wait_gpu: bool = True,
     ) -> None:
         self.port = port_base + 2
         self.server_dir = server_dir
         self.log = server_dir / "server.log"
         server_dir.mkdir(parents=True, exist_ok=True)
-        wait_for_free_gpu(gpu)
+        if wait_gpu:
+            wait_for_free_gpu(gpu)
         args = [
             "sglang",
             "serve",

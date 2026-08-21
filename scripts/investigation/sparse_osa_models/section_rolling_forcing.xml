@@ -1,0 +1,68 @@
+<h2>1. 实验设置</h2>
+<ul>
+<li><b>模型</b>：Rolling Forcing 1.3B（Wan2.1-T2V-1.3B 蒸馏，TencentARC）。与 Self-Forcing 的逐 chunk 生成不同，它做<b>滚动窗口联合去噪</b>：5 个 block（每 block 3 潜帧）组成的窗口一次 forward 各去噪一步，然后窗口滑动 1 个 block；注意力上下文上限 21 潜帧 = 重 RoPE 的 sink block 3 帧 + working cache 3 帧 + 窗口自身 15 帧。单卡 H200。</li>
+<li><b>配置</b>：720p / 20 s（321 像素帧 = 81 潜帧 = 27 block = 31 个窗口 pass），seed 42；主实验 prompt 为 p0 · 东京夜街（见第 4 节）。</li>
+<li><b>方法</b>：dense 与 OSA。OSA 的 density 参数直接给定目标读取密度：主扫描 0.5 / 0.4 / 0.3 / 0.2 四档，多 prompt 验证用 0.3 档。</li>
+<li><b>匹配口径</b>：整段生成的<b>实际累计读取密度</b>（后端采样统计上报；回退 dense 的调用按 1.0 计——包括 ramp-up 的 5 个稠密窗口与冻结前的全部调用）。</li>
+</ul>
+<p><b>OSA 对滚动窗口的扩展</b>（本模型与 Self-Forcing 的关键差异）：</p>
+<ul>
+<li><b>校准（ramp-up 窗口）</b>：Rolling Forcing 的 ramp-up 阶段窗口从 1 个 block 长到 5 个、查询起点始终在 chunk 0，本来就稠密执行；OSA 在这些 pass 上逐次覆盖测量各头对帧内 64-token 空间 tile 的注意力质量分布，最终冻结的是<b>最后一个 ramp-up pass</b>（窗口已满、block 0 接近去噪完毕）的测量。</li>
+<li><b>冻结与复制（稳态窗口）</b>：一次 forward 的查询横跨 5 个 chunk，OSA 为<b>每个查询 chunk 独立</b>构建 gather 计划——各自保留自身 chunk 整帧、1 帧 sink、1 帧近期，其余可见帧（含窗口内其他 chunk 与 working cache）复制该头的 top-mass tile 集合——5 个查询 chunk 作为 5 组 FA3 varlen batch 执行；计划按 (层, 窗口) 缓存。</li>
+<li><b>KV 刷新 pass</b>（updating_cache，把离开窗口的 block 以干净特征重写进缓存）同样稀疏执行，且通过 cache_update 作用域排除出校准。</li>
+<li><b>几何下限</b>：稳态每次调用整帧保留 5/21 ≈ 0.24，叠加 ramp-up 稠密贡献后累计密度下限更高；0.3 档 knob 实测累计密度 0.441（见下）。</li>
+<li><b>代码</b>：<code>sparse/osa.py</code>（WindowGatherPlan 多 chunk 查询扩展）与 <code>runtime/models/dits/rolling_forcing_wanvideo.py</code> 的稀疏挂点，commit <code>c59b5d492</code>；稀疏注意力单测 92 项全部通过。</li>
+</ul>
+<h2>2. Walltime</h2>
+<p><span background-color="light-yellow">⏳ 主扫描（独占 GPU、dense + OSA 四密度档）仍在排队等空闲卡，本节数字待补齐后更新。</span>下表为多 prompt 批次（0.3 档）在共享 GPU 上串行执行的初步均值（5 个 prompt 平均，机器上有驻留显存但零利用率的共租进程，计时可能轻微偏保守）：</p>
+<table>
+<colgroup><col/><col/><col/><col/></colgroup>
+<thead><tr><th><p>方法</p></th><th><p>去噪耗时</p></th><th><p>端到端</p></th><th><p>实际累计密度</p></th></tr></thead>
+<tbody>
+<tr><td><p>dense</p></td><td><p>48.2 s</p></td><td><p>77.1 s</p></td><td><p>—</p></td></tr>
+<tr><td><p>OSA（knob 0.3）</p></td><td><p><b>35.9 s（1.34×）</b></p></td><td><p>63.9 s（1.21×）</p></td><td><p>0.441</p></td></tr>
+</tbody>
+</table>
+<ul>
+<li>加速比低于全上下文 Self-Forcing 同档（2.6×）是<b>结构性的</b>：Rolling Forcing 的注意力上下文封顶在 21 潜帧，每个查询 chunk 固定保留 5 帧整帧（自身 3 + sink 1 + 近期 1），可稀疏化的余地只剩 16 帧；且 31 个窗口 pass 中 5 个 ramp-up pass 全稠密。</li>
+<li>去噪耗时随密度的完整曲线（0.5 / 0.4 / 0.3 / 0.2 档）与图表待主扫描完成后补充。</li>
+</ul>
+<h2>3. 生成质量</h2>
+<p><b>PSNR（OSA 0.3 档相对各自 dense 输出，dB）</b>：自回归 rollout 中任何扰动都会复合成内容轨迹分歧，因此该指标衡量的是"偏离 dense 轨迹的速度"而非画质本身；前 5 s（轨迹尚未分开）更有参考价值。</p>
+<table>
+<colgroup><col/><col/><col/></colgroup>
+<thead><tr><th><p>prompt</p></th><th><p>整段 PSNR</p></th><th><p>前 5 s PSNR</p></th></tr></thead>
+<tbody>
+<tr><td><p>p1 · 雨林逃亡</p></td><td><p>12.3</p></td><td><p>17.6</p></td></tr>
+<tr><td><p>p2 · 主厨摆盘</p></td><td><p>9.3</p></td><td><p>17.7</p></td></tr>
+<tr><td><p>p3 · 浣熊吉他</p></td><td><p>12.9</p></td><td><p>20.1</p></td></tr>
+<tr><td><p>p4 · 茶杯倒水</p></td><td><p>14.0</p></td><td><p>21.0</p></td></tr>
+<tr><td><p>p5 · 巷道海啸</p></td><td><p>12.1</p></td><td><p>19.6</p></td></tr>
+</tbody>
+</table>
+<p><b>视觉检查</b>（帧对比图见第 4 节）：OSA 在全部 5 个 prompt 上无崩坏、无伪影，是四个模型中跟随 dense 轨迹最紧的：</p>
+<ul>
+<li>p3 浣熊、p5 海啸的 OSA 输出与 dense 几乎逐帧同构到 19 s（构图、主体、背景全部对应）；p1 雨林保持人物与动物群结构，仅细节分布不同。</li>
+<li>p4 茶杯：OSA 全程保住"茶杯 + 注水"构图；dense 自身后段反而丢失杯沿只剩水流——OSA 的低 PSNR 部分来自 dense 参考轨迹自身的漂移。</li>
+<li>最大的偏离是 p2 主厨：约 10 s 起 OSA 的镜头逐渐推近、人物占幅变大（取景漂移），但厨师、餐盘与厨房始终连贯。</li>
+<li>主 prompt（p0 · 东京夜街）的多密度档帧对比图待主扫描完成后补充。</li>
+</ul>
+<h2>4. 多 prompt 验证与原始视频</h2>
+<ul>
+<li><b>设置</b>：5 个验证 prompt × {dense, OSA 0.3 档}，均为 720p / 20 s、seed 42，共 10 条视频；每个 prompt 下方为帧对比图（行：Dense / OSA；列：7 帧，t = 1–19 s）与两条原始视频。</li>
+<li><b>密度稳定性</b>：OSA 的实际累计密度在 5 个 prompt 上完全一致（均为 0.441）——选择集合由几何与冻结的 tile 排序决定，对内容不敏感，校准配置可跨 prompt 复用。</li>
+<li><b>跨 prompt 结论</b>：OSA 去噪耗时 35.4–36.6 s vs dense 47.9–48.9 s，全部 prompt 稳定加速；质量结论见第 3 节。</li>
+</ul>
+<p><b>p0 · 东京夜街</b>（主实验 prompt，视频待主扫描完成后补充：A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, creating a mirror effect of the colorful lights. Many pedestrians walk about.）：</p>
+<p><b>p1 · 雨林逃亡</b>（A dynamic and chaotic scene in a dense forest during a heavy rainstorm, capturing a real girl frantically running through the foliage. Her wild hair flows behind her as she sprints, her arms flailing and her face contorted in fear and desperation. Behind her, various animals—rabbits, deer, and birds—are also running, creating a frenzied atmosphere. The girl's clothes are soaked, clinging to her body, and she is screaming and shouting as she tries to escape. The background is a blur of greenery and rain-drenched trees, with occasional glimpses of the darkening sky. A wide-angle shot from a low angle, emphasizing the urgency and chaos of the moment.）：</p>
+<p><b>p2 · 主厨摆盘</b>（A dynamic over-the-shoulder perspective of a chef meticulously plating a dish in a bustling kitchen. The chef, a middle-aged man with a neatly trimmed beard and focused expression, deftly arranges ingredients on a pristine white plate. His hands move with precision, each gesture deliberate and practiced. The background shows a crowded kitchen with steaming pots, whirring blenders, and the clatter of utensils. Bright lights highlight the scene, casting shadows across the busy workspace. The camera angle captures the chef's detailed work from behind, emphasizing his skill and dedication.）：</p>
+<p><b>p3 · 浣熊吉他</b>（A playful raccoon is seen playing an electronic guitar, strumming the strings with its front paws. The raccoon has distinctive black facial markings and a bushy tail. It sits comfortably on a small stool, its body slightly tilted as it focuses intently on the instrument. The setting is a cozy, dimly lit room with vintage posters on the walls, adding a retro vibe. The raccoon's expressive eyes convey a sense of joy and concentration. Medium close-up shot, focusing on the raccoon's face and hands interacting with the guitar.）：</p>
+<p><b>p4 · 茶杯倒水</b>（A close-up shot of a ceramic teacup slowly pouring water into a glass mug. The water flows smoothly from the spout of the teacup into the mug, creating gentle ripples as it fills up. Both cups have detailed textures, with the teacup having a matte finish and the glass mug showcasing clear transparency. The background is a blurred kitchen countertop, adding context without distracting from the central action. The pouring motion is fluid and natural, emphasizing the interaction between the two cups.）：</p>
+<p><b>p5 · 巷道海啸</b>（A dramatic and dynamic scene in the style of a disaster movie, depicting a powerful tsunami rushing through a narrow alley in Bulgaria. The water is turbulent and chaotic, with waves crashing violently against the walls and buildings on either side. The alley is lined with old, weathered houses, their facades partially submerged and splintered. The camera angle is low, capturing the full force of the tsunami as it surges forward, creating a sense of urgency and danger. People can be seen running frantically, adding to the chaotic atmosphere. The scene is filled with dramatic lighting and intense motion, emphasizing the destructive power of the tsunami.）：</p>
+<h2>复现命令</h2>
+<p>环境：单机 8×H200，代码 <code>FrankLeeeee/Oracle-Sparse-Attention</code> @ <code>c59b5d492</code> 或更新；模型 <code>frankleeeee/RollingForcing-Wan2.1-T2V-1.3B-Diffusers</code>（HF 自动下载）。脚本位于 <code>scripts/investigation/sparse_osa_models/</code>，产物在 <code>results/investigation/sparse_osa_models/rolling_forcing/</code>；计时跑建议独占 GPU 串行执行。</p>
+<pre lang="bash" caption="0. 环境与单测"><code>cd /data/projects/vision-gen/sglang<br/>export PYTHONPATH=$PWD/python<br/>python -m pytest python/sglang/multimodal_gen/test/unit/realtime/test_sparse_attention.py -q</code></pre>
+<pre lang="bash" caption="1. 主扫描：720p/20s，dense + OSA x 4 档（第 2 节表格与视频）"><code>cd scripts/investigation/sparse_osa_models<br/>python run_sweep.py --model rolling_forcing --gpus 0<br/># -&gt; rolling_forcing/results.json、runs/&lt;tag&gt;/ 下各 run 的视频与日志</code></pre>
+<pre lang="bash" caption="2. 质量：PSNR + 帧对比图（第 3 节）"><code>python quality.py --model rolling_forcing<br/># -&gt; results.json（追加 psnr_overall_db / psnr_first5s_db）、quality_sheet.png</code></pre>
+<pre lang="bash" caption="3. 多 prompt 验证：5 prompt x {dense, OSA@0.3}（第 4 节帧对比图与视频）"><code>python multi_prompt.py --model rolling_forcing --gpus 0<br/># -&gt; runs_prompts/&lt;prompt&gt;_&lt;method&gt;/、prompt_sheet_p*.png、results_prompts.json</code></pre>
+<pre lang="bash" caption="4. 图表与文档回写"><code>python plot.py --model rolling_forcing        # -&gt; walltime_vs_density.png<br/>python doc_update.py --model rolling_forcing  # 文本 + 图 + 视频写回本文档</code></pre>

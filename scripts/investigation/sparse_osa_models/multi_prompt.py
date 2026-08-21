@@ -58,7 +58,13 @@ def run_generate_jobs(args) -> None:
                 tag, prompt_key, method, config = jobs.get_nowait()
             except queue.Empty:
                 return
-            if tag in results and results[tag].get("returncode") == 0:
+            # `sglang generate` exits 0 even when the run fails; a parsed e2e
+            # time is the real success marker.
+            if (
+                tag in results
+                and results[tag].get("returncode") == 0
+                and results[tag].get("e2e_s") is not None
+            ):
                 print(f"SKIP {tag}: already done", flush=True)
                 jobs.task_done()
                 continue
@@ -74,6 +80,7 @@ def run_generate_jobs(args) -> None:
                     prompt_key=prompt_key,
                     method=method,
                     method_config=config,
+                    wait_gpu=not args.no_gpu_wait,
                 )
                 with lock:
                     results[tag] = result
@@ -113,7 +120,7 @@ def run_lingbot_jobs(args) -> None:
         todo = [
             key
             for key in PROMPT_KEYS
-            if results.get(f"{key}_{suffix}", {}).get("returncode") != 0
+            if results.get(f"{key}_{suffix}", {}).get("denoise_s") is None
         ]
         if not todo:
             continue
@@ -124,6 +131,7 @@ def run_lingbot_jobs(args) -> None:
             server_dir=model_root / "runs_prompts" / f"server_{suffix}",
             method=method,
             method_config=config,
+            wait_gpu=not args.no_gpu_wait,
         ) as server:
             server.wait_ready()
             for prompt_key in todo:
@@ -177,6 +185,9 @@ def main() -> None:
     parser.add_argument("--duration", type=int, default=20)
     parser.add_argument("--res", default="720p")
     parser.add_argument("--sheets-only", action="store_true")
+    # Multi-prompt runs feed the quality comparison, not the headline timing
+    # table, so they may share a GPU with a resident co-tenant.
+    parser.add_argument("--no-gpu-wait", action="store_true")
     parser.add_argument("--port-base", type=int, default=36500)
     args = parser.parse_args()
     if not args.sheets_only:
