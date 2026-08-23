@@ -55,8 +55,11 @@ class Svg1Config(msgspec.Struct, frozen=True):
     # `sparsity` knob via `sparsity_to_width`; here one width drives both
     # scoring and execution, and it is the knob to turn for a sparsity sweep.
     band_frames: float = 2.0
-    # Upstream's `pixel_attn_mask[:, :frame_size] = 1` — the first frame of the
-    # video is a sink for *both* candidate masks.
+    # Upstream's `pixel_attn_mask[:, :frame_size] = 1` — the leading frame(s)
+    # of the view are a sink for *both* candidate masks. Upstream protects one
+    # frame; models distilled onto a multi-frame sink block (Rolling Forcing 3,
+    # LongLive-2 8, LingBot 9) set this to their sink size, since the sink
+    # block is exactly the leading frames of their visible view.
     dense_sink_frames: int = 1
     # Query blocks attended exactly to score the two candidate masks. Upstream
     # samples 32 individual rows; whole blocks keep the profiling pass on the
@@ -121,7 +124,7 @@ def svg1_token_masks(
     index = torch.arange(total, device=device)
     band_blocks = int(band_frames * frame_seqlen) // block
     banded = ((index[:, None] // block) - (index[None, :] // block)).abs() < band_blocks
-    banded[:, :frame_seqlen] |= dense_sink_frames > 0
+    banded[:, : dense_sink_frames * frame_seqlen] = True
 
     permuted = (
         banded.reshape(frame_seqlen, num_frames, frame_seqlen, num_frames)
@@ -188,7 +191,8 @@ def build_svg1_segment_masks(
     num_frames = layout.num_frames
     band_blocks = int(config.band_frames * frame_seqlen) // block
     offset = kv_len - q_len  # the chunk's queries are the last keys of the view
-    sink = config.dense_sink_frames > 0
+    sink_tokens = min(config.dense_sink_frames, num_frames) * frame_seqlen
+    sink = sink_tokens > 0
 
     seg_lo, seg_hi = frame_aligned_block_bounds(
         num_frames=num_frames,
@@ -221,7 +225,7 @@ def build_svg1_segment_masks(
             min(kv_len, (row_block_max + band_blocks) * block),
         )
         if sink:
-            spatial = spatial | overlapping(0, frame_seqlen)
+            spatial = spatial | overlapping(0, sink_tokens)
         spatial_rows.append(spatial | overlapping(rlo, rhi))
 
         # Spatial-major band over sm = cell * F + f, for the *permuted* rows
@@ -244,9 +248,11 @@ def build_svg1_segment_masks(
         )
         if sink:
             # Upstream applies the sink before the permutation, so the
-            # temporal sink is sm < frame_seqlen: the lowest spatial cells of
-            # every frame, not the first frame.
-            sink_hi = (frame_seqlen - frames + num_frames - 1) // num_frames
+            # temporal sink is sm < sink_tokens: the lowest spatial cells of
+            # every frame, not the leading frames themselves.
+            sink_hi = ((sink_tokens - frames + num_frames - 1) // num_frames).clamp(
+                min=0
+            )
             kept |= within_lo[None, :] < sink_hi[:, None]
         temporal = kept.reshape(-1)
         if band_blocks < 1:
@@ -344,16 +350,20 @@ class Svg1Attention(SparseAttentionBackend):
             return None
         device = call.query.device
 
-        # Both candidate masks, the sampled rows and the plans that profile them
-        # depend only on the visible layout, so the whole lot is built once per
-        # chunk and shared by every layer and every denoising step. Only the
-        # per-head choice is remade per call, which is the part SVG defines as
-        # online.
-        signature = (call.key_segments, q_len, call.num_local_heads)
-        hit, cached = self._masks.get(0, signature)
+        # Both candidate masks, the sampled rows and the plans that profile
+        # them depend only on the *shape* of the visible layout — bands and
+        # sink are view-token constructions — so the whole lot is built once
+        # and shared by every layer, denoising step, and (on Rolling Forcing)
+        # every steady window, whose absolute segments change while the shape
+        # repeats. Only the per-head choice is remade per call, which is the
+        # part SVG defines as online. The slot is the frame count so the
+        # alternating denoise/updating layouts of one window don't evict each
+        # other.
+        signature = (layout.num_frames, q_len, call.num_local_heads)
+        hit, cached = self._masks.get(layout.num_frames, signature)
         if not hit:
             cached = self._build_candidates(layout, q_len, kv_len, call, device)
-            self._masks.put(0, signature, cached)
+            self._masks.put(layout.num_frames, signature, cached)
         if cached is None:
             return None
         spatial, temporal, permutation, seg_lo, seg_hi, candidates = cached
@@ -366,9 +376,7 @@ class Svg1Attention(SparseAttentionBackend):
             softmax_scale=call.softmax_scale,
         )
         temporal_heads = choice == 1
-        keep = torch.where(
-            temporal_heads[:, None, None], temporal[None], spatial[None]
-        )
+        keep = torch.where(temporal_heads[:, None, None], temporal[None], spatial[None])
         plan = plan_from_segment_mask(
             keep, segment_starts=seg_lo, segment_ends=seg_hi, block_m=config.block
         )
@@ -383,9 +391,7 @@ class Svg1Attention(SparseAttentionBackend):
         index = torch.where(
             temporal_heads[None, :], permutation[:, None], natural[:, None]
         )  # [q_len, heads]
-        gathered = call.query.gather(
-            1, index[None, :, :, None].expand_as(call.query)
-        )
+        gathered = call.query.gather(1, index[None, :, :, None].expand_as(call.query))
         return SparseAttentionExecution(
             plan=plan,
             query=gathered,
@@ -409,13 +415,19 @@ class Svg1Attention(SparseAttentionBackend):
         )
         num_q_blocks = spatial.shape[0]
         sampled_blocks = torch.linspace(
-            0, num_q_blocks - 1, min(config.num_sampled_blocks, num_q_blocks),
+            0,
+            num_q_blocks - 1,
+            min(config.num_sampled_blocks, num_q_blocks),
             device=device,
         ).long()
         natural_rows = (
-            sampled_blocks[:, None] * config.block
-            + torch.arange(config.block, device=device)
-        ).flatten().clamp(max=q_len - 1)
+            (
+                sampled_blocks[:, None] * config.block
+                + torch.arange(config.block, device=device)
+            )
+            .flatten()
+            .clamp(max=q_len - 1)
+        )
         candidates = [
             (
                 plan_from_segment_mask(
@@ -467,9 +479,7 @@ def cluster_keys(
         centroids = keys[:, seeds].clone()
     else:
         carried = initial_centroids[:, :num_clusters]
-        centroids = torch.cat(
-            [carried, keys[:, seeds[carried.shape[1] :]]], dim=1
-        )
+        centroids = torch.cat([carried, keys[:, seeds[carried.shape[1] :]]], dim=1)
     labels = torch.zeros(num_heads, history_len, dtype=torch.long, device=keys.device)
     for _ in range(iters):
         similarity = keys @ centroids.transpose(1, 2)
@@ -503,9 +513,9 @@ def cluster_keys(
         permutation=permutation,
         centroids=centroids,
         segment_starts=torch.cat([starts, own], dim=1)[:, None].to(torch.int32),
-        segment_ends=torch.cat(
-            [ends, own + own_chunk_len], dim=1
-        )[:, None].to(torch.int32),
+        segment_ends=torch.cat([ends, own + own_chunk_len], dim=1)[:, None].to(
+            torch.int32
+        ),
         log_size=counts.clamp(min=1).float().log(),
     )
 
@@ -606,7 +616,8 @@ class Svg2Attention(SparseAttentionBackend):
         queries = call.query[0].permute(1, 0, 2)  # [heads, q_len, head_dim]
         similarity = queries @ clustering.centroids.transpose(1, 2)
         labels = (
-            2 * similarity.float() - (clustering.centroids.float() ** 2).sum(-1)[:, None, :]
+            2 * similarity.float()
+            - (clustering.centroids.float() ** 2).sum(-1)[:, None, :]
         ).argmax(-1)
         permutation = labels.argsort(dim=1, stable=True).T  # [q_len, heads]
         index = permutation[None, :, :, None].expand_as(call.query)

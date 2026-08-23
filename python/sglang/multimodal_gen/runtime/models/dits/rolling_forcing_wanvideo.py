@@ -78,6 +78,9 @@ class RollingCacheLayout(msgspec.Struct, frozen=True):
     working_start: int
     working_end: int
     anchor_start_frame: int
+    # ``anchor_start_frame`` in token units (``-1`` when not re-roped), so
+    # consumers that speak token offsets need not know the frame length.
+    anchor_rope_start: int
 
 
 def compute_rolling_cache_layout(
@@ -147,6 +150,9 @@ def compute_rolling_cache_layout(
         working_start=working_start,
         working_end=working_end,
         anchor_start_frame=anchor_start_frame,
+        anchor_rope_start=(
+            anchor_start_frame * frame_seqlen if anchor_start_frame >= 0 else -1
+        ),
     )
 
 
@@ -200,6 +206,23 @@ def visible_key_segments(
         return working
     # Denoising pass: re-roped sink, working cache, then the window's own keys.
     return ((0, block_tokens),) + working + ((current_start, num_query_tokens),)
+
+
+def visible_key_rope_starts(
+    layout: RollingCacheLayout,
+    key_segments: tuple[tuple[int, int], ...],
+) -> tuple[int, ...] | None:
+    """RoPE-space token starts of the visible segments, or ``None`` if global.
+
+    Only the steady denoise pass diverges: its sink segment is re-roped to the
+    anchor position while its global tokens stay ``[0, block_tokens)``.
+    Distance-based sparse methods must read temporal distance off these.
+    """
+    if layout.updating_cache or layout.local_start_index == 0:
+        return None
+    if layout.anchor_rope_start <= 0:
+        return None
+    return (layout.anchor_rope_start,) + tuple(start for start, _ in key_segments[1:])
 
 
 class RollingForcingWanSelfAttention(nn.Module):
@@ -354,6 +377,9 @@ class RollingForcingWanSelfAttention(nn.Module):
                     head_start=0,
                     num_local_heads=self.num_heads,
                     softmax_scale=self.attn.softmax_scale,
+                    key_segment_rope_starts=visible_key_rope_starts(
+                        layout, key_segments
+                    ),
                 )
             )
 

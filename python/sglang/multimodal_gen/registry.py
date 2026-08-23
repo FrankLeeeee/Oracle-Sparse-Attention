@@ -840,6 +840,7 @@ def _register_configs():
         sampling_param_cls=CausalForcingT2VSamplingParams,
         pipeline_config_cls=CausalForcingWanT2V480PConfig,
         hf_model_paths=[
+            "frankleeeee/CausalForcing-Wan2.1-T2V-1.3B-Diffusers",
             "zhuhz22/CausalForcing-Wan2.1-T2V-1.3B-chunkwise-Diffusers",
             "zhuhz22/CausalForcing-Wan2.1-T2V-1.3B-framewise-Diffusers",
         ],
@@ -904,6 +905,13 @@ def _register_configs():
         pipeline_config_cls=RollingForcingWanT2V480PConfig,
         hf_model_paths=[
             "TencentARC/RollingForcing-Wan2.1-T2V-1.3B-Diffusers",
+            "frankleeeee/RollingForcing-Wan2.1-T2V-1.3B-Diffusers",
+            # Causal Forcing's minute-level long-video checkpoint
+            # (zhuhz22/Causal-Forcing chunkwise/longvideo.pt) is a Rolling
+            # Forcing model retrained from Causal Forcing's ODE init, so it
+            # runs on the Rolling Forcing pipeline. Listed explicitly because
+            # its name would otherwise hit the causal-forcing detector.
+            "frankleeeee/CausalForcing-Long-Wan2.1-T2V-1.3B-Diffusers",
         ],
         model_detectors=[
             lambda hf_id: "rolling-forcing" in hf_id.lower()

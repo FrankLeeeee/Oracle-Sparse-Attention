@@ -31,7 +31,6 @@ from sglang.multimodal_gen.runtime.layers.attention.sparse.context import (
     visible_layout,
 )
 from sglang.multimodal_gen.runtime.layers.attention.sparse.kernel import (
-    plan_key_mask,
     sparse_attention,
 )
 
@@ -111,6 +110,8 @@ def benchmark_method(
     head_dim: int,
     steady_chunk: int,
     denoise_steps: int,
+    grid_height: int,
+    grid_width: int,
     device: torch.device,
     dtype: torch.dtype,
 ) -> dict:
@@ -121,8 +122,8 @@ def benchmark_method(
             frame_seqlen=frame_seqlen,
             frames_per_block=frames_per_block,
             query_token_start=chunk_index * frames_per_block * frame_seqlen,
-            grid_height=30,
-            grid_width=52,
+            grid_height=grid_height,
+            grid_width=grid_width,
         )
 
     # Walk the earlier chunks, denoising steps included, so anything that
@@ -154,7 +155,14 @@ def benchmark_method(
         return {"method": method, "status": "declined (dense)"}
 
     kv_len = execution.key.shape[1]
-    density = plan_key_mask(execution.plan, kv_len=kv_len).float().mean().item()
+    plan = execution.plan
+    q_blocks = plan.range_counts.shape[1]
+    # kept_tokens instead of plan_key_mask: the mask materializes
+    # [heads, q_blocks, max_ranges, kv] and OOMs at 720p/20s shapes. Ranges
+    # never overlap within a row, so the token count is exact.
+    density = (
+        plan.kept_tokens().sum() / float(plan.range_counts.shape[0] * q_blocks * kv_len)
+    ).item()
 
     geometry = geometry_for(steady_chunk)
     layout = visible_layout(
@@ -188,6 +196,10 @@ def benchmark_method(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--frame-seqlen", type=int, default=1560)
+    # Post-patch grid of one latent frame; must multiply to --frame-seqlen
+    # (Wan 480p: 30x52, 720p: 45x80).
+    parser.add_argument("--grid-height", type=int, default=30)
+    parser.add_argument("--grid-width", type=int, default=52)
     parser.add_argument("--frames-per-block", type=int, default=3)
     parser.add_argument("--visible-frames", type=int, default=21)
     parser.add_argument("--heads", type=int, default=12)
@@ -215,6 +227,8 @@ def main() -> None:
                 head_dim=args.head_dim,
                 steady_chunk=args.steady_chunk,
                 denoise_steps=args.denoise_steps,
+                grid_height=args.grid_height,
+                grid_width=args.grid_width,
                 device=device,
                 dtype=torch.bfloat16,
             )

@@ -50,6 +50,12 @@ class VisibleLayout(msgspec.Struct, frozen=True):
 
     global_frame_ids: np.ndarray  # int64 [num_frames]
     chunk_offsets: np.ndarray  # int64 [num_frames]
+    # Where each visible frame sits in RoPE space. Equal to global_frame_ids
+    # except where the model re-ropes cached keys (Rolling Forcing's sink block
+    # during steady denoise windows sits at the anchor position, not at video
+    # frame 0) — temporal *distance* must be read off these, while sink
+    # identity stays with global_frame_ids.
+    positional_frame_ids: np.ndarray  # int64 [num_frames]
     frame_seqlen: int
     frames_per_block: int
     query_frames: int
@@ -87,11 +93,16 @@ def visible_layout(
     *,
     geometry: ChunkGeometry,
     query_tokens: int,
+    rope_starts: Sequence[int] | None = None,
 ) -> VisibleLayout | None:
     """Frame/chunk coordinates of the visible keys, or ``None`` if unmappable.
 
     ``None`` means the view is not aligned to whole latent frames — the caller
     must fall back to dense attention rather than guess.
+
+    ``rope_starts`` gives each segment's RoPE-space token start where it
+    differs from the segment's global token start (a re-roped sink); ``None``
+    means every segment sits at its global position.
     """
     frame_seqlen = geometry.frame_seqlen
     if (
@@ -102,6 +113,11 @@ def visible_layout(
     for token_start, length in key_segments:
         if token_start % frame_seqlen != 0 or length % frame_seqlen != 0:
             return None
+    if rope_starts is not None:
+        if len(rope_starts) != len(key_segments):
+            return None
+        if any(start % frame_seqlen != 0 for start in rope_starts):
+            return None
 
     global_frame_ids = np.concatenate(
         [
@@ -109,12 +125,27 @@ def visible_layout(
             for start, length in key_segments
         ]
     )
+    if rope_starts is None:
+        positional_frame_ids = global_frame_ids
+    else:
+        positional_frame_ids = np.concatenate(
+            [
+                np.arange(
+                    rope_start // frame_seqlen,
+                    (rope_start + length) // frame_seqlen,
+                )
+                for rope_start, (_, length) in zip(
+                    rope_starts, key_segments, strict=True
+                )
+            ]
+        )
     frames_per_block = geometry.frames_per_block
     query_chunk = geometry.query_chunk_index
     chunk_offsets = global_frame_ids // frames_per_block - query_chunk
     return VisibleLayout(
         global_frame_ids=global_frame_ids,
         chunk_offsets=chunk_offsets,
+        positional_frame_ids=positional_frame_ids,
         frame_seqlen=frame_seqlen,
         frames_per_block=frames_per_block,
         query_frames=query_tokens // frame_seqlen,
@@ -134,7 +165,11 @@ def frame_mask_to_ranges(
     """
     num_heads, num_frames = keep.shape
     padded = np.concatenate(
-        [np.zeros((num_heads, 1), dtype=bool), keep, np.zeros((num_heads, 1), dtype=bool)],
+        [
+            np.zeros((num_heads, 1), dtype=bool),
+            keep,
+            np.zeros((num_heads, 1), dtype=bool),
+        ],
         axis=1,
     )
     edges = np.diff(padded.astype(np.int8), axis=1)

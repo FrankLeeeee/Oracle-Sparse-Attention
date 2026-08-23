@@ -57,6 +57,9 @@ class SparseAttentionCall(msgspec.Struct, frozen=True):
     head_start: int
     num_local_heads: int
     softmax_scale: float
+    # Per-segment RoPE-space token starts, where they differ from the global
+    # token starts (a re-roped sink); ``None`` means positions == globals.
+    key_segment_rope_starts: tuple[int, ...] | None = None
 
     @property
     def head_dim(self) -> int:
@@ -249,7 +252,10 @@ class SparseAttentionBackend(abc.ABC):
             self.warn_dense_once("key segments disagree with the KV view length")
             return None
         layout = visible_layout(
-            call.key_segments, geometry=geometry, query_tokens=call.query.shape[1]
+            call.key_segments,
+            geometry=geometry,
+            query_tokens=call.query.shape[1],
+            rope_starts=call.key_segment_rope_starts,
         )
         if layout is None:
             self.warn_dense_once("the KV view is not aligned to whole latent frames")

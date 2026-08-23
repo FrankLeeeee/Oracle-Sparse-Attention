@@ -134,22 +134,28 @@ def build_radial_block_mask(
     frame_seqlen = layout.frame_seqlen
     q_lo, _ = block_bounds(q_len, block, device=device)
     k_lo, k_hi = block_bounds(kv_len, block, device=device)
-    mask = torch.zeros(
-        (q_lo.numel(), k_lo.numel()), dtype=torch.bool, device=device
-    )
+    mask = torch.zeros((q_lo.numel(), k_lo.numel()), dtype=torch.bool, device=device)
 
+    # Temporal distance is positional (RoPE-space): Rolling Forcing re-ropes
+    # its sink block to sit just before the working cache during denoise
+    # windows, so the sink's *positional* distance to the query is a few
+    # frames while its global id stays 0. Sink identity ("is this video frame
+    # 0..n") stays with the global ids.
     global_frames = [int(f) for f in layout.global_frame_ids]
-    query_frames = global_frames[-layout.query_frames :]
+    positional_frames = [int(f) for f in layout.positional_frame_ids]
+    query_frames = positional_frames[-layout.query_frames :]
     rows = torch.arange(frame_seqlen, device=device).view(-1, 1)
     columns = torch.arange(frame_seqlen, device=device).view(1, -1)
     ones = torch.ones((frame_seqlen, frame_seqlen), dtype=torch.bool, device=device)
 
     for query_index, query_frame in enumerate(query_frames):
-        for key_index, key_frame in enumerate(global_frames):
+        for key_index, (key_frame, key_position) in enumerate(
+            zip(global_frames, positional_frames, strict=True)
+        ):
             if key_frame < config.dense_sink_frames:
                 local = ones
             else:
-                distance = abs(query_frame - key_frame)
+                distance = abs(query_frame - key_position)
                 if not radial_frame_is_kept(
                     distance, frame_seqlen=frame_seqlen, block=block
                 ):
@@ -217,9 +223,24 @@ class RadialAttention(SparseAttentionBackend):
             return None
 
         # Head- and value-independent, so one entry per visible layout serves
-        # every layer and every denoising step.
-        signature = (call.key_segments, q_len, call.num_local_heads)
-        hit, cached = self._plans.get(0, signature)
+        # every layer and every denoising step. The signature is *relative*:
+        # temporal distances and sink membership, not absolute key segments —
+        # Rolling Forcing's steady windows repeat the same relative layout
+        # under ever-changing segments, and keying on the segments would
+        # rebuild the mask (a 15x24 frame-pair loop) every window. The slot is
+        # the frame count, so the alternating denoise/updating layouts of one
+        # window occupy different slots instead of evicting each other.
+        anchor = int(layout.positional_frame_ids[-1])
+        signature = (
+            tuple(int(f) - anchor for f in layout.positional_frame_ids),
+            tuple(
+                bool(f < self._config.dense_sink_frames)
+                for f in layout.global_frame_ids
+            ),
+            q_len,
+            call.num_local_heads,
+        )
+        hit, cached = self._plans.get(layout.num_frames, signature)
         if not hit:
             mask = build_radial_block_mask(
                 layout=layout,
@@ -236,7 +257,7 @@ class RadialAttention(SparseAttentionBackend):
                     kv_len=kv_len,
                     block_m=self._config.block,
                 )
-            self._plans.put(0, signature, cached)
+            self._plans.put(layout.num_frames, signature, cached)
         if cached is None:
             return None
         return SparseAttentionExecution(

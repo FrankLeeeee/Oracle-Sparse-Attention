@@ -76,7 +76,13 @@ class LightForcingConfig(msgspec.Struct, frozen=True):
     keep_near: int = 2
     # The schedule is solved over the whole video, so it needs the intended
     # length (in latent frames) and the KV window cap (-1 = uncapped) up
-    # front — upstream computes it in inference.py from the CLI arguments.
+    # front — upstream computes it in inference.py from the CLI arguments,
+    # and runs launching other models or lengths must do the same: pass the
+    # run's actual latent-frame count, the model's attention window cap in
+    # frames (21 for Self/Causal/Rolling Forcing, 32 for LongLive-2, 18 for
+    # LingBot), and a keep_sink matching the model's sink block (3/8/9 for
+    # Rolling Forcing/LongLive-2/LingBot). The defaults describe the 5-second
+    # Self-Forcing clip the method was published on.
     num_output_frames: int = 21
     local_attn_size: int = -1
 
@@ -226,9 +232,9 @@ def lightforcing_block_mask(
     scores = pooled_query @ pooled_key.transpose(-1, -2)
 
     if past_frames > keep_frames:
-        pooled_frames = pooled_key.view(
-            heads, num_frames, blocks_per_frame, -1
-        ).mean(dim=2)
+        pooled_frames = pooled_key.view(heads, num_frames, blocks_per_frame, -1).mean(
+            dim=2
+        )
         kept_middle = select_middle_frames(
             pooled_query=pooled_query,
             pooled_frames=pooled_frames,
@@ -247,8 +253,7 @@ def lightforcing_block_mask(
         bias[..., past_frames - keep_near : past_frames] = 0.0
         bias[..., past_frames:] = 0.0
         scores = (
-            scores.view(heads, q_blocks, num_frames, blocks_per_frame)
-            + bias[..., None]
+            scores.view(heads, q_blocks, num_frames, blocks_per_frame) + bias[..., None]
         ).view(heads, q_blocks, kv_blocks)
 
     lut = torch.topk(scores, topk, dim=-1, sorted=False).indices

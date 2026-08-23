@@ -213,8 +213,8 @@ def _geometry(chunk_index: int) -> ChunkGeometry:
         frame_seqlen=FRAME_SEQLEN,
         frames_per_block=FRAMES_PER_BLOCK,
         query_token_start=chunk_index * FRAMES_PER_BLOCK * FRAME_SEQLEN,
-        grid_height=10,
-        grid_width=10,
+        grid_height=15,
+        grid_width=26,
     )
 
 
@@ -328,6 +328,7 @@ def _self_forcing_call(device, *, chunk_index, layer_index=0, heads=4, head_dim=
         ("svg1", {"block": 128, "num_sampled_blocks": 2, "band_frames": 0.5}),
         ("svg2", {"block": 128, "cluster_size": 32, "kmeans_iters": 2, "top_p": 0.5}),
         ("radial", {"block": 128}),
+        ("sta", {"kernel_t": 3, "kernel_h": 3, "kernel_w": 3}),
         ("fastar", {"block": 128, "hash_bits": 4, "dense_steps": 0}),
         ("lightforcing", {"block_q": 64, "block_k": 64}),
     ],
@@ -402,6 +403,7 @@ def test_method_output_matches_its_own_plan(method, config):
         ("svg1", {"num_sampled_blocks": 2, "band_frames": 0.5}),
         ("svg2", {"cluster_size": 32, "kmeans_iters": 2, "top_p": 0.5}),
         ("radial", {}),
+        ("sta", {"kernel_t": 3}),
         ("fastar", {"hash_bits": 4, "dense_steps": 0}),
         ("lightforcing", {}),
     ],
@@ -704,3 +706,268 @@ def test_osa_window_query_plans_per_chunk_and_executes():
             atol=3e-2,
             rtol=3e-2,
         )
+
+
+def _gapped_call(device, *, heads=4, head_dim=64):
+    """A LongLive-2/LingBot-shaped call: sink + gap + rolling window.
+
+    Two key segments — video frames 0-1 pinned as a sink, then frames 10-17
+    with frames 15-17 being the query's own chunk (chunk index 5).
+    """
+    sink_frames, window_frames = 2, 8
+    kv_len = (sink_frames + window_frames) * FRAME_SEQLEN
+    chunk_tokens = FRAMES_PER_BLOCK * FRAME_SEQLEN
+    query = torch.randn(
+        1, chunk_tokens, heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    key = torch.randn(1, kv_len, heads, head_dim, device=device, dtype=torch.bfloat16)
+    return SparseAttentionCall(
+        layer_index=0,
+        query=query,
+        key=key,
+        value=torch.randn_like(key),
+        key_segments=(
+            (0, sink_frames * FRAME_SEQLEN),
+            (10 * FRAME_SEQLEN, window_frames * FRAME_SEQLEN),
+        ),
+        head_start=0,
+        num_local_heads=heads,
+        softmax_scale=head_dim**-0.5,
+    )
+
+
+def _window_call(device, *, heads=4, head_dim=64, reroped_sink=True):
+    """A Rolling-Forcing-shaped steady window: 3-chunk query, re-roped sink.
+
+    Key segments: the 1-frame sink block (global frame 0, re-roped to sit just
+    before the working cache), 4 working frames, then the 9-frame window that
+    is also the query. The query's chunk index is the *oldest* window chunk.
+    """
+    query_frames = 3 * FRAMES_PER_BLOCK
+    working_frames = 4
+    sink_frames = 1
+    first_window_frame = 12
+    kv_len = (sink_frames + working_frames + query_frames) * FRAME_SEQLEN
+    query = torch.randn(
+        1,
+        query_frames * FRAME_SEQLEN,
+        heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    key = torch.randn(1, kv_len, heads, head_dim, device=device, dtype=torch.bfloat16)
+    working_start = (first_window_frame - working_frames) * FRAME_SEQLEN
+    segments = (
+        (0, sink_frames * FRAME_SEQLEN),
+        (working_start, working_frames * FRAME_SEQLEN),
+        (first_window_frame * FRAME_SEQLEN, query_frames * FRAME_SEQLEN),
+    )
+    anchor_frame = first_window_frame - working_frames - sink_frames
+    rope_starts = (
+        (anchor_frame * FRAME_SEQLEN, working_start, segments[2][0])
+        if reroped_sink
+        else None
+    )
+    return SparseAttentionCall(
+        layer_index=0,
+        query=query,
+        key=key,
+        value=torch.randn_like(key),
+        key_segments=segments,
+        head_start=0,
+        num_local_heads=heads,
+        softmax_scale=head_dim**-0.5,
+        key_segment_rope_starts=rope_starts,
+    )
+
+
+def _window_geometry() -> ChunkGeometry:
+    # query_token_start = oldest window chunk (frame 12 -> chunk 4).
+    return ChunkGeometry(
+        frame_seqlen=FRAME_SEQLEN,
+        frames_per_block=FRAMES_PER_BLOCK,
+        query_token_start=12 * FRAME_SEQLEN,
+        grid_height=15,
+        grid_width=26,
+    )
+
+
+_ALL_METHOD_CONFIGS = [
+    ("osa", {"density": 0.4, "num_recent_frames": 1, "sink_latent_frames": 1}),
+    ("xattention", {"threshold": 0.6}),
+    ("svg1", {"num_sampled_blocks": 2, "band_frames": 0.5, "dense_sink_frames": 2}),
+    ("svg2", {"cluster_size": 32, "kmeans_iters": 2, "top_p": 0.5}),
+    ("radial", {}),
+    ("sta", {"kernel_t": 3}),
+    ("lightforcing", {}),
+]
+
+
+@requires_cuda
+@pytest.mark.parametrize("method,config", _ALL_METHOD_CONFIGS)
+@pytest.mark.parametrize("shape", ["gapped", "window"])
+def test_method_is_exact_on_noncontiguous_layouts(method, config, shape):
+    """Layouts B/C (sink + gap) and A (multi-chunk window query).
+
+    Every method must either decline or compute exactly what its plan says on
+    the layouts the capped-window models (LongLive-2, LingBot) and Rolling
+    Forcing actually produce. This is the same kernel-exactness contract as
+    ``test_method_output_matches_its_own_plan``, on the layouts that test does
+    not cover.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    backend = build_sparse_attention_backend(method, config)
+
+    if shape == "gapped":
+        call = _gapped_call(device)
+        geometry = _geometry(5)
+    else:
+        call = _window_call(device)
+        geometry = _window_geometry()
+    # Walk earlier chunks so anything that calibrates (OSA) has done so.
+    for earlier in range(geometry.query_chunk_index):
+        backend.begin_forward(_geometry(earlier))
+        backend.attend(_self_forcing_call(device, chunk_index=earlier))
+
+    backend.begin_forward(geometry)
+    out = backend.attend(call)
+    if out is None:
+        pytest.skip(f"{method} declines the {shape} layout")
+    if method == "osa":
+        # OSA executes through its own gather + FA3 path, not prepare();
+        # its exactness on these layouts is asserted in
+        # test_osa_window_query_plans_per_chunk_and_executes. Reaching a
+        # non-None output through attend() is the contract checked here.
+        assert out.shape == call.query.shape
+        return
+
+    layout = visible_layout(
+        call.key_segments,
+        geometry=geometry,
+        query_tokens=call.query.shape[1],
+        rope_starts=call.key_segment_rope_starts,
+    )
+    execution = backend.prepare(call, layout)
+    assert execution is not None
+    plan = execution.plan
+    key_mask = plan_key_mask(plan, kv_len=execution.key.shape[1])
+    q_len = execution.query.shape[1]
+    rows = (torch.arange(q_len, device=device) // plan.block_m).clamp(
+        max=key_mask.shape[1] - 1
+    )
+    scores = (
+        torch.einsum(
+            "qhd,khd->hqk", execution.query[0].float(), execution.key[0].float()
+        )
+        * call.softmax_scale
+    )
+    if plan.logit_bias is not None:
+        scores = scores + plan.logit_bias[:, None, :]
+    if plan.shared_q_block:
+        rows = torch.zeros_like(rows)
+    scores = scores.masked_fill(~key_mask[:, rows, :], float("-inf"))
+    reference = torch.softmax(scores, dim=-1) @ execution.value[0].float().permute(
+        1, 0, 2
+    )
+    sparse_out = sparse_attention(
+        query=execution.query,
+        key=execution.key,
+        value=execution.value,
+        plan=plan,
+        softmax_scale=call.softmax_scale,
+    )
+    torch.testing.assert_close(
+        sparse_out[0].float(), reference.permute(1, 0, 2), atol=3e-2, rtol=3e-2
+    )
+
+
+def test_visible_layout_positional_ids_track_rope_starts():
+    geometry = _window_geometry()
+    device = torch.device("cpu")
+    call = _window_call(device) if torch.cuda.is_available() else None
+    segments = (
+        (0, 1 * FRAME_SEQLEN),
+        (8 * FRAME_SEQLEN, 4 * FRAME_SEQLEN),
+        (12 * FRAME_SEQLEN, 9 * FRAME_SEQLEN),
+    )
+    rope_starts = (7 * FRAME_SEQLEN, 8 * FRAME_SEQLEN, 12 * FRAME_SEQLEN)
+    layout = visible_layout(
+        segments,
+        geometry=geometry,
+        query_tokens=9 * FRAME_SEQLEN,
+        rope_starts=rope_starts,
+    )
+    assert layout is not None
+    assert layout.global_frame_ids[0] == 0
+    assert layout.positional_frame_ids[0] == 7
+    np.testing.assert_array_equal(
+        layout.positional_frame_ids[1:], layout.global_frame_ids[1:]
+    )
+    # Without rope starts, positional == global.
+    plain = visible_layout(segments, geometry=geometry, query_tokens=9 * FRAME_SEQLEN)
+    np.testing.assert_array_equal(plain.positional_frame_ids, plain.global_frame_ids)
+
+
+@requires_cuda
+def test_radial_reroped_sink_uses_positional_distance():
+    """The re-roped sink must get the band of its *positional* neighbourhood.
+
+    With ``dense_sink_frames=0`` the sink frame is treated by distance alone:
+    re-roped to sit right before the working cache it is a near frame (wide
+    band), while at its global position it would be decimated to nothing for
+    most query frames. The masks must therefore differ, and the re-roped one
+    must keep at least as much of the sink column as the global one.
+    """
+    device = torch.device("cuda")
+    geometry = _window_geometry()
+    config = RadialConfig(dense_sink_frames=0)
+    masks = {}
+    for reroped in (False, True):
+        call = _window_call(device, reroped_sink=reroped)
+        layout = visible_layout(
+            call.key_segments,
+            geometry=geometry,
+            query_tokens=call.query.shape[1],
+            rope_starts=call.key_segment_rope_starts,
+        )
+        masks[reroped] = build_radial_block_mask(
+            layout=layout,
+            q_len=call.query.shape[1],
+            kv_len=call.key.shape[1],
+            config=config,
+            device=device,
+        )
+    sink_blocks = FRAME_SEQLEN // 128 + 1
+    kept_reroped = masks[True][:, :sink_blocks].sum().item()
+    kept_global = masks[False][:, :sink_blocks].sum().item()
+    assert kept_reroped > kept_global
+
+
+@requires_cuda
+def test_svg1_dense_sink_frames_protects_that_many_frames():
+    """`dense_sink_frames=n` keeps the first n view frames in the spatial mask."""
+    from sglang.multimodal_gen.runtime.layers.attention.sparse.svg import (
+        Svg1Config,
+        build_svg1_segment_masks,
+    )
+
+    device = torch.device("cuda")
+    call = _gapped_call(device)
+    geometry = _geometry(5)
+    layout = visible_layout(
+        call.key_segments, geometry=geometry, query_tokens=call.query.shape[1]
+    )
+    q_len = call.query.shape[1]
+    kv_len = call.key.shape[1]
+    for sink_frames in (1, 2):
+        config = Svg1Config(band_frames=0.5, dense_sink_frames=sink_frames)
+        spatial, _, _ = build_svg1_segment_masks(
+            layout=layout, q_len=q_len, kv_len=kv_len, config=config, device=device
+        )
+        tiles_per_frame = -(-FRAME_SEQLEN // config.key_tile)
+        sink_cols = spatial[:, : sink_frames * tiles_per_frame]
+        assert bool(sink_cols.all()), f"sink frames not dense at n={sink_frames}"
+        beyond = spatial[0, sink_frames * tiles_per_frame : 3 * tiles_per_frame]
+        assert not bool(beyond.all()), "everything past the sink is dense too"

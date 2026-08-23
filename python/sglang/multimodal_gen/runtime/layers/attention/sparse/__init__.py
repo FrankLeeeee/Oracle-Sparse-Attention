@@ -12,6 +12,7 @@ package is constructed or called. Otherwise it names one method:
 ``svg1`` / ``svg2``     Sparse VideoGen v1 (spatial/temporal heads) and v2
                         (semantic clustering).
 ``radial``              Radial Attention's log-decaying spatiotemporal mask.
+``sta``                 Sliding Tile Attention's clamped 3D tile windows.
 ``fastar``              FAST-AR's TempCache + AnnSA.
 ``lightforcing``        Light Forcing's chunk-aware sparsity schedule +
                         hierarchical frame/block top-k selection.
@@ -47,6 +48,10 @@ from sglang.multimodal_gen.runtime.layers.attention.sparse.radial import (
     RadialAttention,
     RadialConfig,
 )
+from sglang.multimodal_gen.runtime.layers.attention.sparse.sta import (
+    StaAttention,
+    StaConfig,
+)
 from sglang.multimodal_gen.runtime.layers.attention.sparse.svg import (
     Svg1Attention,
     Svg1Config,
@@ -67,6 +72,7 @@ _METHODS: dict[str, tuple[type[SparseAttentionBackend], type[msgspec.Struct]]] =
     "svg1": (Svg1Attention, Svg1Config),
     "svg2": (Svg2Attention, Svg2Config),
     "radial": (RadialAttention, RadialConfig),
+    "sta": (StaAttention, StaConfig),
     "fastar": (FastArAttention, FastArConfig),
     "lightforcing": (LightForcingAttention, LightForcingConfig),
 }
