@@ -197,9 +197,14 @@ def measure_generate(
 
 
 def measure_lingbot(
-    method: str, config: dict, gpu: int, port_base: int, tag: str
+    method: str,
+    config: dict,
+    gpu: int,
+    port_base: int,
+    tag: str,
+    res: str = "480p",
 ) -> float:
-    server_dir = ROOT / "lingbot_world_v2" / "calibration" / method / tag
+    server_dir = ROOT / "lingbot_world_v2" / "calibration" / method / f"{res}_{tag}"
     cache = server_dir / "result.json"
     if cache.exists():
         cached = json.loads(cache.read_text())
@@ -216,7 +221,7 @@ def measure_lingbot(
     ) as server:
         server.wait_ready()
         result = run_lingbot_session(
-            server, out_dir=server_dir / "session", duration=20, res="480p"
+            server, out_dir=server_dir / "session", duration=20, res=res
         )
     if result["returncode"] != 0 or "density" not in result:
         raise RuntimeError(
@@ -234,7 +239,9 @@ def measure(
     model: str, method: str, config: dict, gpu: int, port_base: int, tag: str
 ) -> float:
     if MODELS[model]["kind"] == "realtime":
-        return measure_lingbot(method, config, gpu, port_base, tag)
+        return measure_lingbot(
+            method, config, gpu, port_base, tag, res=CALIBRATION_RES
+        )
     return measure_generate(
         model, method, config, gpu, port_base, tag, res=CALIBRATION_RES
     )

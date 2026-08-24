@@ -43,15 +43,35 @@ def top_blocks(doc: str) -> list[tuple[str, list[str], str]]:
             ids = [child.get("id")]
         else:
             ids = [item.get("id") for item in child if item.get("id")]
-        text = " ".join("".join(child.itertext()).split())[:100]
+        # Media blocks carry no text — their file name lives in an attribute,
+        # and that is how the callers below address them.
+        names = [child.get("name", "")] + [
+            item.get("name", "") for item in child.iter() if item.get("name")
+        ]
+        text = " ".join(
+            ("".join(child.itertext()) + " " + " ".join(names)).split()
+        )[:160]
         blocks.append((child.tag, ids, text))
     return blocks
 
 
 def find_block(
-    blocks, *, text: str | None = None, tag: str | None = None, name: str | None = None
+    blocks,
+    *,
+    text: str | None = None,
+    tag: str | None = None,
+    name: str | None = None,
+    start: int = 0,
 ) -> int:
+    """Index of the first matching block at or after ``start``.
+
+    ``start`` matters because a section's end marker can also occur inside its
+    own heading — "2. Walltime与优化过程" contains the "优化过程" that ends the
+    span — and matching that would make the span empty.
+    """
     for index, (block_tag, _, block_text) in enumerate(blocks):
+        if index < start:
+            continue
         if text is not None and text not in block_text:
             continue
         if tag is not None and block_tag != tag:
@@ -70,7 +90,7 @@ def replace_span(doc: str, *, after: str, before: str, xml: str) -> None:
     """
     blocks = top_blocks(doc)
     start = find_block(blocks, text=after)
-    end = find_block(blocks, text=before)
+    end = find_block(blocks, text=before, start=start + 1)
     if end <= start:
         raise LookupError(f"{before!r} does not follow {after!r}")
     doomed = [block_id for _, ids, _ in blocks[start + 1 : end] for block_id in ids]
