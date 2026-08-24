@@ -13,7 +13,7 @@ import html
 import json
 import pathlib
 
-from common import METHOD_LABELS, METHODS, MODELS, ROOT
+from common import MAIN_PROMPT, METHOD_LABELS, METHODS, MODELS, PROMPTS, ROOT
 
 from notes import MODEL_NOTES, PROMPT_LABELS
 
@@ -217,8 +217,11 @@ def prompts_section(model: str, prompts: dict) -> str:
         + table(["方法", "跨 prompt 密度区间", "均值"], rows)
         + bullets(notes["prompt_bullets"])
     )
+    # One anchor paragraph per prompt; the frame sheet and the eight videos of
+    # that prompt are placed under it by doc_update.
     for key, label in PROMPT_LABELS.items():
-        body += f"<p><b>{esc(label)}</b></p>"
+        note = "（主实验 prompt，帧对比图见第 3 节：" if key == MAIN_PROMPT else "（"
+        body += f"<p><b>{esc(label)}</b>{note}{esc(PROMPTS[key])}）</p>"
     return body
 
 

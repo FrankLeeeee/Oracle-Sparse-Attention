@@ -38,6 +38,15 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 MAX_ITERS = 5
 TOLERANCE = 0.02
 
+# Rebuild configs.json from the measurement caches without touching a GPU.
+# Used to recover entries after a lost update; a missing measurement is an
+# error rather than a silent GPU run.
+REPLAY_ONLY = False
+
+
+class CacheMiss(RuntimeError):
+    pass
+
 
 # Full-context Self-Forcing reaches lower cumulative densities than the
 # capped-window models (their own-chunk + sink fixed keeps are a large share
@@ -167,6 +176,8 @@ def measure_generate(
         cached = json.loads(cache.read_text())
         if cached.get("config") == config and "density" in cached:
             return cached["density"]
+    if REPLAY_ONLY:
+        raise CacheMiss(f"{model}/{method} {tag} not measured yet")
     result = run_generate(
         model=model,
         out_dir=out_dir,
@@ -194,6 +205,8 @@ def measure_lingbot(
         cached = json.loads(cache.read_text())
         if cached.get("config") == config and "density" in cached:
             return cached["density"]
+    if REPLAY_ONLY:
+        raise CacheMiss(f"lingbot/{method} {tag} not measured yet")
     with LingbotServer(
         gpu=gpu,
         port_base=port_base,
@@ -399,9 +412,15 @@ def main() -> None:
     # resolution, so its calibration must run at the sweep's resolution;
     # scalar knobs are resolution-relative and stay on cheap 480p runs.
     parser.add_argument("--res", default="480p", choices=["480p", "720p"])
+    parser.add_argument(
+        "--replay-only",
+        action="store_true",
+        help="rebuild configs.json from cached measurements; never run a GPU",
+    )
     args = parser.parse_args()
-    global CALIBRATION_RES
+    global CALIBRATION_RES, REPLAY_ONLY
     CALIBRATION_RES = args.res
+    REPLAY_ONLY = args.replay_only
 
     configs_path = ROOT / "configs.json"
     pool = GpuPool([int(gpu) for gpu in args.gpus.split(",")])
@@ -418,7 +437,7 @@ def main() -> None:
             except queue.Empty:
                 return
             for attempt in range(10):
-                gpu = pool.acquire()
+                gpu = -1 if REPLAY_ONLY else pool.acquire()
                 try:
                     if method == "sta":
                         result = calibrate_sta(args.model, gpu, port_base)
@@ -439,7 +458,8 @@ def main() -> None:
                     print(f"[{args.model}/{method}] FAILED: {error}", flush=True)
                     break
                 finally:
-                    pool.release(gpu)
+                    if gpu >= 0:
+                        pool.release(gpu)
 
     threads = [
         threading.Thread(target=worker, args=(index,)) for index in range(args.workers)
