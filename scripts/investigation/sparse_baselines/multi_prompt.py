@@ -27,6 +27,7 @@ from common import (
     GpuContended,
     GpuPool,
     LingbotServer,
+    record_result,
     extract_frames,
     render_frame_sheet,
     run_generate,
@@ -94,7 +95,7 @@ def run_prompts_generate(args, jobs) -> None:
                 )
                 with lock:
                     results[run_key] = result
-                    results_path.write_text(json.dumps(results, indent=2))
+                    record_result(results_path, run_key, result)
                 print(
                     f"[gpu{gpu}] DONE {run_key} rc={result['returncode']} "
                     f"density={result.get('density')}",

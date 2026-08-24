@@ -22,6 +22,7 @@ from common import (
     ROOT,
     GpuContended,
     GpuPool,
+    record_result,
     LingbotServer,
     run_generate,
     run_lingbot_session,
@@ -84,7 +85,7 @@ def sweep_generate(args, jobs: list[tuple]) -> None:
                 )
                 with lock:
                     results[tag] = result
-                    results_path.write_text(json.dumps(results, indent=2))
+                    record_result(results_path, tag, result)
                 print(
                     f"[gpu{gpu}] DONE  {tag} rc={result['returncode']} "
                     f"e2e={result.get('e2e_s')} denoise={result.get('denoise_s')} "

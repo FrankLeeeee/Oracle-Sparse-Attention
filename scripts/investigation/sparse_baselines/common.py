@@ -22,6 +22,7 @@ kills it if a co-tenant process appears mid-run, and the caller re-queues it —
 timings measured through contention are invalid.
 """
 
+import fcntl
 import glob
 import json
 import os
@@ -253,6 +254,29 @@ GPU_WAIT_TIMEOUT_S = 28800
 # across two checks and hold at least this much memory before it invalidates
 # the timing.
 IDLE_CONTEXT_MIB = 2048
+
+
+def record_result(path: pathlib.Path, key: str, value: dict) -> None:
+    """Merge one run into a results file, atomically.
+
+    Sweeps of the same model can overlap (a targeted redo alongside the full
+    chain), and each holding the dict it read at startup would let the second
+    writer erase the first's rows — the same lost update that once wiped a
+    whole model's calibration. Re-read under an flock and write through a
+    temp file.
+    """
+    lock_path = path.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            rows = json.loads(path.read_text()) if path.exists() else {}
+            rows[key] = value
+            temporary = path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(rows, indent=2))
+            temporary.replace(path)
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 class GpuContended(RuntimeError):

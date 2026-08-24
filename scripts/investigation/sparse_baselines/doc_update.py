@@ -75,7 +75,11 @@ def rewrite_managed(doc: str, xml: str) -> None:
     are deleted only after the new ones are in, so a failure mid-way leaves
     the old content intact rather than an empty document.
     """
-    before = [block_id for block_id, _ in top_level_blocks(doc)]
+    # The page title is a top-level block too, and deleting it silently
+    # blanks the document's name in the drive listing — keep it.
+    before = [
+        block_id for block_id, tag in top_level_blocks(doc) if tag != "title"
+    ]
     cli("docs", "+update", "--doc", doc, "--command", "append", "--content", xml)
     if before:
         for chunk_start in range(0, len(before), 20):
