@@ -239,11 +239,52 @@ MODEL_NOTES: dict[str, dict] = {
         ],
     },
     "lingbot_world_v2": {
-        "model_line": "LingBot-World v2 14B causal fast（realtime I2V，WebSocket 会话）",
-        "geometry_line": "3 帧 chunk、9 帧 sink + 9 帧近期窗口",
+        "model_line": "LingBot-World v2 14B causal fast（realtime I2V，"
+        "每个稀疏配置起一个 sglang serve，经 WebSocket 会话逐 chunk 生成）",
+        "geometry_line": "3 帧 chunk、9 帧 sink + 9 帧近期窗口（可见集合仅 18 潜帧）",
         "time_metric": "逐 chunk forward 累计耗时",
-        "walltime_bullets": [],
-        "quality_bullets": [],
-        "prompt_bullets": [],
+        "setup_extra": [
+            "<b>耗时口径与其他四页不同</b>：realtime 模型没有一次性的去噪阶段，"
+            "这里统计的是会话内每个 chunk 的 scheduler forward 时间之和"
+            "（含去噪步与 KV 刷新），稠密参考 264.1 s，是五个模型里最重的。",
+            "<b>本模型是唯一的 I2V</b>：条件图取自同 prompt、同 seed 的 "
+            "Rolling Forcing <b>稠密</b>视频第 0 帧（条件图会主导画面，"
+            "所以必须与 prompt 一致，且不能取自某个稀疏方法的输出）。",
+        ],
+        "walltime_bullets": [
+            "<b>只有 18 帧可见集合，把“整帧保留型”方法逼到了墙角</b>："
+            "Radial 下限 0.743（0.90×，<b>慢于稠密</b>）、SVG1 下限 0.613（1.01×，持平）——"
+            "9 帧 sink + 9 帧窗口里几乎没有可丢的整帧。",
+            "<b>能按 tile / 块细粒度削减的方法才有收益</b>：STA 0.09 档 150.7 s（1.75×）最快，"
+            "XAttention 0.18 档 177.1 s（1.49×）次之，LightForcing 1.32×、OSA 1.30×。",
+            "OSA 的下限是 0.351（自身 chunk + sink + 近期帧已占掉 18 帧中的大半），"
+            "因此止步 1.30×；SVG2 只有在最稀疏档才首次超过稠密（1.19×）。",
+            "注意加速比整体低于 Self-Forcing：本模型每次注意力的可见集合被封在 18 帧，"
+            "注意力在总耗时中的占比本就较小。",
+        ],
+        "quality_bullets": [
+            "<b>没有任何方法出现崩坏</b>——这是 I2V 的结构性优势：条件图每个 chunk 都在"
+            "锚定画面，误差不像 T2V 那样自由累积。差异表现为内容轨迹分歧，而非画质损坏。",
+            "<b>dense 自身并不是“正确答案”</b>：稠密视频在约 10 s 后镜头挤进人群，"
+            "主体（红裙女性）被行人背影淹没；<b>OSA（0.35）与 STA（0.35）反而把主体"
+            "与街道保持得更久</b>。因此本页 PSNR 的高低尤其只能读作“与 dense 轨迹的接近程度”。",
+            "PSNR 最高的是 Radial（0.74）与 LightForcing（0.51）——它们密度最高、"
+            "最贴近 dense 轨迹，包括跟随它挤进人群这一点。",
+            "<b>SVG2（0.30）的漂移最大</b>：镜头整体仰起拍摄高楼，主体姿态出现异常"
+            "（后仰、贴地），是最不像原轨迹的一档；XAttention 次之。",
+        ],
+        "prompt_bullets": [
+            "<b>密度基本与内容无关，但不像 T2V 那样逐位相同</b>："
+            "OSA 0.339–0.351、STA 0.342–0.348、LightForcing 0.289–0.305、"
+            "Radial 0.734–0.743、SVG1 0.603–0.614、SVG2 0.289–0.294，"
+            "浮动都在 0.01 上下；XAttention 依旧最大（0.215–0.286）。"
+            "轻微浮动来自 realtime 会话的 chunk 数随 prompt 略有差异，"
+            "而非方法本身按内容改变选择。",
+            "<b>结论跨 prompt 一致</b>：5 个 prompt 上同样没有任何方法崩坏，"
+            "密度—耗时的排序也不变（STA / XAttention 最省，Radial / SVG1 触底）。",
+            "各 prompt 的条件图都取自同 prompt 的 Rolling Forcing 稠密视频第 0 帧，"
+            "因此这一节的画面同时受条件图与文本 prompt 影响，比较时以“同一行内的"
+            "时间演化”为准。",
+        ],
     },
 }
