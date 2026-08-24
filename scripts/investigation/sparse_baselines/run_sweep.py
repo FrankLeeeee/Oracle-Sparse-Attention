@@ -22,8 +22,8 @@ from common import (
     ROOT,
     GpuContended,
     GpuPool,
-    record_result,
     LingbotServer,
+    record_result,
     run_generate,
     run_lingbot_session,
 )
@@ -123,12 +123,16 @@ def sweep_lingbot(args, jobs: list[tuple]) -> None:
     results: dict = (
         json.loads(results_path.read_text()) if results_path.exists() else {}
     )
-    gpu = int(args.gpus.split(",")[0])
+    # Acquire per config rather than pinning to the first listed GPU: this
+    # model holds one server for a whole config, and that GPU may be busy for
+    # hours, which would stall the sweep behind it indefinitely.
+    pool = GpuPool([int(g) for g in args.gpus.split(",")])
 
     for tag, method, config in jobs:
         if tag in results and results[tag].get("returncode") == 0:
             print(f"skip {tag} (already done)", flush=True)
             continue
+        gpu = pool.acquire()
         print(f"[gpu{gpu}] START server {args.model} {tag}", flush=True)
         with LingbotServer(
             gpu=gpu,
@@ -148,9 +152,10 @@ def sweep_lingbot(args, jobs: list[tuple]) -> None:
                 if not result.get("contended"):
                     break
                 print(f"[gpu{gpu}] {tag} contended, redoing session", flush=True)
+        pool.release(gpu)
         result["config"] = config
         results[tag] = result
-        results_path.write_text(json.dumps(results, indent=2))
+        record_result(results_path, tag, result)
         print(
             f"[gpu{gpu}] DONE  {tag} rc={result['returncode']} "
             f"denoise={result.get('denoise_s')} density={result.get('density')}",

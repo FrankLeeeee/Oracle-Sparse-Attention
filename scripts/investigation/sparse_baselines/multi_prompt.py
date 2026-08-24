@@ -27,8 +27,8 @@ from common import (
     GpuContended,
     GpuPool,
     LingbotServer,
-    record_result,
     extract_frames,
+    record_result,
     render_frame_sheet,
     run_generate,
     run_lingbot_session,
@@ -127,7 +127,7 @@ def run_prompts_lingbot(args, jobs) -> None:
     results: dict = (
         json.loads(results_path.read_text()) if results_path.exists() else {}
     )
-    gpu = int(args.gpus.split(",")[0])
+    pool = GpuPool([int(g) for g in args.gpus.split(",")])
     for tag, method, config in jobs:
         pending = [
             prompt_key
@@ -136,6 +136,7 @@ def run_prompts_lingbot(args, jobs) -> None:
         ]
         if not pending:
             continue
+        gpu = pool.acquire()
         print(f"[gpu{gpu}] START server {tag} for {pending}", flush=True)
         with LingbotServer(
             gpu=gpu,
@@ -156,12 +157,13 @@ def run_prompts_lingbot(args, jobs) -> None:
                 )
                 result["config"] = config
                 results[run_key] = result
-                results_path.write_text(json.dumps(results, indent=2))
+                record_result(results_path, run_key, result)
                 print(
                     f"[gpu{gpu}] DONE {run_key} rc={result['returncode']} "
                     f"density={result.get('density')}",
                     flush=True,
                 )
+        pool.release(gpu)
 
 
 def build_sheets(args) -> None:

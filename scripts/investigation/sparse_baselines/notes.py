@@ -229,7 +229,14 @@ MODEL_NOTES: dict[str, dict] = {
             "换句话说，<b>在 LongLive-2 上限制稀疏注意力的是收益而不是风险</b>："
             "方法都能用，只是省不下时间。",
         ],
-        "prompt_bullets": [],
+        "prompt_bullets": [
+            "<b>密度与画面内容无关</b>：OSA（0.398）、LightForcing（0.303）、"
+            "Radial（0.539）、STA（0.385）在 5 个 prompt 上完全一致，"
+            "SVG1 / SVG2 浮动 ≤ 0.002，仍然只有 XAttention 随内容变化"
+            "（0.236–0.266）。",
+            "<b>质量结论跨 prompt 一致</b>：5 个 prompt 上没有任何方法出现崩坏，"
+            "与单 prompt 的结论相同——这也再次说明本模型的瓶颈不在质量。",
+        ],
     },
     "lingbot_world_v2": {
         "model_line": "LingBot-World v2 14B causal fast（realtime I2V，WebSocket 会话）",
