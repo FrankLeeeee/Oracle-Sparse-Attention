@@ -63,7 +63,12 @@ class StaConfig(msgspec.Struct, frozen=True):
     # windows of the tiles it covers. Adjacent tiles' clamped windows overlap
     # in all but one tile column, so the union costs a few percent, and the
     # reported density is the executed one.
-    block: int = 64
+    #
+    # 128 rather than a tile-sized 64: the kernel's ``tl.dot`` wants at least
+    # 128 query rows to reach full tensor-core throughput, and halving it
+    # costs about a factor of two on the attention itself — far more than the
+    # few percent of extra keys that unioning ~2 tiles per block adds.
+    block: int = 128
 
 
 def pick_tile(extent: int, other_extent: int) -> tuple[int, int]:

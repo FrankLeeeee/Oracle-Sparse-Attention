@@ -24,6 +24,7 @@ import threading
 from common import (
     MODELS,
     ROOT,
+    GpuContended,
     GpuPool,
     LingbotServer,
     method_base_config,
@@ -151,9 +152,15 @@ def sta_candidates(model: str, *, grid_h: int, grid_w: int) -> list[tuple[dict, 
 
 
 def measure_generate(
-    model: str, method: str, config: dict, gpu: int, port_base: int, tag: str
+    model: str,
+    method: str,
+    config: dict,
+    gpu: int,
+    port_base: int,
+    tag: str,
+    res: str = "480p",
 ) -> float:
-    out_dir = ROOT / model / "calibration" / method / tag
+    out_dir = ROOT / model / "calibration" / method / f"{res}_{tag}"
     cache = out_dir / "result.json"
     if cache.exists():
         cached = json.loads(cache.read_text())
@@ -165,7 +172,7 @@ def measure_generate(
         gpu=gpu,
         port_base=port_base,
         duration=20,
-        res="480p",
+        res=res,
         method=method,
         method_config=config,
     )
@@ -206,12 +213,17 @@ def measure_lingbot(
     return result["density"]
 
 
+CALIBRATION_RES = "480p"
+
+
 def measure(
     model: str, method: str, config: dict, gpu: int, port_base: int, tag: str
 ) -> float:
     if MODELS[model]["kind"] == "realtime":
         return measure_lingbot(method, config, gpu, port_base, tag)
-    return measure_generate(model, method, config, gpu, port_base, tag)
+    return measure_generate(
+        model, method, config, gpu, port_base, tag, res=CALIBRATION_RES
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +301,7 @@ def calibrate_scalar(
 
 
 def calibrate_sta(model: str, gpu: int, port_base: int) -> dict[str, dict]:
-    width, height = MODELS[model]["resolutions"]["480p"]
+    width, height = MODELS[model]["resolutions"][CALIBRATION_RES]
     downsample = MODELS[model]["token_downsample"]
     grid_h, grid_w = height // downsample, width // downsample
     ladder = sta_candidates(model, grid_h=grid_h, grid_w=grid_w)
@@ -360,7 +372,13 @@ def main() -> None:
     parser.add_argument("--gpus", type=str, default="0,1,2,3,4,5,6,7")
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--port-base", type=int, default=29800)
+    # STA's knob is a tile-grid kernel, and the tile grid differs per
+    # resolution, so its calibration must run at the sweep's resolution;
+    # scalar knobs are resolution-relative and stay on cheap 480p runs.
+    parser.add_argument("--res", default="480p", choices=["480p", "720p"])
     args = parser.parse_args()
+    global CALIBRATION_RES
+    CALIBRATION_RES = args.res
 
     configs_path = ROOT / "configs.json"
     configs = json.loads(configs_path.read_text()) if configs_path.exists() else {}
@@ -379,20 +397,30 @@ def main() -> None:
                 method = work.get_nowait()
             except queue.Empty:
                 return
-            gpu = pool.acquire()
-            try:
-                if method == "sta":
-                    result = calibrate_sta(args.model, gpu, port_base)
-                else:
-                    result = calibrate_scalar(args.model, method, gpu, port_base)
-                with lock:
-                    configs[args.model][method] = result
-                    configs_path.write_text(json.dumps(configs, indent=2))
-                print(f"[{args.model}/{method}] calibrated", flush=True)
-            except Exception as error:  # noqa: BLE001
-                print(f"[{args.model}/{method}] FAILED: {error}", flush=True)
-            finally:
-                pool.release(gpu)
+            for attempt in range(10):
+                gpu = pool.acquire()
+                try:
+                    if method == "sta":
+                        result = calibrate_sta(args.model, gpu, port_base)
+                    else:
+                        result = calibrate_scalar(args.model, method, gpu, port_base)
+                    with lock:
+                        configs[args.model][method] = result
+                        configs_path.write_text(json.dumps(configs, indent=2))
+                    print(f"[{args.model}/{method}] calibrated", flush=True)
+                    break
+                except GpuContended:
+                    # Completed measurements are cached; move to another GPU
+                    # and resume the method there.
+                    print(
+                        f"[{args.model}/{method}] gpu{gpu} contended, moving on",
+                        flush=True,
+                    )
+                except Exception as error:  # noqa: BLE001
+                    print(f"[{args.model}/{method}] FAILED: {error}", flush=True)
+                    break
+                finally:
+                    pool.release(gpu)
 
     threads = [
         threading.Thread(target=worker, args=(index,)) for index in range(args.workers)

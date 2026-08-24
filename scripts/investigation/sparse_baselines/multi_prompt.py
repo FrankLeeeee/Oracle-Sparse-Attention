@@ -24,6 +24,7 @@ from common import (
     MODELS,
     PROMPTS,
     ROOT,
+    GpuContended,
     GpuPool,
     LingbotServer,
     extract_frames,
@@ -99,6 +100,9 @@ def run_prompts_generate(args, jobs) -> None:
                     f"density={result.get('density')}",
                     flush=True,
                 )
+            except GpuContended:
+                print(f"[gpu{gpu}] {run_key} contended, requeueing", flush=True)
+                job_queue.put((prompt_key, tag, method, config))
             except Exception as error:  # noqa: BLE001
                 print(f"[gpu{gpu}] FAIL {run_key}: {error}", flush=True)
             finally:

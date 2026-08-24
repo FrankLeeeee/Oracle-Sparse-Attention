@@ -20,6 +20,7 @@ import threading
 from common import (
     MODELS,
     ROOT,
+    GpuContended,
     GpuPool,
     LingbotServer,
     run_generate,
@@ -90,6 +91,9 @@ def sweep_generate(args, jobs: list[tuple]) -> None:
                     f"density={result.get('density')}",
                     flush=True,
                 )
+            except GpuContended:
+                print(f"[gpu{gpu}] {tag} contended, requeueing", flush=True)
+                job_queue.put((tag, method, config))
             except Exception as error:  # noqa: BLE001
                 print(f"[gpu{gpu}] FAIL {tag}: {error}", flush=True)
             finally:

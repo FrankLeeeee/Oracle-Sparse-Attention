@@ -144,6 +144,12 @@ def method_base_config(method: str, model: str) -> dict:
         return {"dense_sink_frames": sink}
     if method == "radial":
         return {"dense_sink_frames": sink}
+    if method == "sta":
+        # Pinned rather than left to the default so the calibration cache is
+        # keyed by it: the query-block size changes both the executed density
+        # (a block unions the windows of the tiles it spans) and the kernel
+        # throughput, so measurements from another block size do not carry.
+        return {"block": 128}
     return {}
 
 
@@ -258,61 +264,49 @@ def _gpu_uuid(gpu: int) -> str:
     ).stdout.strip()
 
 
-def _descendants(pid: int) -> set[int]:
-    """pid plus all its descendants, via one `ps` snapshot."""
-    output = subprocess.run(
-        ["ps", "-eo", "pid,ppid"], capture_output=True, text=True
-    ).stdout
-    children: dict[int, list[int]] = {}
-    for line in output.splitlines()[1:]:
-        parts = line.split()
-        if len(parts) != 2:
-            continue
-        child, parent = int(parts[0]), int(parts[1])
-        children.setdefault(parent, []).append(child)
-    seen = {pid}
-    stack = [pid]
-    while stack:
-        for child in children.get(stack.pop(), []):
-            if child not in seen:
-                seen.add(child)
-                stack.append(child)
-    return seen
+def compute_apps(gpu: int) -> dict[int, int]:
+    """{pid: used MiB} of compute apps on ``gpu``, in the *host* PID namespace.
 
-
-def foreign_compute_pids(gpu: int, own_root_pid: int | None = None) -> set[int]:
-    """Compute-app PIDs on ``gpu`` that are not ours.
-
-    PIDs from other containers are invisible in our /proc, so any compute PID
-    that is not a descendant of ``own_root_pid`` counts as foreign.
+    We run inside a container with its own PID namespace, so these numbers
+    never match our /proc — ownership cannot be decided by pid ancestry.
+    Callers therefore reason by *sets over time*: a run only starts on an
+    empty GPU, pids appearing in its launch window are blessed as its own,
+    and later additions are co-tenants — unless they are transient probe
+    blips (gone within seconds, tiny memory), which this box produces
+    routinely and which do not disturb a multi-minute timing.
     """
     uuid = _gpu_uuid(gpu)
     output = subprocess.run(
         [
             "nvidia-smi",
-            "--query-compute-apps=gpu_uuid,pid",
-            "--format=csv,noheader",
+            "--query-compute-apps=gpu_uuid,pid,used_gpu_memory",
+            "--format=csv,noheader,nounits",
         ],
         capture_output=True,
         text=True,
         check=True,
     ).stdout
-    pids = set()
+    apps: dict[int, int] = {}
     for line in output.splitlines():
         parts = [part.strip() for part in line.split(",")]
-        if len(parts) == 2 and parts[0] == uuid:
-            pids.add(int(parts[1]))
-    if own_root_pid is not None:
-        pids -= _descendants(own_root_pid)
-    return pids
+        if len(parts) == 3 and parts[0] == uuid:
+            try:
+                apps[int(parts[1])] = int(parts[2])
+            except ValueError:
+                apps[int(parts[1])] = 0
+    return apps
+
+
+def compute_pids(gpu: int) -> set[int]:
+    return set(compute_apps(gpu))
 
 
 def wait_for_exclusive_gpu(gpu: int) -> None:
-    """Block until no other process computes on ``gpu``."""
+    """Block until no process computes on ``gpu``."""
     deadline = time.time() + GPU_WAIT_TIMEOUT_S
     warned = False
     while time.time() < deadline:
-        if not foreign_compute_pids(gpu):
+        if not compute_pids(gpu):
             return
         if not warned:
             print(f"[gpu{gpu}] occupied, waiting for it to go idle", flush=True)
@@ -326,14 +320,45 @@ class GpuPool:
 
     On this shared box GPUs come and go; pinning a worker to a busy GPU
     starves it, so workers acquire dynamically and release when done. A GPU
-    is grantable when no foreign compute process runs on it and no other
-    worker of this pool holds it.
+    is grantable when no compute process runs on it, no worker of this pool
+    holds it, and no *other campaign process* holds its lockfile — two
+    concurrently running drivers (one model's timing sweep, the next model's
+    calibration) must never double-book a GPU, and nvidia-smi alone cannot
+    show a run that is still loading its model.
     """
+
+    _LOCK_DIR = ROOT / "gpu_locks"
 
     def __init__(self, candidates: list[int]):
         self._candidates = candidates
         self._held: set[int] = set()
         self._lock = threading.Lock()
+        self._LOCK_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _lock_path(self, gpu: int) -> pathlib.Path:
+        return self._LOCK_DIR / f"gpu{gpu}.lock"
+
+    def _try_file_lock(self, gpu: int) -> bool:
+        path = self._lock_path(gpu)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            # Stale if its owner process is gone (same container, so /proc
+            # is authoritative for our own campaign drivers).
+            try:
+                owner = int(path.read_text().strip())
+            except (ValueError, FileNotFoundError):
+                owner = -1
+            if owner > 0 and pathlib.Path(f"/proc/{owner}").exists():
+                return False
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            return self._try_file_lock(gpu)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(str(os.getpid()))
+        return True
 
     def acquire(self, *, timeout_s: int = GPU_WAIT_TIMEOUT_S) -> int:
         deadline = time.time() + timeout_s
@@ -344,13 +369,15 @@ class GpuPool:
                     if gpu in self._held:
                         continue
                 try:
-                    busy = bool(foreign_compute_pids(gpu))
+                    busy = bool(compute_pids(gpu))
                 except Exception:
                     continue
                 if busy:
                     continue
                 with self._lock:
                     if gpu in self._held:
+                        continue
+                    if not self._try_file_lock(gpu):
                         continue
                     self._held.add(gpu)
                 return gpu
@@ -366,12 +393,37 @@ class GpuPool:
     def release(self, gpu: int) -> None:
         with self._lock:
             self._held.discard(gpu)
+            try:
+                self._lock_path(gpu).unlink()
+            except FileNotFoundError:
+                pass
 
 
 class GpuWatchdog:
-    """Kill the watched process if a co-tenant appears on the GPU."""
+    """Kill the watched process if a co-tenant appears on the GPU.
 
-    def __init__(self, gpu: int, proc: subprocess.Popen, *, interval_s: int = 30):
+    nvidia-smi pids live in the host namespace, so ownership is inferred from
+    timing: the GPU was empty at launch, so pids appearing during the launch
+    window are the run's own processes; later additions are co-tenants. Two
+    tolerances keep this from livelocking on this box's routine noise: an
+    extra pid must persist across two checks (short-lived probe contexts come
+    and go in seconds) and hold non-trivial memory (a real job, not an idling
+    probe context) before the run is declared contended.
+    """
+
+    # Pids first seen within this window of launch are the run's own
+    # (covers model load up to the 5B/14B checkpoints).
+    _BLESS_WINDOW_S = 120
+    # An extra pid below this footprint that merely idles cannot disturb a
+    # multi-minute timing measurably.
+    _KILL_MIB = 2048
+    # An `sglang generate` run registers exactly this many compute processes
+    # (worker + scheduler); anything beyond is a co-tenant even inside the
+    # bless window — the cycling job on this box re-acquires its GPUs every
+    # few minutes and would otherwise get blessed alongside our own run.
+    _EXPECTED_OWN = 2
+
+    def __init__(self, gpu: int, proc: subprocess.Popen, *, interval_s: int = 15):
         self._gpu = gpu
         self._proc = proc
         self._interval = interval_s
@@ -380,26 +432,53 @@ class GpuWatchdog:
         self._thread = threading.Thread(target=self._watch, daemon=True)
         self._thread.start()
 
+    def _kill(self, reason: str) -> None:
+        self.contended = True
+        print(f"[gpu{self._gpu}] {reason}, killing the run", flush=True)
+        try:
+            os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
     def _watch(self) -> None:
+        started = time.time()
+        blessed: set[int] = set()
+        suspect: set[int] = set()
         while not self._stop.wait(self._interval):
             if self._proc.poll() is not None:
                 return
             try:
-                foreign = foreign_compute_pids(self._gpu, self._proc.pid)
+                apps = compute_apps(self._gpu)
             except Exception:
                 continue
-            if foreign:
-                self.contended = True
+            in_window = time.time() - started <= self._BLESS_WINDOW_S
+            if in_window and len(blessed) < self._EXPECTED_OWN:
+                # Accept new pids as our own, oldest-first, up to the count
+                # a run actually creates.
+                for pid in sorted(set(apps) - blessed):
+                    if len(blessed) >= self._EXPECTED_OWN:
+                        break
+                    blessed.add(pid)
+            extra = set(apps) - blessed
+            # Confirmed co-tenant: seen on two consecutive checks with a
+            # real memory footprint.
+            confirmed = {
+                pid for pid in extra & suspect if apps.get(pid, 0) >= self._KILL_MIB
+            }
+            if confirmed:
+                self._kill(
+                    "co-tenant appeared "
+                    f"({sorted((pid, apps[pid]) for pid in confirmed)} MiB)"
+                )
+                return
+            if extra - suspect:
                 print(
-                    f"[gpu{self._gpu}] co-tenant appeared ({sorted(foreign)}), "
-                    "killing the run",
+                    f"[gpu{self._gpu}] transient/small extra process "
+                    f"{sorted((pid, apps.get(pid, 0)) for pid in extra - suspect)}"
+                    " MiB, watching",
                     flush=True,
                 )
-                try:
-                    os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                return
+            suspect = extra
 
     def stop(self) -> None:
         self._stop.set()
@@ -449,7 +528,7 @@ def run_generate(
     prompt_key: str = MAIN_PROMPT,
     method: str | None = None,
     method_config: dict | None = None,
-    max_retries: int = 20,
+    max_retries: int = 3,
 ) -> dict:
     """One exclusive-GPU `sglang generate` run; re-queues on contention."""
     spec = MODELS[model]
@@ -511,6 +590,7 @@ def run_generate(
         result["returncode"] = proc.returncode
         result["wall_s"] = round(time.time() - started, 1)
         result["config"] = method_config
+        result["gpu"] = gpu
         return result
     raise GpuContended(f"gpu {gpu} contended on every attempt for {out_dir}")
 
@@ -690,15 +770,27 @@ def run_lingbot_session(
             stderr=subprocess.STDOUT,
             env=dict(os.environ, PYTHONPATH=str(REPO / "python")),
         )
+        # The server's own processes are whatever computes on the GPU at
+        # session start (the ws client itself never touches the GPU); a pid
+        # beyond that set that persists with a real footprint is a co-tenant
+        # (probe blips are tolerated, same policy as GpuWatchdog).
+        try:
+            blessed = compute_pids(server.gpu)
+        except Exception:
+            blessed = set()
         contended = False
+        suspect: set[int] = set()
         deadline = time.time() + GENERATE_TIMEOUT_S
         while proc.poll() is None and time.time() < deadline:
             time.sleep(20)
             try:
-                if foreign_compute_pids(server.gpu, os.getpid()):
-                    contended = True
+                apps = compute_apps(server.gpu)
             except Exception:
-                pass
+                continue
+            extra = set(apps) - blessed
+            if any(apps.get(pid, 0) >= 2048 for pid in extra & suspect):
+                contended = True
+            suspect = extra
         if proc.poll() is None:
             proc.kill()
     result: dict = {"returncode": proc.returncode, "contended": contended}
