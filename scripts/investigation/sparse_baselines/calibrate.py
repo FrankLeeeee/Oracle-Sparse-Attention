@@ -14,6 +14,7 @@ Writes/updates configs.json: {model: {method: {tier: config}}}.
 """
 
 import argparse
+import fcntl
 import itertools
 import json
 import pathlib
@@ -361,6 +362,28 @@ def calibrate_sta(model: str, gpu: int, port_base: int) -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 
 
+def record_config(path: pathlib.Path, model: str, method: str, result: dict) -> None:
+    """Merge one method's calibration into configs.json, atomically.
+
+    Several calibration processes run at once (one model's sweep alongside the
+    next model's calibration), so the file has to be re-read under an
+    inter-process lock before writing: holding a copy from process start and
+    writing it back loses whatever another process recorded in between — which
+    is exactly how a finished model's entry once disappeared.
+    """
+    lock_path = path.with_suffix(".lock")
+    with open(lock_path, "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            configs = json.loads(path.read_text()) if path.exists() else {}
+            configs.setdefault(model, {})[method] = result
+            temporary = path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(configs, indent=2))
+            temporary.replace(path)
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, choices=sorted(MODELS))
@@ -381,9 +404,6 @@ def main() -> None:
     CALIBRATION_RES = args.res
 
     configs_path = ROOT / "configs.json"
-    configs = json.loads(configs_path.read_text()) if configs_path.exists() else {}
-    configs.setdefault(args.model, {})
-
     pool = GpuPool([int(gpu) for gpu in args.gpus.split(",")])
     work: "queue.Queue[str]" = queue.Queue()
     for method in args.methods:
@@ -405,8 +425,7 @@ def main() -> None:
                     else:
                         result = calibrate_scalar(args.model, method, gpu, port_base)
                     with lock:
-                        configs[args.model][method] = result
-                        configs_path.write_text(json.dumps(configs, indent=2))
+                        record_config(configs_path, args.model, method, result)
                     print(f"[{args.model}/{method}] calibrated", flush=True)
                     break
                 except GpuContended:
