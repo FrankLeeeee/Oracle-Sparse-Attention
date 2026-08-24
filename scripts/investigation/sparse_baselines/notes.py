@@ -102,10 +102,33 @@ MODEL_NOTES: dict[str, dict] = {
         "prompt_bullets": [],
     },
     "longlive2": {
-        "model_line": "LongLive-2.0 5B（Efficient-Large-Model/LongLive-2.0-5B）",
-        "geometry_line": "8 帧 chunk、32 潜帧可见窗口（8 帧 sink + 窗口）",
+        "model_line": "LongLive-2.0 5B（Efficient-Large-Model/LongLive-2.0-5B，24 头 ×128）",
+        "geometry_line": "8 帧 chunk、32 潜帧可见窗口（8 帧 sink + 窗口）、"
+        "720p post-patch 网格 22×40（880 token/帧）",
         "time_metric": "去噪耗时",
-        "walltime_bullets": [],
+        "setup_extra": [
+            "<b>本模型的注意力规模远小于其他四个</b>：720p 每帧只有 880 token，"
+            "窗口封顶 32 帧 ⇒ 每次注意力调用的 KV 只有 <b>28k token</b>"
+            "（Self-Forcing 全上下文末 chunk 为 292k，相差 10 倍）。"
+            "这是下面所有结论的成因。",
+        ],
+        "walltime_bullets": [
+            "<b>结论：在 LongLive-2 上稀疏注意力基本不划算</b>——除 OSA 外，"
+            "所有方法都在 1.0× 上下（部分低于稠密）。",
+            "<b>原因是被优化的对象本身太小</b>。在本模型的形状"
+            "（q=7040、kv=28160、24 头 ×128）上直接测量单次调用："
+            "稠密注意力仅 <b>3.2 ms</b>，而各方法每次调用的<b>规划开销</b>为 "
+            "0.24 ms（STA）/ 0.89 ms（LightForcing）/ 1.14 ms（XAttention）/ "
+            "1.50 ms（SVG2）——规划本身就占到被优化对象的 8%–47%。"
+            "逐步做估计或聚类的方法（XAttention、SVG2）因此整体只有 0.5×。",
+            "<b>OSA 是唯一稳定为正的方法</b>（0.40 档 22.4 s，1.27×）："
+            "它的计划按 (层, chunk) 缓存，去噪步之间零重复规划，"
+            "所以省下的读取能真正兑现。",
+            "<b>端到端角度更悲观</b>：稠密端到端 59.8 s 里去噪只占 28.5 s，"
+            "即使注意力完全免费，端到端也只能到 1.9×。",
+            "注：本模型单次注意力只有毫秒级，逐行 ±10% 的运行间波动属正常，"
+            "个别非单调点（如 STA 0.32 档）应按此理解。",
+        ],
         "quality_bullets": [],
         "prompt_bullets": [],
     },

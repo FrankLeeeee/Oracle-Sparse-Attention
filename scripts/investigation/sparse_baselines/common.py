@@ -58,6 +58,7 @@ MODELS = {
         "token_downsample": 16,
         "window_frames": -1,
         "sink_frames": 1,
+        "pinned_sink_frames": 0,
         "latents_20s": 81,
     },
     "causal_forcing": {
@@ -69,6 +70,7 @@ MODELS = {
         "token_downsample": 16,
         "window_frames": 21,
         "sink_frames": 1,
+        "pinned_sink_frames": 0,
         "latents_20s": 81,
     },
     "rolling_forcing": {
@@ -80,6 +82,7 @@ MODELS = {
         "token_downsample": 16,
         "window_frames": 21,
         "sink_frames": 3,
+        "pinned_sink_frames": 3,
         "latents_20s": 81,
     },
     "longlive2": {
@@ -91,6 +94,7 @@ MODELS = {
         "token_downsample": 32,
         "window_frames": 32,
         "sink_frames": 8,
+        "pinned_sink_frames": 8,
         "latents_20s": 120,
     },
     "lingbot_world_v2": {
@@ -102,6 +106,7 @@ MODELS = {
         "token_downsample": 16,
         "window_frames": 18,
         "sink_frames": 9,
+        "pinned_sink_frames": 9,
         "latents_20s": 81,
     },
 }
@@ -145,11 +150,13 @@ def method_base_config(method: str, model: str) -> dict:
     if method == "radial":
         return {"dense_sink_frames": sink}
     if method == "sta":
-        # Pinned rather than left to the default so the calibration cache is
-        # keyed by it: the query-block size changes both the executed density
-        # (a block unions the windows of the tiles it spans) and the kernel
-        # throughput, so measurements from another block size do not carry.
-        return {"block": 128}
+        # Both pinned rather than left to defaults so the calibration cache is
+        # keyed by them: the query-block size changes the executed density (a
+        # block unions the windows of the tiles it spans) and the kernel
+        # throughput, and the sink exemption changes what is kept. The sink
+        # here is the model's *explicit pinned block* (0 where the model has
+        # none), not the 1-frame default Radial and SVG1 use.
+        return {"block": 128, "dense_sink_frames": spec["pinned_sink_frames"]}
     return {}
 
 

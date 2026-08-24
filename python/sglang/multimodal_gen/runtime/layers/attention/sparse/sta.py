@@ -69,6 +69,10 @@ class StaConfig(msgspec.Struct, frozen=True):
     # costs about a factor of two on the attention itself — far more than the
     # few percent of extra keys that unioning ~2 tiles per block adds.
     block: int = 128
+    # Leading visible frames the temporal window may not evict. 0 is upstream
+    # (no sink concept); set it to the model's pinned sink block for the
+    # block-causal models that have one.
+    dense_sink_frames: int = 0
 
 
 def pick_tile(extent: int, other_extent: int) -> tuple[int, int]:
@@ -157,6 +161,15 @@ def build_sta_tile_mask(
         extent=num_frames,
         kernel=config.kernel_t,
     )  # [query_frames, num_frames]
+    if config.dense_sink_frames:
+        # Upstream STA is bidirectional over one clip, where the temporal axis
+        # is pure distance and the oldest frames are genuinely the least
+        # relevant. A block-causal model with a *pinned sink* breaks that
+        # assumption: its first visible frames are the anchor the model was
+        # distilled to keep, yet they sit at the far end of the window and the
+        # clamped kernel evicts them. On LongLive-2 (8 sink frames of 32
+        # visible) that eviction corrupts the rollout outright.
+        time_keep[:, : config.dense_sink_frames] = True
     row_keep = clamped_window(
         np.arange(tiles_h), extent=tiles_h, kernel=config.kernel_h
     )  # [tiles_h, tiles_h]
