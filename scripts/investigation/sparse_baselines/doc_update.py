@@ -16,8 +16,11 @@ import re
 import shutil
 import sys
 
+import json
+
 import sections
 from common import METHODS, MODELS, ROOT, newest_video
+from quality import tier_tag
 
 from notes import PROMPT_LABELS
 
@@ -105,17 +108,28 @@ def stage_videos(model: str) -> dict[str, dict[str, pathlib.Path]]:
         shutil.copy(source, target)
         files.setdefault(prompt_key, {})[label] = target
 
-    tags = ["dense"] + [f"{method}_0.3" for method in METHODS]
+    # A method whose calibration floored above 0.30 has no "_0.3" run — its
+    # tiers collapse onto one config — so resolve each method to whichever of
+    # its runs is nearest 0.30, exactly as the quality sheet does.
+    results = json.loads((model_root / "results.json").read_text())
+    tags = ["dense"] + [
+        tag
+        for tag in (tier_tag(results, method) for method in METHODS)
+        if tag is not None
+    ]
     for tag in tags:
         label = tag.rsplit("_", 1)[0] if tag != "dense" else "dense"
         stage("p0_tokyo", label, model_root / "runs" / tag)
         for prompt_key in PROMPT_LABELS:
             if prompt_key == "p0_tokyo":
                 continue
+            # The multi-prompt sweep always runs the "_0.3" config name, even
+            # when that config is a floored tier.
+            prompt_tag = "dense" if tag == "dense" else f"{label}_0.3"
             stage(
                 prompt_key,
                 label,
-                model_root / "runs_prompts" / f"{prompt_key}_{tag}",
+                model_root / "runs_prompts" / f"{prompt_key}_{prompt_tag}",
             )
     return files
 
@@ -161,13 +175,17 @@ def push_figures(doc: str, model: str) -> None:
         caption="各方法去噪耗时 vs 实际累计读取密度（虚线为 dense 参考）",
     )
     published = published_media(doc, ids[quality])
-    upsert_media(
-        doc,
-        published,
-        last_block_id(doc, ids[quality]),
-        model_root / "quality_sheet_target0.3.png",
-        caption="帧对比（p0 · 东京夜街，各方法 ~0.30 档；行：方法；列：帧号 / 时间，共 7 帧）",
+    from notes import MODEL_NOTES
+
+    sheets = MODEL_NOTES[model].get(
+        "quality_sheets",
+        [("quality_sheet_target0.3.png", "帧对比（p0 · 东京夜街，各方法 ~0.30 档；行：方法；列：帧号 / 时间，共 7 帧）")],
     )
+    anchor = last_block_id(doc, ids[quality])
+    for filename, caption in sheets:
+        anchor = upsert_media(
+            doc, published, anchor, model_root / filename, caption=caption
+        )
 
 
 def push_videos(doc: str, model: str) -> None:

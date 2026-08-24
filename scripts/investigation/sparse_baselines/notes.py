@@ -76,8 +76,48 @@ MODEL_NOTES: dict[str, dict] = {
             "PSNR 与视觉对比都失去意义；"
             "<b>5 s 一组（81 帧，模型的训练分布内）才是质量结论的依据</b>。",
         ],
-        "walltime_bullets": [],
-        "quality_bullets": [],
+        # Quality is read off the in-distribution 5 s sweep, not the 20 s one.
+        "quality_results_file": "results_5s.json",
+        "quality_sheets": [
+            (
+                "quality_sheet_target0.3_5s.png",
+                "帧对比（5 s 原生时长，模型分布内；行：方法；列：帧号 / 时间，共 7 帧）",
+            ),
+            (
+                "quality_sheet_target0.3.png",
+                "对照：同样的方法在 20 s 下——注意 Dense 一行自身已崩坏，"
+                "该时长的质量比较不成立",
+            ),
+        ],
+        "quality_lead_extra": (
+            "<p><b>本节的数字与图都来自 5 s（81 帧）这一组</b>，即模型的训练分布内；"
+            "20 s 那一组的 dense 参考自身已崩坏，任何“相对 dense”的指标都失去意义。"
+            "另需注意：5 s 只有 7 个 chunk，累计密度被前几个稠密 chunk 主导，"
+            "因此各档实际密度都落在 0.27–0.55，<b>这一组回答的是“会不会坏”，"
+            "而不是“哪个密度更快”</b>。另外视频本身就只有 5 s，"
+            "所以下表“整段”与“前 5 s”两列按定义相同，保留只为与其他四页同构。</p>"
+        ),
+        "walltime_bullets": [
+            "<b>本表仅用于与其余四个模型口径一致地比较耗时</b>；质量结论见第 3 节的 5 s 组。",
+            "封顶窗口（21 潜帧）下，各方法的加速幅度介于 Self-Forcing 与 "
+            "Rolling Forcing 之间：<b>OSA 最快</b>（0.29 档 22.0 s，1.94×），"
+            "Radial 次之（0.29 档 24.2 s，1.76×），STA（0.30 档 26.2 s，1.63×）"
+            "与 LightForcing（1.43×）接近。",
+            "SVG2 在 0.42 档仍略慢于稠密（0.96×），到 0.22 档才到 1.21×——"
+            "与其余模型上的结论一致：它的逐步聚类开销最难摊薄。",
+        ],
+        "quality_bullets": [
+            "<b>5 s 原生时长下，全部方法都可用</b>：dense、OSA、LightForcing、"
+            "Radial、SVG1、SVG2、XAttention 都保持人物、红裙与街景结构，"
+            "没有任何一个出现崩坏。",
+            "<b>唯一的可见伪影来自 STA</b>（0.50 档）：从第 2 s 起画面中出现"
+            "<b>第二个主体</b>（同一位女性的复制），此后一直存在。"
+            "这与它在 Rolling Forcing 上的失效同源——tile 窗口切断了空间上"
+            "相距较远的区域之间的关联，模型于是各自成像。",
+            "各方法在 5 s 下的实际密度都在 0.37–0.55，差异不大，"
+            "因此 PSNR 高低更多反映轨迹分歧速度而非画质：XAttention 密度最低（0.37）"
+            "而 PSNR 也最低，属预期。",
+        ],
         "prompt_bullets": [],
     },
     "rolling_forcing": {
@@ -125,7 +165,18 @@ MODEL_NOTES: dict[str, dict] = {
             "所以这里按上游语义如实报告：<b>STA 与 XAttention 不适配滚动窗口联合去噪</b>，"
             "而不是把它们改造成必然不稀疏的版本。",
         ],
-        "prompt_bullets": [],
+        "prompt_bullets": [
+            "<b>密度完全与内容无关</b>：OSA（0.375）、LightForcing（0.286）、"
+            "Radial（0.443）、SVG2（0.619）、STA（0.274）在 5 个 prompt 上给出"
+            "逐位相同的密度，SVG1 浮动 0.001，XAttention 也只有 0.276–0.289"
+            "（比 Self-Forcing 上的 0.27–0.38 稳定得多，因为窗口封顶限制了它的选择空间）。",
+            "<b>崩坏结论跨 prompt 成立</b>：STA 在全部 5 个 prompt 上都从约 4 s 起"
+            "出现色带噪声（雨林一档尤其明显，画面几乎被竖直彩条吞没）；"
+            "XAttention 表现为强烈拖影与色块。二者都不是个别场景的偶发问题。",
+            "<b>干净的方法同样跨 prompt 稳定</b>：OSA / LightForcing / Radial / SVG2 "
+            "在 5 个 prompt 上都保持主体与场景结构；SVG1 会增殖次要物体"
+            "（雨林里鹿越来越多、出现悬空的鹿），属于内容漂移而非崩坏。",
+        ],
     },
     "longlive2": {
         "model_line": "LongLive-2.0 5B（Efficient-Large-Model/LongLive-2.0-5B，24 头 ×128）",

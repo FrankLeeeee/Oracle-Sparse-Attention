@@ -166,13 +166,26 @@ def walltime_section(model: str, results: dict) -> str:
 
 
 def quality_section(model: str, results: dict) -> str:
+    """The quality section, optionally measured on a second sweep.
+
+    A model whose shared 20 s configuration is out of its training
+    distribution (Causal Forcing) carries a second in-distribution sweep, and
+    every quality claim has to come from that one — comparing methods against
+    a dense reference that has itself collapsed says nothing about the
+    methods.
+    """
     notes = MODEL_NOTES[model]
+    quality_file = notes.get("quality_results_file")
+    if quality_file:
+        results = json.loads((ROOT / model / quality_file).read_text())
     lead = (
         "<p><b>PSNR（相对 dense 输出，dB）：</b>自回归 rollout 中任何扰动都会"
         "复合成内容轨迹分歧，因此该指标衡量的是“偏离 dense 轨迹的速度”而非画质"
         "本身；前 5 s（轨迹尚未分开）更有参考价值。下表为各方法 ~0.30 档"
         "（括号内为实际密度）：</p>"
     )
+    if notes.get("quality_lead_extra"):
+        lead = notes["quality_lead_extra"] + lead
     rows = []
     for method in METHODS:
         entries = method_rows(results, method)
