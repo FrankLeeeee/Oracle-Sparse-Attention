@@ -245,6 +245,16 @@ SERVER_READY_TIMEOUT_S = 1800
 GPU_WAIT_TIMEOUT_S = 28800
 
 
+# Mid-run tolerance only. A run never *starts* on a GPU that has any CUDA
+# context on it — that is the standing rule for this box, and a parked
+# context is reason enough to pick another GPU. Once a run is under way,
+# though, killing it for a context that appears and vanishes within seconds
+# only throws away good work, so the watchdog requires a co-tenant to persist
+# across two checks and hold at least this much memory before it invalidates
+# the timing.
+IDLE_CONTEXT_MIB = 2048
+
+
 class GpuContended(RuntimeError):
     """A co-tenant process appeared on the GPU mid-run; the timing is invalid."""
 
@@ -306,6 +316,16 @@ def compute_apps(gpu: int) -> dict[int, int]:
 
 def compute_pids(gpu: int) -> set[int]:
     return set(compute_apps(gpu))
+
+
+def workload_pids(gpu: int) -> set[int]:
+    """Compute apps big enough to actually contend for the GPU.
+
+    Only for reasoning about a run already in flight; acquisition uses
+    :func:`compute_pids`, because a GPU with any context on it is not ours
+    to take.
+    """
+    return {pid for pid, mib in compute_apps(gpu).items() if mib >= IDLE_CONTEXT_MIB}
 
 
 def wait_for_exclusive_gpu(gpu: int) -> None:
@@ -430,10 +450,22 @@ class GpuWatchdog:
     # few minutes and would otherwise get blessed alongside our own run.
     _EXPECTED_OWN = 2
 
-    def __init__(self, gpu: int, proc: subprocess.Popen, *, interval_s: int = 15):
+    def __init__(
+        self,
+        gpu: int,
+        proc: subprocess.Popen,
+        *,
+        interval_s: int = 15,
+        preexisting: set[int] | None = None,
+    ):
         self._gpu = gpu
         self._proc = proc
         self._interval = interval_s
+        # Parked contexts that were already on the GPU at launch. They are not
+        # ours, but they are not contention either — and crucially they must
+        # not consume the bless slots, or one of our own two processes would
+        # look foreign and get the run killed.
+        self._preexisting = set(preexisting or ())
         self.contended = False
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._watch, daemon=True)
@@ -462,11 +494,11 @@ class GpuWatchdog:
             if in_window and len(blessed) < self._EXPECTED_OWN:
                 # Accept new pids as our own, oldest-first, up to the count
                 # a run actually creates.
-                for pid in sorted(set(apps) - blessed):
+                for pid in sorted(set(apps) - blessed - self._preexisting):
                     if len(blessed) >= self._EXPECTED_OWN:
                         break
                     blessed.add(pid)
-            extra = set(apps) - blessed
+            extra = set(apps) - blessed - self._preexisting
             # Confirmed co-tenant: seen on two consecutive checks with a
             # real memory footprint.
             confirmed = {
@@ -569,6 +601,7 @@ def run_generate(
     for attempt in range(max_retries):
         wait_for_exclusive_gpu(gpu)
         started = time.time()
+        parked = compute_pids(gpu)
         with open(log, "w") as handle:
             proc = subprocess.Popen(
                 args,
@@ -578,7 +611,7 @@ def run_generate(
                 cwd=out_dir,
                 start_new_session=True,
             )
-            watchdog = GpuWatchdog(gpu, proc)
+            watchdog = GpuWatchdog(gpu, proc, preexisting=parked)
             try:
                 proc.wait(timeout=GENERATE_TIMEOUT_S)
             except subprocess.TimeoutExpired:
