@@ -116,13 +116,25 @@ def walltime_section(model: str, results: dict) -> str:
     metric = notes["time_metric"]
     tiers = [t for t in TIERS if any(t in method_rows(results, m) for m in METHODS)]
 
+    def reference_time(method: str) -> float:
+        """Denoise time at the tier nearest 0.30, the row-ordering key.
+
+        Ordering by each method's *fastest* run would rank a method by how low
+        a density it can reach rather than how fast it is at a density every
+        method reaches, which puts a method that is slow everywhere but has one
+        very sparse tier at the top.
+        """
+        entries = [
+            e for e in method_rows(results, method).values() if "denoise_s" in e
+        ]
+        if not entries:
+            return 1e9
+        return min(entries, key=lambda e: abs(e.get("density", 1.0) - 0.30))[
+            "denoise_s"
+        ]
+
     rows = []
-    ordered = sorted(
-        METHODS,
-        key=lambda m: min(
-            (e["denoise_s"] for e in method_rows(results, m).values()), default=1e9
-        ),
-    )
+    ordered = sorted(METHODS, key=reference_time)
     for method in ordered:
         entries = method_rows(results, method)
         if not entries:

@@ -612,14 +612,16 @@ def condition_frame(prompt_key: str, res: str = "720p") -> pathlib.Path:
     if target.exists():
         return target
     rf_root = ROOT / "rolling_forcing"
+    # Only a *dense* Rolling Forcing run is an acceptable source: a sparse
+    # run's frame 0 would fold that method's artifacts into every LingBot
+    # video, including the dense reference's.
     patterns = [
         str(rf_root / "runs" / "dense" / "**" / "*.mp4"),
         str(rf_root / "runs_prompts" / f"{prompt_key}_dense" / "**" / "*.mp4"),
-        str(rf_root / "calibration" / "**" / "*.mp4"),
     ]
     if prompt_key != MAIN_PROMPT:
-        patterns = patterns[1:2]
-    sources = []
+        patterns = patterns[1:]
+    sources: list[str] = []
     for pattern in patterns:
         sources = sorted(glob.glob(pattern, recursive=True))
         if sources:
@@ -630,10 +632,18 @@ def condition_frame(prompt_key: str, res: str = "720p") -> pathlib.Path:
             "condition frame from; run the rolling_forcing sweeps first"
         )
     import imageio.v2 as imageio_v2
+    from PIL import Image
 
+    width, height = MODELS["lingbot_world_v2"]["resolutions"][res]
+    frame = imageio_v2.get_reader(sources[-1]).get_data(0)
+    image = Image.fromarray(frame)
+    if image.size != (width, height):
+        # Rolling Forcing's 720p frame is the only dense source; resample it
+        # to whatever resolution this session runs at.
+        image = image.resize((width, height), Image.LANCZOS)
     target.parent.mkdir(parents=True, exist_ok=True)
-    imageio_v2.imwrite(target, imageio_v2.get_reader(sources[-1]).get_data(0))
-    print(f"wrote LingBot condition frame {target}", flush=True)
+    image.save(target)
+    print(f"wrote LingBot condition frame {target} ({width}x{height})", flush=True)
     return target
 
 
