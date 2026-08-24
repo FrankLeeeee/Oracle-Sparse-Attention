@@ -74,7 +74,7 @@ def sweep_generate(args, jobs: list[tuple]) -> None:
             try:
                 result = run_generate(
                     model=args.model,
-                    out_dir=model_root / "runs" / tag,
+                    out_dir=model_root / args.runs_dir / tag,
                     gpu=gpu,
                     port_base=port_base,
                     duration=args.duration,
@@ -132,7 +132,7 @@ def sweep_lingbot(args, jobs: list[tuple]) -> None:
         with LingbotServer(
             gpu=gpu,
             port_base=args.port_base,
-            server_dir=model_root / "runs" / tag,
+            server_dir=model_root / args.runs_dir / tag,
             method=method,
             method_config=config,
         ) as server:
@@ -140,7 +140,7 @@ def sweep_lingbot(args, jobs: list[tuple]) -> None:
             for attempt in range(3):
                 result = run_lingbot_session(
                     server,
-                    out_dir=model_root / "runs" / tag,
+                    out_dir=model_root / args.runs_dir / tag,
                     duration=args.duration,
                     res=args.res,
                 )
@@ -168,6 +168,7 @@ def main() -> None:
     parser.add_argument("--res", default="720p")
     parser.add_argument("--skip-dense", action="store_true")
     parser.add_argument("--out", default="results.json")
+    parser.add_argument("--runs-dir", default="runs")
     parser.add_argument("--port-base", type=int, default=36000)
     args = parser.parse_args()
     jobs = sweep_jobs(args.model, args.methods, args.skip_dense)

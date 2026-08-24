@@ -60,9 +60,22 @@ MODEL_NOTES: dict[str, dict] = {
     },
     "causal_forcing": {
         "model_line": "Causal Forcing 1.3B（thu-ml/Causal-Forcing chunk-wise，"
-        "转档为 frankleeeee/CausalForcing-Wan2.1-T2V-1.3B-Diffusers）",
-        "geometry_line": "3 帧 chunk、21 潜帧滑动窗口、1 帧 sink",
+        "本轮转档并上传为 frankleeeee/CausalForcing-Wan2.1-T2V-1.3B-Diffusers）",
+        "geometry_line": "3 帧 chunk、21 潜帧滑动窗口、无 sink（sink_size=0）",
         "time_metric": "去噪耗时",
+        "setup_extra": [
+            "<b>重要前提：本模型只训练到 81 帧（5 s）。</b>上游 README 明确写着"
+            "“Causal Forcing 不原生支持超过 81 帧的视频……直接把 5 秒训练的 "
+            "Causal Forcing 当作长视频基线是极不公平的”，长视频应改用其 "
+            "longvideo 检查点（本轮也已转档为 "
+            "frankleeeee/CausalForcing-Long-Wan2.1-T2V-1.3B-Diffusers，"
+            "它其实是基于 Rolling Forcing 框架重训的）。",
+            "因此本页给出<b>两组实验</b>：20 s 一组只为与其余四个模型口径一致地"
+            "比较<b>耗时</b>——该时长下<b>稠密输出自身已经崩坏</b>"
+            "（约 7 s 后画面被霓虹涂抹吞没，16 s 后主体只剩剪影），"
+            "PSNR 与视觉对比都失去意义；"
+            "<b>5 s 一组（81 帧，模型的训练分布内）才是质量结论的依据</b>。",
+        ],
         "walltime_bullets": [],
         "quality_bullets": [],
         "prompt_bullets": [],

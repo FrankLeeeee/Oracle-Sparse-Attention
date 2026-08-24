@@ -62,7 +62,15 @@ def tier_tag(results: dict, method: str, tier: str = "0.3") -> str | None:
     )
 
 
-def build_sheet(model: str, results: dict, *, duration: int, tier: str) -> None:
+def build_sheet(
+    model: str,
+    results: dict,
+    *,
+    duration: int,
+    tier: str,
+    runs_dir: str = "runs",
+    suffix: str = "",
+) -> None:
     fps = MODELS[model]["fps"]
     frame_indices = sheet_frame_indices(fps=fps, duration=duration)
     model_root = ROOT / model
@@ -71,7 +79,7 @@ def build_sheet(model: str, results: dict, *, duration: int, tier: str) -> None:
         tag for tag in (tier_tag(results, method, tier) for method in METHODS) if tag
     ]
     for tag in tags:
-        frames = extract_frames(model_root / "runs" / tag, frame_indices)
+        frames = extract_frames(model_root / runs_dir / tag, frame_indices)
         if frames is None:
             print(f"missing video: {tag}", flush=True)
             continue
@@ -84,7 +92,7 @@ def build_sheet(model: str, results: dict, *, duration: int, tier: str) -> None:
             if density:
                 label = f"{label} d={density:.2f}"
         rows.append((label, frames))
-    out = model_root / f"quality_sheet_target{tier}.png"
+    out = model_root / f"quality_sheet_target{tier}{suffix}.png"
     render_frame_sheet(rows=rows, frame_indices=frame_indices, fps=fps, out_path=out)
     print(f"wrote {out} rows={[label for label, _ in rows]}", flush=True)
 
@@ -95,20 +103,25 @@ def main() -> None:
     parser.add_argument("--duration", type=int, default=20)
     parser.add_argument("--tier", default="0.3")
     parser.add_argument("--sheet-only", action="store_true")
+    # A second sweep of the same model (e.g. its native duration) keeps its
+    # own results file, run directory and sheet so the two never mix.
+    parser.add_argument("--out", default="results.json")
+    parser.add_argument("--runs-dir", default="runs")
+    parser.add_argument("--sheet-suffix", default="")
     args = parser.parse_args()
     model_root = ROOT / args.model
-    results_path = model_root / "results.json"
+    results_path = model_root / args.out
     results = json.loads(results_path.read_text())
 
     if not args.sheet_only:
-        dense = load_video(model_root / "runs" / "dense")
+        dense = load_video(model_root / args.runs_dir / "dense")
         if dense is None:
             raise SystemExit(f"no dense reference video under {model_root}/runs/dense")
         first = 5 * MODELS[args.model]["fps"]
         for tag, entry in sorted(results.items()):
             if tag == "dense":
                 continue
-            video = load_video(model_root / "runs" / tag)
+            video = load_video(model_root / args.runs_dir / tag)
             if video is None:
                 continue
             n = min(len(dense), len(video))
@@ -122,7 +135,14 @@ def main() -> None:
             )
         results_path.write_text(json.dumps(results, indent=2))
 
-    build_sheet(args.model, results, duration=args.duration, tier=args.tier)
+    build_sheet(
+        args.model,
+        results,
+        duration=args.duration,
+        tier=args.tier,
+        runs_dir=args.runs_dir,
+        suffix=args.sheet_suffix,
+    )
 
 
 if __name__ == "__main__":
