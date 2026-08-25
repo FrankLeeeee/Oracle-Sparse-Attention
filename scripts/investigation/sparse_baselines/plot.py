@@ -22,7 +22,7 @@ COLORS = {
     "osa": "#1f77b4",
     "osa2": "#0b3d91",
     "osa2s": "#17becf",
-    "osa2a": "#d62728",
+    "osa2a": "#bcbd22",
     "osa1d": "#9edae5",
     "lightforcing": "#ff7f0e",
     "radial": "#2ca02c",
