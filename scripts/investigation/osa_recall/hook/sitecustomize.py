@@ -61,102 +61,6 @@ def _install(module) -> None:
                 handle.write(json.dumps(record) + "\n")
 
     @torch.no_grad()
-    def measure_chunk(self, call, layout, chunk_plan, query, offset) -> None:
-        key = call.key[:1]
-        heads = query.shape[2]
-        frame_seqlen = layout.frame_seqlen
-        num_frames = layout.num_frames
-        tile = self._config.spatial_tile
-        num_tiles = frame_seqlen // tile
-
-        # The frames OSA keeps whole, rebuilt exactly as _chunk_plan does.
-        own = layout.frames_of_offset(offset)
-        ages = frame_ages(layout, query_chunk_offset=offset)
-        full = (
-            own
-            | layout.sink_frames(self._sink_frames())
-            | ((ages > 0) & (ages <= self._config.num_recent_frames))
-        )
-        num_full = int(full.sum())
-        num_other = num_frames - num_full
-        if num_other <= 0 or num_tiles <= 0:
-            return
-        # Whole frames are fixed cost; the rest of the budget buys tiles.
-        tiles_kept = (chunk_plan.kept - num_full * frame_seqlen) // (num_other * tile)
-        tiles_kept = int(max(0, min(tiles_kept, num_tiles)))
-        full_mask = torch.from_numpy(full).to(query.device)
-
-        sampled = query[:, ::QUERY_STRIDE]
-        num_sampled = sampled.shape[1]
-        device = query.device
-        mass_full = torch.zeros(heads, dtype=torch.float64, device=device)
-        mass_tile = torch.zeros(heads, num_tiles, dtype=torch.float64, device=device)
-        for start in range(0, num_sampled, QUERY_TILE):
-            chunk = sampled[:, start : start + QUERY_TILE]
-            scores = torch.einsum("bqhd,bkhd->hqk", chunk, key).float()
-            probs = torch.softmax(scores * call.softmax_scale, dim=-1)
-            per_frame = probs.view(heads, -1, num_frames, frame_seqlen)
-            mass_full += per_frame[:, :, full_mask, :].sum((1, 2, 3)).double()
-            other = per_frame[:, :, ~full_mask, :]
-            body = other[..., : num_tiles * tile].reshape(
-                heads, other.shape[1], other.shape[2], num_tiles, tile
-            )
-            mass_tile += body.sum((1, 2, 4)).double()
-
-        if tiles_kept > 0:
-            order = self._tile_order[call.layer_index][:, :tiles_kept].long()
-            frozen = mass_tile.gather(1, order).sum(1)
-            refreshed = mass_tile.topk(tiles_kept, dim=1).values.sum(1)
-        else:
-            frozen = refreshed = torch.zeros_like(mass_full)
-        scale = float(num_sampled)
-        whole_only = (mass_full / scale).cpu()
-        recall_frozen = ((mass_full + frozen) / scale).cpu()
-        recall_refreshed = ((mass_full + refreshed) / scale).cpu()
-
-        chunk_index = int(layout.query_chunk_index) + offset
-        key_id = (call.layer_index, chunk_index)
-        step = steps.get(key_id, 0)
-        steps[key_id] = step + 1
-
-        # One layer's raw per-tile profile, for the explainer figure: what the
-        # mass over history frames actually looks like at this chunk, and which
-        # tiles each policy picks out of it.
-        if TILE_DUMP_LAYER == call.layer_index and step == 0 and tiles_kept > 0:
-            head_mass = (mass_tile / scale).cpu()
-            frozen_ids = self._tile_order[call.layer_index][:, :tiles_kept].cpu()
-            with open(TILE_DUMP_PATH, "a") as handle:
-                handle.write(
-                    json.dumps(
-                        {
-                            "chunk": chunk_index,
-                            "layer": call.layer_index,
-                            "tiles_kept": int(tiles_kept),
-                            "tile_mass": [
-                                [round(v, 8) for v in row] for row in head_mass.tolist()
-                            ],
-                            "frozen_tiles": frozen_ids.tolist(),
-                        }
-                    )
-                    + "\n"
-                )
-        emit(
-            {
-                "chunk": chunk_index,
-                "layer": int(call.layer_index),
-                "step": step,
-                "kv_frames": int(num_frames),
-                "whole_frames": num_full,
-                "tiles_kept": int(tiles_kept),
-                "num_tiles": int(num_tiles),
-                "density": float(chunk_plan.density),
-                "recall_frozen": [round(v, 6) for v in recall_frozen.tolist()],
-                "recall_refreshed": [round(v, 6) for v in recall_refreshed.tolist()],
-                "whole_only": [round(v, 6) for v in whole_only.tolist()],
-            }
-        )
-
-    @torch.no_grad()
     def dump_section(self, call, layout) -> None:
         """Block-reduced frame-to-frame map, per query tile AND key tile.
 
@@ -182,11 +86,7 @@ def _install(module) -> None:
         else:
             own = layout.frames_of_offset(0)
             ages = frame_ages(layout, query_chunk_offset=0)
-            full = (
-                own
-                | layout.sink_frames(self._sink_frames())
-                | ((ages > 0) & (ages <= self._config.num_recent_frames))
-            )
+            full = self._whole_frame_mask(layout, own, ages)
             groups = {"history": ~full, "whole": full}
 
         maps = {
@@ -247,11 +147,7 @@ def _install(module) -> None:
 
         own = layout.frames_of_offset(0)
         ages = frame_ages(layout, query_chunk_offset=0)
-        full = (
-            own
-            | layout.sink_frames(self._sink_frames())
-            | ((ages > 0) & (ages <= self._config.num_recent_frames))
-        )
+        full = self._whole_frame_mask(layout, own, ages)
         num_full = int(full.sum())
         num_other = num_frames - num_full
         if num_other <= 0 or num_tiles <= 0:
@@ -331,30 +227,17 @@ def _install(module) -> None:
             layout = self._layout(call)
             if layout is None or layout.query_chunk_index < 1:
                 return out
-            calibrated = call.layer_index in self._tile_order or (
-                hasattr(self, "_section_order")
-                and call.layer_index in self._section_order
-            )
-            if not calibrated:
+            if call.layer_index not in self._section_order:
                 return out
             # By now the plan is in the per-(layer, chunk) cache, so this is a
             # pure lookup — no re-calibration, no state change.
             plan = self._prepare_plan(call, layout)
             if plan is None:
                 return out
-            if hasattr(module, "BlockSparsePlan") and isinstance(
-                plan, module.BlockSparsePlan
-            ):
+            if isinstance(plan, module.BlockSparsePlan):
                 measure_chunk_2d(self, call, layout, plan)
-            elif isinstance(plan, module.ReplicateGatherPlan):
-                measure_chunk(self, call, layout, plan, call.query[:1], 0)
-            else:
-                # A rolling window denoises several query chunks at once, each
-                # with its own kept-whole frames and its own gather plan.
-                tokens = plan.chunk_query_tokens
-                for offset, chunk_plan in enumerate(plan.chunk_plans):
-                    slice_ = call.query[:1, offset * tokens : (offset + 1) * tokens]
-                    measure_chunk(self, call, layout, chunk_plan, slice_, offset)
+            # Rolling-window tuples are not measured; the recall study runs on
+            # single-chunk models.
         except Exception as exc:  # noqa: BLE001 - never break the run
             if not failed:
                 failed.append(str(exc))

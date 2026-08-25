@@ -21,6 +21,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 COLORS = {
     "osa": "#1f77b4",
     "osa2": "#0b3d91",
+    "osa2s": "#17becf",
     "lightforcing": "#ff7f0e",
     "radial": "#2ca02c",
     "svg1": "#d62728",

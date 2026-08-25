@@ -53,7 +53,7 @@ def main() -> None:
     parser.add_argument("--port-base", type=int, default=29700)
     parser.add_argument("--tile-layer", type=int, default=-1)
     parser.add_argument("--section-chunks", default="")
-    parser.add_argument("--query-tiled", action="store_true")
+    parser.add_argument("--whole-frames", default="", choices=["", "all", "sink", "none"])
     parser.add_argument("--dense", action="store_true")
     parser.add_argument("--no-hook", action="store_true")
     parser.add_argument("--tag", default=None)
@@ -76,8 +76,8 @@ def main() -> None:
         "sink_latent_frames": 1,
         "num_recent_frames": 1,
     }
-    if args.query_tiled:
-        config["query_tiled"] = True
+    if args.whole_frames:
+        config["whole_frames"] = args.whole_frames
     sparse_flags = (
         []
         if args.dense
