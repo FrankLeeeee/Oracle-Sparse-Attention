@@ -104,6 +104,12 @@ class OsaConfig(msgspec.Struct, frozen=True):
     # average over many queries, so a stride of 8 costs 1/8 of the recompute
     # and moves the profile by well under a percent.
     calibration_query_stride: int = 8
+    # Minimum query-to-key frame distance included in the calibration fold.
+    # 0 (default) averages every section, including the diagonal-dominated
+    # dt=0 self-sections; at deployment the pattern is applied to history
+    # frames whose dt is large, so restricting calibration to the most
+    # distant measurable sections (dt >= this) can match them better.
+    calibration_dt_min: int = 0
 
 
 @torch.no_grad()
@@ -116,6 +122,7 @@ def measure_section_tile_mass(
     query_stride: int,
     query_tile: int,
     spatial_tile: int,
+    dt_min: int = 0,
 ) -> torch.Tensor:
     """Mean attention mass per (query tile, key tile): ``[heads, q_tiles, k_tiles]``.
 
@@ -132,18 +139,33 @@ def measure_section_tile_mass(
     device = query.device
 
     positions = torch.arange(0, query.shape[1], query_stride, device=device)
-    sampled = query[:1, ::query_stride]
+    query_frame = positions // frame_seqlen  # [nq]
+    if dt_min > 0:
+        # Only query rows with at least one key frame at distance >= dt_min.
+        keep = query_frame >= dt_min
+        positions = positions[keep]
+        query_frame = query_frame[keep]
+    sampled = query[:1, positions]
     bucket = (positions % frame_seqlen) // query_tile  # [nq]
     keys = key[:1]
     mass = torch.zeros(num_heads, q_tiles, k_tiles, dtype=torch.float32, device=device)
     counts = torch.zeros(q_tiles, dtype=torch.float32, device=device)
     counts.index_add_(0, bucket, torch.ones_like(bucket, dtype=torch.float32))
+    frame_ids = torch.arange(num_frames, device=device)
     block = 256
     for start in range(0, sampled.shape[1], block):
         tile = sampled[:, start : start + block]
         scores = torch.einsum("bqhd,bkhd->hqk", tile.float(), keys.float())
         probs = torch.softmax(scores * softmax_scale, dim=-1)
-        folded = probs.view(num_heads, -1, num_frames, frame_seqlen).sum(2)
+        per_frame = probs.view(num_heads, -1, num_frames, frame_seqlen)
+        if dt_min > 0:
+            # Zero the sections closer than dt_min (per query row).
+            allowed = (
+                query_frame[start : start + block][None, :, None]
+                - frame_ids[None, None, :]
+            ) >= dt_min
+            per_frame = per_frame * allowed[..., None].to(per_frame.dtype)
+        folded = per_frame.sum(2)
         padded = torch.zeros(
             num_heads, folded.shape[1], k_tiles * spatial_tile, device=device
         )
@@ -280,6 +302,7 @@ class OracleSparseAttention(SparseAttentionBackend):
                     query_stride=self._config.calibration_query_stride,
                     query_tile=self._config.query_tile,
                     spatial_tile=self._config.spatial_tile,
+                    dt_min=self._config.calibration_dt_min,
                 )
             return None
         order = self._section_order.get(call.layer_index)
