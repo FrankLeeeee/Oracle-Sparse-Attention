@@ -53,7 +53,8 @@ def main() -> None:
     parser.add_argument("--port-base", type=int, default=29700)
     parser.add_argument("--tile-layer", type=int, default=-1)
     parser.add_argument("--section-chunks", default="")
-    parser.add_argument("--whole-frames", default="", choices=["", "all", "sink", "none"])
+    parser.add_argument("--whole-frames", default="", choices=["", "all", "anchors", "sink", "none"])
+    parser.add_argument("--groups", action="store_true")
     parser.add_argument("--dense", action="store_true")
     parser.add_argument("--no-hook", action="store_true")
     parser.add_argument("--tag", default=None)
@@ -117,6 +118,7 @@ def main() -> None:
         OSA_RECALL_QUERY_STRIDE=str(args.query_stride),
         OSA_RECALL_TILE_LAYER=str(args.tile_layer),
         OSA_RECALL_TILE_OUT=str(out_dir / "tile_profile.jsonl"),
+        OSA_GROUP_OUT=str(out_dir / "groups.jsonl") if args.groups else "",
         OSA_SECTION_LAYER=str(args.tile_layer),
         OSA_SECTION_CHUNKS=args.section_chunks,
         OSA_SECTION_DIR=str(sections) if args.section_chunks else "",

@@ -63,6 +63,7 @@ SCALAR_METHODS = {
     "osa": {"knob": "density", "seeds": (0.45, 0.12), "bounds": (0.02, 0.95)},
     "osa2": {"knob": "density", "seeds": (0.45, 0.12), "bounds": (0.02, 0.95)},
     "osa2s": {"knob": "density", "seeds": (0.45, 0.12), "bounds": (0.02, 0.95)},
+    "osa2a": {"knob": "density", "seeds": (0.45, 0.12), "bounds": (0.02, 0.95)},
     "xattention": {"knob": "threshold", "seeds": (0.95, 0.5), "bounds": (0.01, 0.9999)},
     "svg1": {"knob": "band_frames", "seeds": (40.0, 8.0), "bounds": (0.5, 80.0)},
     "svg2": {"knob": "top_p", "seeds": (0.95, 0.5), "bounds": (0.01, 0.9999)},

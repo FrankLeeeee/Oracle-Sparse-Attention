@@ -42,6 +42,9 @@ SECTION_CHUNKS = {
     int(c) for c in os.environ.get("OSA_SECTION_CHUNKS", "").split(",") if c.strip()
 }
 SECTION_DIR = os.environ.get("OSA_SECTION_DIR", "")
+# Optional: per-chunk attention mass and plan recall split by frame group
+# (sink / own chunk / recent / history), for the anchoring analysis.
+GROUP_OUT = os.environ.get("OSA_GROUP_OUT", "")
 
 
 def _install(module) -> None:
@@ -152,7 +155,7 @@ def _install(module) -> None:
         num_other = num_frames - num_full
         if num_other <= 0 or num_tiles <= 0:
             return
-        band = plan.starts.shape[2] - num_full * ((frame_seqlen + tile - 1) // tile)
+        band = plan.starts.shape[2] - num_full * (frame_seqlen // tile)
         band = int(band // max(num_other, 1))
         full_mask = torch.from_numpy(full).to(device)
 
@@ -212,6 +215,90 @@ def _install(module) -> None:
             }
         )
 
+    @torch.no_grad()
+    def measure_groups(self, call, layout, plan) -> None:
+        """Dense demand vs plan recall, per frame group.
+
+        ``demand[g]``: fraction of a query's softmax mass that lands on group
+        g's frames. ``recall[g]``: the fraction of that group's mass the plan
+        actually reads. Sink anchoring shows up as high sink demand with low
+        sink recall.
+        """
+        import numpy as np
+
+        query = call.query[:1]
+        key = call.key[:1]
+        heads = query.shape[2]
+        frame_seqlen = layout.frame_seqlen
+        num_frames = layout.num_frames
+        tile = self._config.spatial_tile
+        num_tiles = frame_seqlen // tile
+        q_tiles = plan.q_tiles_per_frame
+        device = query.device
+
+        own = layout.frames_of_offset(0)
+        ages = frame_ages(layout, query_chunk_offset=0)
+        sink = layout.sink_frames(self._sink_frames())
+        recent = (ages > 0) & (ages <= self._config.num_recent_frames) & ~sink
+        hist = ~(own | sink | recent)
+        groups = {"sink": sink, "own": own & ~sink, "recent": recent, "hist": hist}
+
+        # The plan's kept tiles per (head, q_tile), and which frames are whole.
+        full = self._whole_frame_mask(layout, own, ages)
+        num_full = int(full.sum())
+        k_tiles_pad = frame_seqlen // tile
+        band = (plan.starts.shape[2] - num_full * k_tiles_pad) // max(
+            num_frames - num_full, 1
+        )
+        hist_entries = plan.starts[:, :, num_full * k_tiles_pad :]
+        kept = ((hist_entries % frame_seqlen) // tile)[:, :, :band].long()
+
+        positions = torch.arange(0, query.shape[1], QUERY_STRIDE, device=device)
+        sampled = query[:1, ::QUERY_STRIDE]
+        bucket = ((positions % frame_seqlen) // plan.query_tile).long()
+        num_sampled = sampled.shape[1]
+        demand = {g: 0.0 for g in groups}
+        captured = {g: 0.0 for g in groups}
+        full_t = torch.from_numpy(full).to(device)
+        for start in range(0, num_sampled, QUERY_TILE):
+            chunk = sampled[:, start : start + QUERY_TILE]
+            scores = torch.einsum("bqhd,bkhd->hqk", chunk, key).float()
+            probs = torch.softmax(scores * call.softmax_scale, dim=-1)
+            per_frame = probs.view(heads, -1, num_frames, frame_seqlen)
+            tiles = per_frame[..., : num_tiles * tile].reshape(
+                heads, per_frame.shape[1], num_frames, num_tiles, tile
+            ).sum(-1)
+            kept_rows = kept[:, bucket[start : start + QUERY_TILE]]  # [h, nq, band]
+            for name, mask in groups.items():
+                mask_t = torch.from_numpy(np.asarray(mask)).to(device)
+                demand[name] += float(per_frame[:, :, mask_t].sum())
+                # captured: whole frames in the group count fully, patterned
+                # frames count their kept tiles.
+                whole_in = mask_t & full_t
+                pattern_in = mask_t & ~full_t
+                got = float(per_frame[:, :, whole_in].sum())
+                if int(pattern_in.sum()) and band > 0:
+                    group_tiles = tiles[:, :, pattern_in]  # [h, nq, f, num_tiles]
+                    got += float(
+                        group_tiles.gather(
+                            3,
+                            kept_rows[:, :, None, :].expand(
+                                -1, -1, int(pattern_in.sum()), -1
+                            ),
+                        ).sum()
+                    )
+                captured[name] += got
+        scale = num_sampled * heads
+        record = {"chunk": int(layout.query_chunk_index), "layer": int(call.layer_index)}
+        for name in groups:
+            d = demand[name] / scale
+            c = captured[name] / scale
+            record[f"demand_{name}"] = round(d, 6)
+            record[f"recall_{name}"] = round(c / d, 4) if d > 1e-9 else None
+        with write_lock:
+            with open(GROUP_OUT, "a") as handle:
+                handle.write(json.dumps(record) + "\n")
+
     def attend(self, call):
         if SECTION_DIR and call.layer_index == SECTION_LAYER and not self.in_cache_update:
             try:
@@ -236,6 +323,8 @@ def _install(module) -> None:
                 return out
             if isinstance(plan, module.BlockSparsePlan):
                 measure_chunk_2d(self, call, layout, plan)
+                if GROUP_OUT:
+                    measure_groups(self, call, layout, plan)
             # Rolling-window tuples are not measured; the recall study runs on
             # single-chunk models.
         except Exception as exc:  # noqa: BLE001 - never break the run

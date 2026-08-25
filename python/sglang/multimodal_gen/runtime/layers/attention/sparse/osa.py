@@ -57,7 +57,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-_WHOLE_FRAME_MODES = ("all", "sink", "none")
+_WHOLE_FRAME_MODES = ("all", "anchors", "sink", "none")
 
 
 class OsaConfig(msgspec.Struct, frozen=True):
@@ -85,9 +85,11 @@ class OsaConfig(msgspec.Struct, frozen=True):
     #   "all"  — the query's own chunk, the sink and the recent band. The
     #            classic geometry; the whole-frame keeps set a density floor
     #            (their share of the visible window).
-    #   "sink" — only the sink frames. The floor shrinks to the sink's share
-    #            of the window; own chunk and recent frames run the pattern,
-    #            which chunk 0's own-chunk sections calibrated directly.
+    #   "anchors" — the sink and the recent band, the two frames the model
+    #            re-anchors on (global composition and temporal smoothness);
+    #            the own chunk runs the pattern, which chunk 0's own-chunk
+    #            sections calibrated directly.
+    #   "sink" — only the sink frames.
     #   "none" — nothing is whole; density equals the knob at every chunk
     #            after chunk 0 (at least one tile per frame is always kept).
     whole_frames: str = "all"
@@ -350,9 +352,10 @@ class OracleSparseAttention(SparseAttentionBackend):
         sink = layout.sink_frames(self._sink_frames())
         if mode == "sink":
             return sink
-        return (
-            own | sink | ((ages > 0) & (ages <= self._config.num_recent_frames))
-        )
+        recent = (ages > 0) & (ages <= self._config.num_recent_frames)
+        if mode == "anchors":
+            return sink | recent
+        return own | sink | recent
 
     def _chunk_plan(
         self,

@@ -112,13 +112,15 @@ MODELS = {
     },
 }
 
-METHODS = ("osa", "osa2", "osa2s", "lightforcing", "radial", "svg1", "svg2", "xattention", "sta")
+METHODS = ("osa", "osa2", "osa2s", "osa2a", "lightforcing", "radial", "svg1", "svg2", "xattention", "sta")
 
 METHOD_LABELS = {
     "dense": "Dense",
     "osa": "OSA",
     "osa2": "OSA-2D",
     "osa2s": "OSA-2D-sink",
+    "osa2a": "OSA-2D-anchors",
+    "osa1d": "OSA-1D (removed)",
     "lightforcing": "LightForcing",
     "radial": "Radial",
     "svg1": "SVG1",
@@ -148,6 +150,16 @@ def method_base_config(method: str, model: str) -> dict:
     if method == "osa2s":
         # Fully sparse except the sink frame — the dense-anchor middle ground.
         return {"whole_frames": "sink", "sink_latent_frames": 1}
+    if method == "osa2a":
+        # Fully sparse except the two anchor frames (sink + recent): fixes the
+        # chunk-periodic camera oscillation of "none" (the model re-anchors
+        # global composition on the sink and temporal smoothness on the recent
+        # frame; both under-recalled ~0.6/0.8 when patterned).
+        return {
+            "whole_frames": "anchors",
+            "sink_latent_frames": 1,
+            "num_recent_frames": 1,
+        }
     if method == "lightforcing":
         return {
             "num_output_frames": spec["latents_20s"],
@@ -560,7 +572,7 @@ class GpuWatchdog:
 
 # Variant method keys: an experiment method that runs an existing backend
 # under a different base config. Tags/results keep the variant name.
-BACKEND_OF = {"osa2": "osa", "osa2s": "osa"}
+BACKEND_OF = {"osa2": "osa", "osa2s": "osa", "osa2a": "osa"}
 
 
 def sparse_args(method: str | None, method_config: dict | None) -> list[str]:

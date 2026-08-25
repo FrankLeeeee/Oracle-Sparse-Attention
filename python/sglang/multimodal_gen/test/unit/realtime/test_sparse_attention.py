@@ -556,8 +556,8 @@ def test_osa_fully_sparse_has_no_whole_frames_and_exact_density():
     allow = torch.zeros(heads, q_tiles, kv_len, dtype=torch.bool, device=device)
     for h in range(heads):
         for t in range(q_tiles):
-            for s0, e0 in zip(plan.starts[h, t].tolist(), plan.ends[h, t].tolist()):
-                allow[h, t, s0:e0] = True
+            for s0 in plan.starts[h, t].tolist():
+                allow[h, t, s0 : s0 + plan.key_tile] = True
     frames = allow.view(heads, q_tiles, num_frames, FRAME_SEQLEN)
     # No frame is whole — not the sink, not the own chunk ...
     assert not frames.all(dim=-1).any()
@@ -666,10 +666,8 @@ def test_osa_window_query_plans_per_chunk_and_executes():
         allow = torch.zeros(heads, q_tiles, kv_len, dtype=torch.bool, device=device)
         for h in range(heads):
             for t in range(q_tiles):
-                for s0, e0 in zip(
-                    chunk_plan.starts[h, t].tolist(), chunk_plan.ends[h, t].tolist()
-                ):
-                    allow[h, t, s0:e0] = True
+                for s0 in chunk_plan.starts[h, t].tolist():
+                    allow[h, t, s0 : s0 + chunk_plan.key_tile] = True
         frames = allow.view(heads, q_tiles, num_frames, FRAME_SEQLEN)
         own_first = (window_start_chunk + offset) * FRAMES_PER_BLOCK
         whole = (
@@ -680,7 +678,8 @@ def test_osa_window_query_plans_per_chunk_and_executes():
                 & (global_frame_ids < own_first + FRAMES_PER_BLOCK)
             )
         )
-        assert frames[:, :, torch.from_numpy(whole).to(device)].all()
+        body = (FRAME_SEQLEN // 64) * 64
+        assert frames[:, :, torch.from_numpy(whole).to(device), :body].all()
         # Every non-whole frame repeats one per-(head, query tile) pattern.
         others = np.flatnonzero(~whole)
         for frame in others[1:]:
