@@ -112,11 +112,12 @@ MODELS = {
     },
 }
 
-METHODS = ("osa", "lightforcing", "radial", "svg1", "svg2", "xattention", "sta")
+METHODS = ("osa", "osa2", "lightforcing", "radial", "svg1", "svg2", "xattention", "sta")
 
 METHOD_LABELS = {
     "dense": "Dense",
     "osa": "OSA",
+    "osa2": "OSA-2D",
     "lightforcing": "LightForcing",
     "radial": "Radial",
     "svg1": "SVG1",
@@ -138,6 +139,10 @@ def method_base_config(method: str, model: str) -> dict:
     sink = spec["sink_frames"]
     if method == "osa":
         return {"sink_latent_frames": 1, "num_recent_frames": 1}
+    if method == "osa2":
+        # The 2-D frame-to-frame pattern with nothing kept whole: sink and
+        # own chunk are sparse too, so the density knob has no floor.
+        return {"query_tiled": True, "keep_whole_frames": False}
     if method == "lightforcing":
         return {
             "num_output_frames": spec["latents_20s"],
@@ -548,10 +553,15 @@ class GpuWatchdog:
         self._thread.join(timeout=5)
 
 
+# Variant method keys: an experiment method that runs an existing backend
+# under a different base config. Tags/results keep the variant name.
+BACKEND_OF = {"osa2": "osa"}
+
+
 def sparse_args(method: str | None, method_config: dict | None) -> list[str]:
     args = []
     if method is not None:
-        args += ["--sparse-attention", method]
+        args += ["--sparse-attention", BACKEND_OF.get(method, method)]
         if method_config:
             args += ["--sparse-attention-config", json.dumps(method_config)]
     return args

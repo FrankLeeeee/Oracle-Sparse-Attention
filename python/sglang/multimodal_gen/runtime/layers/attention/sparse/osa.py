@@ -96,6 +96,15 @@ class OsaConfig(msgspec.Struct, frozen=True):
     query_tiled: bool = False
     # Query tiling quantum of the 2-D pattern; also the kernel's BLOCK_M.
     query_tile: int = 128
+    # Keep the query's own chunk, the sink and the recent band as whole
+    # frames (the classic OSA geometry). False applies the frozen tile
+    # pattern to *every* visible frame — own chunk and sink included — which
+    # removes the whole-frame density floor entirely: the achieved per-call
+    # density equals the knob for every chunk after chunk 0. The own-chunk
+    # sections are exactly what chunk 0 calibrated on, so the pattern is
+    # in-distribution there; sink/recent lose their whole-frame privilege
+    # and compete for tiles like any other frame.
+    keep_whole_frames: bool = True
     # Query sub-sampling of the calibration passes. The per-head tile profile
     # is an average over thousands of queries, so a stride of 8 costs 1/8 of
     # the recompute and moves the profile by well under a percent.
@@ -559,11 +568,14 @@ class OracleSparseAttention(SparseAttentionBackend):
         if not own.any():
             return None
         ages = frame_ages(layout, query_chunk_offset=query_chunk_offset)
-        full = (
-            own
-            | layout.sink_frames(self._sink_frames())
-            | ((ages > 0) & (ages <= self._config.num_recent_frames))
-        )
+        if self._config.keep_whole_frames:
+            full = (
+                own
+                | layout.sink_frames(self._sink_frames())
+                | ((ages > 0) & (ages <= self._config.num_recent_frames))
+            )
+        else:
+            full = np.zeros(num_frames, dtype=bool)
         num_full = int(full.sum())
         num_other = num_frames - num_full
         budget = self._density * num_frames * frame_seqlen
@@ -574,6 +586,10 @@ class OracleSparseAttention(SparseAttentionBackend):
             max(0, int(round(remaining / (num_other * tile_size)))),
             num_tiles,
         )
+        if not self._config.keep_whole_frames:
+            # With no whole frames a zero-tile plan would attend to nothing;
+            # one tile per frame is the geometry's true floor.
+            tiles_kept = max(1, tiles_kept)
         frame_ids = torch.arange(num_frames, dtype=torch.int32, device=device)
         full_frames = torch.from_numpy(full).to(device)
         return build_block_plan(
@@ -622,11 +638,14 @@ class OracleSparseAttention(SparseAttentionBackend):
             # this supports; an unmapped chunk keeps everything to stay safe.
             return None
         ages = frame_ages(layout, query_chunk_offset=query_chunk_offset)
-        full = (
-            own
-            | layout.sink_frames(self._sink_frames())
-            | ((ages > 0) & (ages <= self._config.num_recent_frames))
-        )
+        if self._config.keep_whole_frames:
+            full = (
+                own
+                | layout.sink_frames(self._sink_frames())
+                | ((ages > 0) & (ages <= self._config.num_recent_frames))
+            )
+        else:
+            full = np.zeros(num_frames, dtype=bool)
         num_full = int(full.sum())
         num_other = num_frames - num_full
         budget = self._density * num_frames * frame_seqlen
@@ -637,6 +656,10 @@ class OracleSparseAttention(SparseAttentionBackend):
             max(0, int(round(remaining / (num_other * tile_size)))),
             num_tiles,
         )
+        if not self._config.keep_whole_frames:
+            # With no whole frames a zero-tile plan would attend to nothing;
+            # one tile per frame is the geometry's true floor.
+            tiles_kept = max(1, tiles_kept)
         full_frames = torch.from_numpy(full).to(device)
         frame_starts = (
             torch.arange(num_frames, dtype=torch.int64, device=device) * frame_seqlen

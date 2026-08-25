@@ -665,6 +665,63 @@ def test_osa_query_tiled_pattern_is_per_query_tile_and_exact():
 
 
 @requires_cuda
+def test_osa_fully_sparse_has_no_whole_frames_and_exact_density():
+    """OSA 2-D with keep_whole_frames=False: no frame is kept whole — sink and
+    own chunk get the frozen tile pattern like every other frame — and the
+    achieved per-call density equals the knob (no floor)."""
+    from sglang.multimodal_gen.runtime.layers.attention.sparse.block_kernel import (
+        BlockSparsePlan,
+    )
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    query_tile = 128
+    density = 0.3
+    backend = build_sparse_attention_backend(
+        "osa",
+        {
+            "density": density,
+            "spatial_tile": 64,
+            "calibration_query_stride": 4,
+            "query_tiled": True,
+            "query_tile": query_tile,
+            "keep_whole_frames": False,
+        },
+    )
+
+    backend.begin_forward(_geometry(0))
+    assert backend.attend(_self_forcing_call(device, chunk_index=0)) is None
+
+    # Even chunk 1 — where the whole-frame geometry used to force density
+    # far above the knob — now runs at the knob.
+    for chunk_index in (1, 9):
+        call = _self_forcing_call(device, chunk_index=chunk_index)
+        backend.begin_forward(_geometry(chunk_index))
+        out = backend.attend(call)
+        assert out is not None and out.shape == call.query.shape
+
+    plan = backend._plans._entries[0][1]
+    assert isinstance(plan, BlockSparsePlan)
+    heads = 4
+    kv_len = 10 * FRAMES_PER_BLOCK * FRAME_SEQLEN
+    num_frames = kv_len // FRAME_SEQLEN
+    q_tiles = -(-FRAME_SEQLEN // query_tile)
+    allow = torch.zeros(heads, q_tiles, kv_len, dtype=torch.bool, device=device)
+    for h in range(heads):
+        for t in range(q_tiles):
+            for s0, e0 in zip(plan.starts[h, t].tolist(), plan.ends[h, t].tolist()):
+                allow[h, t, s0:e0] = True
+    frames = allow.view(heads, q_tiles, num_frames, FRAME_SEQLEN)
+    # No frame is whole — not the sink, not the own chunk ...
+    assert not frames.all(dim=-1).any()
+    # ... every frame gets the same per-query-tile pattern ...
+    for frame in range(1, num_frames):
+        assert torch.equal(frames[:, :, frame], frames[:, :, 0])
+    # ... and the density tracks the knob without a floor.
+    assert abs(plan.density - density) < 0.05
+
+
+@requires_cuda
 def test_osa_window_query_plans_per_chunk_and_executes():
     """A rolling-window call (multi-chunk query, Rolling Forcing) gets one plan
     per query chunk: each chunk keeps its *own* whole frames — its chunk, the
