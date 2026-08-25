@@ -100,6 +100,16 @@ class OsaConfig(msgspec.Struct, frozen=True):
     spatial_tile: int = 64
     # Query tiling quantum of the frozen pattern; also the kernel's BLOCK_M.
     query_tile: int = 128
+    # How the frozen per-(head, query tile) key-tile set is fit from the
+    # measured mass profile:
+    #   "topk"   — independent per-tile top-k (the default; fully non-
+    #              parametric, inherits all measurement noise).
+    #   "smooth" — 1-2-1 smoothing of the mass profile before top-k; a light
+    #              regularizer against single-tile measurement noise.
+    #   "band"   — the best contiguous tile window (max sliding-window mass):
+    #              the strongest regularizer, matching the diagonal-band
+    #              structure the section maps show.
+    pattern_fit: str = "topk"
     # Query sub-sampling of the calibration passes. The per-tile profile is an
     # average over many queries, so a stride of 8 costs 1/8 of the recompute
     # and moves the profile by well under a percent.
@@ -192,7 +202,11 @@ class OracleSparseAttention(SparseAttentionBackend):
         # layer -> [heads, q_tiles, k_tiles] key tiles by descending mass,
         # frozen at the first post-calibration chunk.
         self._section_order: dict[int, torch.Tensor] = {}
+        # pattern_fit="band": [heads, q_tiles, full_tiles] mass kept for
+        # per-budget band placement.
+        self._section_band_mass: dict[int, torch.Tensor] = {}
         self._plans = LayoutCache()
+        self._band_mass_layer = -1
         self._last_chunk_index = -1
         self._logged_summary = False
 
@@ -207,6 +221,7 @@ class OracleSparseAttention(SparseAttentionBackend):
     def reset(self) -> None:
         self._section_mass.clear()
         self._section_order.clear()
+        self._section_band_mass.clear()
         self._plans.clear()
         self._last_chunk_index = -1
         self._logged_summary = False
@@ -296,10 +311,18 @@ class OracleSparseAttention(SparseAttentionBackend):
             # keeps the same token count — the kernel's uniform trip count.
             # Whole frames still include the tail.
             full_tiles = layout.frame_seqlen // self._config.spatial_tile
-            order = torch.argsort(mass[:, :, :full_tiles], dim=2, descending=True).to(
-                torch.int32
-            )
+            body = mass[:, :, :full_tiles]
+            if self._config.pattern_fit == "smooth":
+                # 1-2-1 smoothing along the key-tile axis, a light regularizer
+                # against single-tile measurement noise.
+                padded = torch.nn.functional.pad(body, (1, 1), mode="replicate")
+                body = (padded[:, :, :-2] + 2 * body + padded[:, :, 2:]) / 4
+            order = torch.argsort(body, dim=2, descending=True).to(torch.int32)
             self._section_order[call.layer_index] = order
+            if self._config.pattern_fit == "band":
+                # Band fitting places a contiguous window at plan-build time
+                # (its position depends on the chunk's tile budget).
+                self._section_band_mass[call.layer_index] = body.contiguous()
             self._section_mass.pop(call.layer_index, None)
         num_query_chunks, ragged = divmod(layout.query_frames, layout.frames_per_block)
         if ragged:
@@ -323,6 +346,7 @@ class OracleSparseAttention(SparseAttentionBackend):
                 f"{call.layer_index} has {call.num_local_heads}"
             )
             return None
+        self._band_mass_layer = call.layer_index
         if num_query_chunks == 1:
             plan = self._chunk_plan(layout, order, query_chunk_offset=0)
         else:
@@ -382,8 +406,18 @@ class OracleSparseAttention(SparseAttentionBackend):
         )
         frame_ids = torch.arange(num_frames, dtype=torch.int32, device=device)
         full_frames = torch.from_numpy(full).to(device)
+        tiles = order[:, :, :tiles_kept]
+        band_mass = self._section_band_mass.get(self._band_mass_layer)
+        if band_mass is not None:
+            # Best contiguous window of tiles_kept tiles per (head, q tile):
+            # max sliding-window mass via a cumulative sum.
+            csum = torch.nn.functional.pad(band_mass.cumsum(dim=2), (1, 0))
+            window = csum[:, :, tiles_kept:] - csum[:, :, :-tiles_kept]
+            start = window.argmax(dim=2, keepdim=True).to(torch.int32)
+            offsets = torch.arange(tiles_kept, dtype=torch.int32, device=device)
+            tiles = start + offsets[None, None, :]
         return build_block_plan(
-            tiles=order[:, :, :tiles_kept],
+            tiles=tiles,
             hist_offsets=frame_ids[~full_frames] * frame_seqlen,
             whole_offsets=frame_ids[full_frames] * frame_seqlen,
             frame_seqlen=frame_seqlen,
