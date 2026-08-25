@@ -90,6 +90,10 @@ class OsaConfig(msgspec.Struct, frozen=True):
     keep_own_chunk_full: bool = True
     keep_sink_full: bool = True
     keep_recent_frames_full: bool = True
+    # Run the first this-many denoising forwards of every chunk dense (the
+    # early steps set the chunk's structure; proposal 3.6's hybrid-dense
+    # lever). 0 disables.
+    dense_first_steps: int = 0
     # Run the clean-latent KV-refresh pass dense. Its hidden states feed the
     # K/V every later chunk reads, so sparsification errors there compound.
     # Off by default to keep the read-density comparable with the baselines
@@ -194,6 +198,7 @@ class OracleSparseAttention(SparseAttentionBackend):
         self._section_order: dict[int, torch.Tensor] = {}
         self._plans = LayoutCache()
         self._last_chunk_index = -1
+        self._forwards_this_chunk = 0
         self._logged_summary = False
 
     def _on_begin_forward(self, geometry: ChunkGeometry) -> None:
@@ -202,6 +207,10 @@ class OracleSparseAttention(SparseAttentionBackend):
             # A new video restarts the chunk counter; the previous video's
             # calibration says nothing about this one.
             self.reset()
+        if chunk_index != self._last_chunk_index:
+            self._forwards_this_chunk = 0
+        else:
+            self._forwards_this_chunk += 1
         self._last_chunk_index = chunk_index
 
     def reset(self) -> None:
@@ -209,6 +218,7 @@ class OracleSparseAttention(SparseAttentionBackend):
         self._section_order.clear()
         self._plans.clear()
         self._last_chunk_index = -1
+        self._forwards_this_chunk = 0
         self._logged_summary = False
 
     def prepare(
@@ -265,6 +275,12 @@ class OracleSparseAttention(SparseAttentionBackend):
         self, call: SparseAttentionCall, layout: VisibleLayout
     ) -> BlockSparsePlan | tuple[BlockSparsePlan | None, ...] | None:
         if self._config.dense_cache_update and self.in_cache_update:
+            return None
+        if (
+            self._config.dense_first_steps > 0
+            and not self.in_cache_update
+            and self._forwards_this_chunk < self._config.dense_first_steps
+        ):
             return None
         if layout.query_chunk_index == 0:
             # Chunk 0 runs dense; every denoising step overwrites the
