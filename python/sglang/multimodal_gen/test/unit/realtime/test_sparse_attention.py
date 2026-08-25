@@ -580,6 +580,91 @@ def test_osa_freezes_the_last_chunk0_step_and_replicates():
 
 
 @requires_cuda
+def test_osa_query_tiled_pattern_is_per_query_tile_and_exact():
+    """OSA 2-D mode: each query tile freezes its own key-tile set, the plan
+    replicates one section pattern over every history frame, whole frames stay
+    whole for every query tile, and the block-sparse kernel matches a masked
+    reference."""
+    from sglang.multimodal_gen.runtime.layers.attention.sparse.block_kernel import (
+        BlockSparsePlan,
+    )
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    query_tile = 128
+    backend = build_sparse_attention_backend(
+        "osa",
+        {
+            "density": 0.4,
+            "num_recent_frames": 1,
+            "sink_latent_frames": 1,
+            "spatial_tile": 64,
+            "calibration_query_stride": 4,
+            "query_tiled": True,
+            "query_tile": query_tile,
+        },
+    )
+
+    backend.begin_forward(_geometry(0))
+    for _ in range(2):  # chunk 0 runs dense while measuring the section map
+        assert backend.attend(_self_forcing_call(device, chunk_index=0)) is None
+    assert 0 in backend._section_mass
+    q_tiles = -(-FRAME_SEQLEN // query_tile)
+    assert backend._section_mass[0].shape[1] == q_tiles
+
+    chunk_index = 9
+    call = _self_forcing_call(device, chunk_index=chunk_index)
+    backend.begin_forward(_geometry(chunk_index))
+    out = backend.attend(call)
+    assert out is not None and out.shape == call.query.shape
+
+    plan = backend._plans._entries[0][1]
+    assert isinstance(plan, BlockSparsePlan)
+    heads = call.query.shape[2]
+    kv_len = call.key.shape[1]
+    num_frames = kv_len // FRAME_SEQLEN
+
+    # Rebuild the kept mask per (head, query tile) from the plan's block list.
+    allow = torch.zeros(heads, q_tiles, kv_len, dtype=torch.bool, device=device)
+    for h in range(heads):
+        for t in range(q_tiles):
+            for s0, e0 in zip(plan.starts[h, t].tolist(), plan.ends[h, t].tolist()):
+                allow[h, t, s0:e0] = True
+    frames = allow.view(heads, q_tiles, num_frames, FRAME_SEQLEN)
+    # own chunk, sink and recent frames are whole for every query tile ...
+    assert frames[:, :, 0].all() and frames[:, :, -FRAMES_PER_BLOCK - 1 :].all()
+    # ... every history frame repeats one section pattern ...
+    for frame in range(2, num_frames - FRAMES_PER_BLOCK - 1):
+        assert torch.equal(frames[:, :, frame], frames[:, :, 1])
+    # ... and at least two query tiles of some head keep different key sets
+    # (the whole point of the 2-D pattern).
+    assert any(
+        not torch.equal(frames[h, 0, 1], frames[h, t, 1])
+        for h in range(heads)
+        for t in range(1, q_tiles)
+    )
+    density = allow.float().mean().item()
+    assert abs(density - 0.4) < 0.1
+    assert abs(plan.density - density) < 2e-2
+
+    # The block-sparse kernel computes exactly the masked attention. The mask
+    # varies per query tile, so expand it to per-row before masking.
+    row_tile = (
+        torch.arange(call.query.shape[1], device=device) % FRAME_SEQLEN
+    ) // query_tile
+    scores = (
+        torch.einsum("qhd,khd->hqk", call.query[0].float(), call.key[0].float())
+        * call.softmax_scale
+    )
+    row_allow = allow[:, row_tile, :]  # [heads, q_len, kv_len]
+    scores = scores.masked_fill(~row_allow, float("-inf"))
+    reference = torch.softmax(scores, dim=-1) @ call.value[0].float().permute(1, 0, 2)
+    torch.testing.assert_close(
+        out[0].float(), reference.permute(1, 0, 2), atol=3e-2, rtol=3e-2
+    )
+
+
+@requires_cuda
 def test_osa_window_query_plans_per_chunk_and_executes():
     """A rolling-window call (multi-chunk query, Rolling Forcing) gets one plan
     per query chunk: each chunk keeps its *own* whole frames — its chunk, the

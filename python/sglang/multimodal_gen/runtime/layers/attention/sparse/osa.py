@@ -43,6 +43,11 @@ from sglang.multimodal_gen.runtime.layers.attention.sparse.context import (
     ChunkGeometry,
     VisibleLayout,
 )
+from sglang.multimodal_gen.runtime.layers.attention.sparse.block_kernel import (
+    BlockSparsePlan,
+    block_sparse_attention,
+    build_block_plan,
+)
 from sglang.multimodal_gen.runtime.layers.attention.sparse.replicate_kernel import (
     ReplicateGatherPlan,
     build_gather_plan,
@@ -83,6 +88,14 @@ class OsaConfig(msgspec.Struct, frozen=True):
     # Spatial selection quantum in key tokens; 64 matches the kernel's key
     # tile, so a kept tile is never partially wasted.
     spatial_tile: int = 64
+    # 2-D pattern: freeze one tile set *per query tile* instead of one per
+    # head. Same token budget per query, but the kept keys follow the strong
+    # within-frame diagonal the 1-D marginal destroys (recall 0.68 vs 0.25 on
+    # history frames at matched density). Runs through the uniform
+    # block-sparse Triton kernel instead of gather + FA3.
+    query_tiled: bool = False
+    # Query tiling quantum of the 2-D pattern; also the kernel's BLOCK_M.
+    query_tile: int = 128
     # Query sub-sampling of the calibration passes. The per-head tile profile
     # is an average over thousands of queries, so a stride of 8 costs 1/8 of
     # the recompute and moves the profile by well under a percent.
@@ -130,6 +143,57 @@ def measure_spatial_tile_mass(
     )
     padded[:, :frame_seqlen] = spatial_mass
     return padded.view(num_heads, num_tiles, spatial_tile).sum(-1)
+
+
+@torch.no_grad()
+def measure_section_tile_mass(
+    *,
+    query: torch.Tensor,  # [batch, q_len, heads, head_dim]
+    key: torch.Tensor,  # [batch, kv_len, heads, head_dim]
+    layout: VisibleLayout,
+    softmax_scale: float,
+    query_stride: int,
+    query_tile: int,
+    spatial_tile: int,
+) -> torch.Tensor:
+    """Mean attention mass per (query tile, key tile): ``[heads, q_tiles, k_tiles]``.
+
+    The 2-D analogue of :func:`measure_spatial_tile_mass`: the key axis is
+    folded modulo the frame exactly as there, but the query axis keeps its
+    within-frame tile identity instead of being averaged away. Query frames
+    still fold together — the frame-to-frame pattern is per *section*, and all
+    sections of a head share it.
+    """
+    frame_seqlen = layout.frame_seqlen
+    num_frames = layout.num_frames
+    num_heads = query.shape[2]
+    k_tiles = (frame_seqlen + spatial_tile - 1) // spatial_tile
+    q_tiles = (frame_seqlen + query_tile - 1) // query_tile
+    device = query.device
+
+    positions = torch.arange(0, query.shape[1], query_stride, device=device)
+    sampled = query[:1, ::query_stride]
+    bucket = (positions % frame_seqlen) // query_tile  # [nq]
+    keys = key[:1]
+    mass = torch.zeros(
+        num_heads, q_tiles, k_tiles, dtype=torch.float32, device=device
+    )
+    counts = torch.zeros(q_tiles, dtype=torch.float32, device=device)
+    counts.index_add_(0, bucket, torch.ones_like(bucket, dtype=torch.float32))
+    block = 256
+    for start in range(0, sampled.shape[1], block):
+        tile = sampled[:, start : start + block]
+        scores = torch.einsum("bqhd,bkhd->hqk", tile.float(), keys.float())
+        probs = torch.softmax(scores * softmax_scale, dim=-1)
+        folded = probs.view(num_heads, -1, num_frames, frame_seqlen).sum(2)
+        padded = torch.zeros(
+            num_heads, folded.shape[1], k_tiles * spatial_tile, device=device
+        )
+        padded[:, :, :frame_seqlen] = folded
+        per_tile = padded.view(num_heads, -1, k_tiles, spatial_tile).sum(-1)
+        mass.index_add_(1, bucket[start : start + block], per_tile)
+    mass /= counts.clamp(min=1.0)[None, :, None]
+    return mass
 
 
 def frame_ages(layout: VisibleLayout, *, query_chunk_offset: int = 0) -> np.ndarray:
@@ -187,6 +251,9 @@ class OracleSparseAttention(SparseAttentionBackend):
         # layer -> [heads, tiles] tile indices by descending mass, frozen at
         # the first post-calibration chunk.
         self._tile_order: dict[int, torch.Tensor] = {}
+        # 2-D variants of the two dicts above: [heads, q_tiles, k_tiles].
+        self._section_mass: dict[int, torch.Tensor] = {}
+        self._section_order: dict[int, torch.Tensor] = {}
         self._plans = LayoutCache()
         self._last_chunk_index = -1
         self._logged_summary = False
@@ -202,6 +269,8 @@ class OracleSparseAttention(SparseAttentionBackend):
     def reset(self) -> None:
         self._spatial_mass.clear()
         self._tile_order.clear()
+        self._section_mass.clear()
+        self._section_order.clear()
         self._plans.clear()
         self._last_chunk_index = -1
         self._logged_summary = False
@@ -224,6 +293,52 @@ class OracleSparseAttention(SparseAttentionBackend):
         if plan is None:
             self._record_density(None, kv_len=call.key.shape[1])
             return None
+        if isinstance(plan, BlockSparsePlan):
+            self._record_density(
+                None, kv_len=call.key.shape[1], fraction=plan.density
+            )
+            return block_sparse_attention(
+                query=call.query,
+                key=call.key,
+                value=call.value,
+                plan=plan,
+                softmax_scale=call.softmax_scale,
+            )
+        if isinstance(plan, tuple):
+            # A rolling window: one 2-D plan per query chunk over the shared
+            # KV view; a None entry keeps that chunk dense-equivalent, which
+            # the block kernel cannot express, so it runs whole-frame keeps
+            # via a keep-everything plan built by _chunk_plan_2d's caller.
+            tokens = layout.frames_per_block * layout.frame_seqlen
+            outputs = []
+            fractions = []
+            for index, chunk_plan in enumerate(plan):
+                query_slice = call.query[:, index * tokens : (index + 1) * tokens]
+                if chunk_plan is None:
+                    outputs.append(None)
+                    fractions.append(1.0)
+                    continue
+                outputs.append(
+                    block_sparse_attention(
+                        query=query_slice,
+                        key=call.key,
+                        value=call.value,
+                        plan=chunk_plan,
+                        softmax_scale=call.softmax_scale,
+                    )
+                )
+                fractions.append(chunk_plan.density)
+            if any(out is None for out in outputs):
+                # Mixed sparse/dense window: fall back to dense for the whole
+                # call rather than splicing partial outputs.
+                self._record_density(None, kv_len=call.key.shape[1])
+                return None
+            self._record_density(
+                None,
+                kv_len=call.key.shape[1],
+                fraction=sum(fractions) / len(fractions),
+            )
+            return torch.cat(outputs, dim=1)
         self._record_density(None, kv_len=call.key.shape[1], fraction=plan.density)
         if isinstance(plan, ReplicateGatherPlan):
             return replicate_gather_attention(
@@ -257,16 +372,29 @@ class OracleSparseAttention(SparseAttentionBackend):
             # when the per-head pattern has settled. The clean-latent
             # KV-refresh pass runs after the last step and must not overwrite.
             if not self.in_cache_update:
-                self._spatial_mass[call.layer_index] = measure_spatial_tile_mass(
-                    query=call.query,
-                    key=call.key,
-                    layout=layout,
-                    softmax_scale=call.softmax_scale,
-                    query_stride=self._config.calibration_query_stride,
-                    query_tile=self._config.calibration_query_tile,
-                    spatial_tile=self._config.spatial_tile,
-                )
+                if self._config.query_tiled:
+                    self._section_mass[call.layer_index] = measure_section_tile_mass(
+                        query=call.query,
+                        key=call.key,
+                        layout=layout,
+                        softmax_scale=call.softmax_scale,
+                        query_stride=self._config.calibration_query_stride,
+                        query_tile=self._config.query_tile,
+                        spatial_tile=self._config.spatial_tile,
+                    )
+                else:
+                    self._spatial_mass[call.layer_index] = measure_spatial_tile_mass(
+                        query=call.query,
+                        key=call.key,
+                        layout=layout,
+                        softmax_scale=call.softmax_scale,
+                        query_stride=self._config.calibration_query_stride,
+                        query_tile=self._config.calibration_query_tile,
+                        spatial_tile=self._config.spatial_tile,
+                    )
             return None
+        if self._config.query_tiled:
+            return self._prepare_plan_2d(call, layout)
         order = self._tile_order.get(call.layer_index)
         if order is None:
             mass = self._spatial_mass.get(call.layer_index)
@@ -350,6 +478,113 @@ class OracleSparseAttention(SparseAttentionBackend):
         self._plans.put(call.layer_index, signature, plan)
         self._log_summary(layout)
         return plan
+
+    def _prepare_plan_2d(
+        self, call: SparseAttentionCall, layout: VisibleLayout
+    ) -> BlockSparsePlan | tuple[BlockSparsePlan, ...] | None:
+        order = self._section_order.get(call.layer_index)
+        if order is None:
+            mass = self._section_mass.get(call.layer_index)
+            if mass is None:
+                self.warn_dense_once(
+                    f"layer {call.layer_index} was never calibrated "
+                    "(chunk 0 not seen)"
+                )
+                return None
+            # As in the 1-D path, the frame's short tail tile is excluded from
+            # selection so every (head, query tile) keeps the same token count
+            # (the kernel's uniform trip count); whole frames still include it.
+            full_tiles = layout.frame_seqlen // self._config.spatial_tile
+            order = torch.argsort(
+                mass[:, :, :full_tiles], dim=2, descending=True
+            ).to(torch.int32)
+            self._section_order[call.layer_index] = order
+            self._section_mass.pop(call.layer_index, None)
+        num_query_chunks, ragged = divmod(
+            layout.query_frames, layout.frames_per_block
+        )
+        if ragged:
+            self.warn_dense_once(
+                f"query spans {layout.query_frames} frames, not a whole number "
+                f"of {layout.frames_per_block}-frame chunks"
+            )
+            return None
+        signature = (
+            call.key_segments,
+            layout.query_frames,
+            call.head_start,
+            call.num_local_heads,
+        )
+        hit, cached = self._plans.get(call.layer_index, signature)
+        if hit:
+            return cached
+        if order.shape[0] != call.num_local_heads:
+            self.warn_dense_once(
+                f"calibrated {order.shape[0]} heads but layer "
+                f"{call.layer_index} has {call.num_local_heads}"
+            )
+            return None
+        if num_query_chunks == 1:
+            plan = self._chunk_plan_2d(layout, order, query_chunk_offset=0)
+        else:
+            plans = tuple(
+                self._chunk_plan_2d(layout, order, query_chunk_offset=offset)
+                for offset in range(num_query_chunks)
+            )
+            plan = None if all(entry is None for entry in plans) else plans
+        self._plans.put(call.layer_index, signature, plan)
+        self._log_summary(layout)
+        return plan
+
+    def _chunk_plan_2d(
+        self,
+        layout: VisibleLayout,
+        order: torch.Tensor,  # [heads, q_tiles, full_tiles] by descending mass
+        *,
+        query_chunk_offset: int,
+    ) -> BlockSparsePlan | None:
+        """One query chunk's 2-D plan, or ``None`` if it keeps everything.
+
+        The kept-whole frames and the tile budget are computed exactly as in
+        the 1-D :meth:`_chunk_plan`; only the shape of the kept set differs —
+        each query tile gets its own top tiles instead of the head's.
+        """
+        num_heads, q_tiles, num_tiles = order.shape
+        frame_seqlen = layout.frame_seqlen
+        tile_size = self._config.spatial_tile
+        num_frames = layout.num_frames
+        device = order.device
+
+        own = layout.frames_of_offset(query_chunk_offset)
+        if not own.any():
+            return None
+        ages = frame_ages(layout, query_chunk_offset=query_chunk_offset)
+        full = (
+            own
+            | layout.sink_frames(self._sink_frames())
+            | ((ages > 0) & (ages <= self._config.num_recent_frames))
+        )
+        num_full = int(full.sum())
+        num_other = num_frames - num_full
+        budget = self._density * num_frames * frame_seqlen
+        remaining = budget - num_full * frame_seqlen
+        if num_other == 0 or remaining >= num_other * frame_seqlen:
+            return None  # everything is kept
+        tiles_kept = min(
+            max(0, int(round(remaining / (num_other * tile_size)))),
+            num_tiles,
+        )
+        frame_ids = torch.arange(num_frames, dtype=torch.int32, device=device)
+        full_frames = torch.from_numpy(full).to(device)
+        return build_block_plan(
+            tiles=order[:, :, :tiles_kept],
+            hist_offsets=frame_ids[~full_frames] * frame_seqlen,
+            whole_offsets=frame_ids[full_frames] * frame_seqlen,
+            frame_seqlen=frame_seqlen,
+            query_tile=self._config.query_tile,
+            key_tile=tile_size,
+            kv_len=layout.kv_len,
+        )
 
     def _keep_all_plan(
         self,
@@ -446,7 +681,7 @@ class OracleSparseAttention(SparseAttentionBackend):
             "OSA frozen from chunk 0's last denoising step: "
             "%d layers, target density %.2f, %d recent + %d sink frames kept "
             "whole; visible window %d frames",
-            len(self._tile_order),
+            max(len(self._tile_order), len(self._section_order)),
             self._density,
             self._config.num_recent_frames,
             self._sink_frames(),
