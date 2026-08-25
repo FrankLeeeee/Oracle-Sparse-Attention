@@ -26,8 +26,9 @@ once during generation:
 2. Each ``(layer, head, query tile)`` freezes its key tiles ordered by
    descending mass. On every later chunk the token budget buys each query
    tile its top-mass key tiles — the *same* set in every replicated frame.
-   ``whole_frames`` chooses which frames are exempt from the pattern and kept
-   whole instead. ``density`` (fraction of visible keys read) is met exactly
+   The ``keep_own_chunk_full`` / ``keep_sink_full`` /
+   ``keep_recent_frames_full`` switches choose which frames are exempt from
+   the pattern and kept whole instead. ``density`` (fraction of visible keys read) is met exactly
    by construction.
 3. Execution runs through the uniform block-sparse Triton kernel
    (``block_kernel.py``): every (head, query tile) keeps the same number of
@@ -57,8 +58,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-_WHOLE_FRAME_MODES = ("all", "anchors", "sink", "none")
-
 
 class OsaConfig(msgspec.Struct, frozen=True):
     """Knobs of Oracle Sparse Attention.
@@ -69,30 +68,28 @@ class OsaConfig(msgspec.Struct, frozen=True):
     define how much of the video's start counts as the sink.
     """
 
-    # Fraction of visible keys read. Frames selected by `whole_frames` are
-    # kept whole; the remaining budget buys each (head, query tile) its
-    # top-mass key tiles, the same set in every other frame.
+    # Fraction of visible keys read. Frames selected by the keep_*_full
+    # switches are kept whole; the remaining budget buys each (head, query
+    # tile) its top-mass key tiles, the same set in every other frame.
     density: float | None = None
     sparsity: float | None = None
     sink_chunks: int = 1
     # Sink size in latent frames; None falls back to sink_chunks whole chunks.
     # 1 is the classic first-frame sink.
     sink_latent_frames: int | None = None
-    # Most-recent past latent frames kept whole under whole_frames="all",
-    # counted against the density budget.
+    # How many most-recent past latent frames keep_recent_frames_full keeps
+    # whole, counted against the density budget.
     num_recent_frames: int = 2
-    # Which frames are exempt from the tile pattern and kept whole:
-    #   "all"  — the query's own chunk, the sink and the recent band. The
-    #            classic geometry; the whole-frame keeps set a density floor
-    #            (their share of the visible window).
-    #   "anchors" — the sink and the recent band, the two frames the model
-    #            re-anchors on (global composition and temporal smoothness);
-    #            the own chunk runs the pattern, which chunk 0's own-chunk
-    #            sections calibrated directly.
-    #   "sink" — only the sink frames.
-    #   "none" — nothing is whole; density equals the knob at every chunk
-    #            after chunk 0 (at least one tile per frame is always kept).
-    whole_frames: str = "all"
+    # Which frames are exempt from the tile pattern and kept whole ("full").
+    # The three exemptions are independent; their union is the kept-whole set,
+    # and its share of the visible window is the density floor. All three on
+    # is the classic geometry (fastest at matched density, highest PSNR);
+    # sink + recent alone are the two anchor frames whose dense keeps prevent
+    # the chunk-periodic camera oscillation of the fully sparse setting; all
+    # three off has no floor but shakes and corrupts below ~0.2.
+    keep_own_chunk_full: bool = True
+    keep_sink_full: bool = True
+    keep_recent_frames_full: bool = True
     # Run the clean-latent KV-refresh pass dense. Its hidden states feed the
     # K/V every later chunk reads, so sparsification errors there compound.
     # Off by default to keep the read-density comparable with the baselines
@@ -185,11 +182,6 @@ class OracleSparseAttention(SparseAttentionBackend):
         if density is None or not 0.0 < density <= 1.0:
             raise ValueError(
                 "osa needs density in (0, 1] " "(or the equivalent sparsity in [0, 1))"
-            )
-        if config.whole_frames not in _WHOLE_FRAME_MODES:
-            raise ValueError(
-                f"whole_frames must be one of {_WHOLE_FRAME_MODES}, "
-                f"got {config.whole_frames!r}"
             )
         self._density = density
         self._config = config
@@ -346,16 +338,14 @@ class OracleSparseAttention(SparseAttentionBackend):
     def _whole_frame_mask(
         self, layout: VisibleLayout, own: np.ndarray, ages: np.ndarray
     ) -> np.ndarray:
-        mode = self._config.whole_frames
-        if mode == "none":
-            return np.zeros(layout.num_frames, dtype=bool)
-        sink = layout.sink_frames(self._sink_frames())
-        if mode == "sink":
-            return sink
-        recent = (ages > 0) & (ages <= self._config.num_recent_frames)
-        if mode == "anchors":
-            return sink | recent
-        return own | sink | recent
+        full = np.zeros(layout.num_frames, dtype=bool)
+        if self._config.keep_own_chunk_full:
+            full |= own
+        if self._config.keep_sink_full:
+            full |= layout.sink_frames(self._sink_frames())
+        if self._config.keep_recent_frames_full:
+            full |= (ages > 0) & (ages <= self._config.num_recent_frames)
+        return full
 
     def _chunk_plan(
         self,
@@ -410,13 +400,15 @@ class OracleSparseAttention(SparseAttentionBackend):
         self._logged_summary = True
         logger.info(
             "OSA frozen from chunk 0's last denoising step: "
-            "%d layers, target density %.2f, whole_frames=%s "
-            "(%d recent + %d sink frames); visible window %d frames",
+            "%d layers, target density %.2f, kept full: own=%s sink=%s(%d) "
+            "recent=%s(%d); visible window %d frames",
             len(self._section_order),
             self._density,
-            self._config.whole_frames,
-            self._config.num_recent_frames,
+            self._config.keep_own_chunk_full,
+            self._config.keep_sink_full,
             self._sink_frames(),
+            self._config.keep_recent_frames_full,
+            self._config.num_recent_frames,
             layout.num_frames,
         )
 

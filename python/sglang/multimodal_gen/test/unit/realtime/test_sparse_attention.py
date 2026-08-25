@@ -532,7 +532,9 @@ def test_osa_fully_sparse_has_no_whole_frames_and_exact_density():
             "spatial_tile": 64,
             "calibration_query_stride": 4,
             "query_tile": query_tile,
-            "whole_frames": "none",
+            "keep_own_chunk_full": False,
+            "keep_sink_full": False,
+            "keep_recent_frames_full": False,
         },
     )
 

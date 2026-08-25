@@ -146,17 +146,28 @@ def method_base_config(method: str, model: str) -> dict:
         # Fully sparse OSA: nothing kept whole, so the density knob has no
         # geometric floor. (OSA itself is 2-D now; osa2 differs only in
         # whole_frames.)
-        return {"whole_frames": "none"}
+        return {
+            "keep_own_chunk_full": False,
+            "keep_sink_full": False,
+            "keep_recent_frames_full": False,
+        }
     if method == "osa2s":
         # Fully sparse except the sink frame — the dense-anchor middle ground.
-        return {"whole_frames": "sink", "sink_latent_frames": 1}
+        return {
+            "keep_own_chunk_full": False,
+            "keep_sink_full": True,
+            "keep_recent_frames_full": False,
+            "sink_latent_frames": 1,
+        }
     if method == "osa2a":
         # Fully sparse except the two anchor frames (sink + recent): fixes the
         # chunk-periodic camera oscillation of "none" (the model re-anchors
         # global composition on the sink and temporal smoothness on the recent
         # frame; both under-recalled ~0.6/0.8 when patterned).
         return {
-            "whole_frames": "anchors",
+            "keep_own_chunk_full": False,
+            "keep_sink_full": True,
+            "keep_recent_frames_full": True,
             "sink_latent_frames": 1,
             "num_recent_frames": 1,
         }

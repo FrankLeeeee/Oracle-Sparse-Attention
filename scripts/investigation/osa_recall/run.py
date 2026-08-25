@@ -78,7 +78,17 @@ def main() -> None:
         "num_recent_frames": 1,
     }
     if args.whole_frames:
-        config["whole_frames"] = args.whole_frames
+        own, sink, recent = {
+            "all": (True, True, True),
+            "anchors": (False, True, True),
+            "sink": (False, True, False),
+            "none": (False, False, False),
+        }[args.whole_frames]
+        config.update(
+            keep_own_chunk_full=own,
+            keep_sink_full=sink,
+            keep_recent_frames_full=recent,
+        )
     sparse_flags = (
         []
         if args.dense
