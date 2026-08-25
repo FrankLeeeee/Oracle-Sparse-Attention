@@ -116,11 +116,13 @@ METHODS = ("osa", "osa2", "osa2s", "osa2a", "lightforcing", "radial", "svg1", "s
 
 METHOD_LABELS = {
     "dense": "Dense",
-    "osa": "OSA",
-    "osa2": "OSA-2D",
-    "osa2s": "OSA-2D-sink",
-    "osa2a": "OSA-2D-anchors",
-    "osa1d": "OSA-1D (removed)",
+    # OSA labels are additive: bare "OSA" is the fully sparse pattern (no
+    # frames kept whole); each "+ ... full" suffix names an enabled
+    # keep_*_full switch.
+    "osa": "OSA + own chunk full + sink full + recent full",
+    "osa2": "OSA",
+    "osa2s": "OSA + sink full",
+    "osa2a": "OSA + sink full + recent full",
     "lightforcing": "LightForcing",
     "radial": "Radial",
     "svg1": "SVG1",
