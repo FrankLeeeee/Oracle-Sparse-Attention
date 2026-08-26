@@ -143,7 +143,15 @@ def method_base_config(method: str, model: str) -> dict:
     spec = MODELS[model]
     sink = spec["sink_frames"]
     if method == "osa":
-        return {"sink_latent_frames": 1, "num_recent_frames": 1}
+        # num_recent_frames is per-model optimal. 2 is the precision
+        # campaign's adopted setting (doc EbY9dmoEVoShFEx7KkScf60bnre P5): at
+        # matched density it buys full-context Self-Forcing +0.9 dB overall /
+        # +2.7 dB first-5s for free (density floor 0.26 -> 0.31). On the
+        # capped-window models the same extra dense frame blows the ~0.30
+        # budget instead (Causal Forcing floor 0.36, Rolling Forcing 0.48 —
+        # the rolling plans compound it), so they stay at 1.
+        recent = 2 if spec["window_frames"] < 0 else 1
+        return {"sink_latent_frames": 1, "num_recent_frames": recent}
     if method == "osa2":
         # Fully sparse OSA: nothing kept whole, so the density knob has no
         # geometric floor. (OSA itself is 2-D now; osa2 differs only in

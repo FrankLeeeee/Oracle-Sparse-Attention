@@ -61,7 +61,9 @@ def bullets(items: list[str]) -> str:
 def setup_section(model: str, results: dict, configs: dict) -> str:
     spec = MODELS[model]
     notes = MODEL_NOTES[model]
-    tiers = [t for t in TIERS if any(t in configs[m] for m in METHODS)]
+    # The osa2* variants are calibrated only on Self-Forcing; the other
+    # models have no entry for them.
+    tiers = [t for t in TIERS if any(t in configs.get(m, {}) for m in METHODS)]
     width, height = spec["resolutions"]["720p"]
     duration = 20
     frames = spec["frames"][duration]
