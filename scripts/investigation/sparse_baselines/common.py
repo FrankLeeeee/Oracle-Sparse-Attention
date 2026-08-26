@@ -112,7 +112,7 @@ MODELS = {
     },
 }
 
-METHODS = ("osa", "osa2", "osa2s", "osa2a", "lightforcing", "radial", "svg1", "svg2", "xattention", "sta")
+METHODS = ("osa", "osa2", "osa2s", "osa2a", "osasched", "lightforcing", "radial", "svg1", "svg2", "xattention", "sta")
 
 METHOD_LABELS = {
     "dense": "Dense",
@@ -123,6 +123,10 @@ METHOD_LABELS = {
     "osa2": "OSA",
     "osa2s": "OSA + sink full",
     "osa2a": "OSA + sink full + recent full",
+    # Demand-scheduled OSA: no whole-frame exemptions; the budget is
+    # front-loaded per chunk (1/sqrt(kv), FLOPs-matched) and split over frames
+    # by measured attention demand.
+    "osasched": "OSA + demand schedule",
     "lightforcing": "LightForcing",
     "radial": "Radial",
     "svg1": "SVG1",
@@ -180,6 +184,20 @@ def method_base_config(method: str, model: str) -> dict:
             "keep_recent_frames_full": True,
             "sink_latent_frames": 1,
             "num_recent_frames": 1,
+        }
+    if method == "osasched":
+        # Demand-scheduled OSA (2026-08-26 starvation analysis, P1-P3): no
+        # whole-frame exemptions, chunk-aware front-loaded budget, per-frame
+        # demand weights. schedule_num_frames is injected per run.
+        return {
+            "keep_own_chunk_full": False,
+            "keep_sink_full": False,
+            "keep_recent_frames_full": False,
+            "sink_latent_frames": 1,
+            "num_recent_frames": 1,
+            "demand_weighted": True,
+            "chunk_schedule": "flops_matched",
+            "schedule_window_frames": spec["window_frames"],
         }
     if method == "lightforcing":
         return {
@@ -593,7 +611,7 @@ class GpuWatchdog:
 
 # Variant method keys: an experiment method that runs an existing backend
 # under a different base config. Tags/results keep the variant name.
-BACKEND_OF = {"osa2": "osa", "osa2s": "osa", "osa2a": "osa"}
+BACKEND_OF = {"osa2": "osa", "osa2s": "osa", "osa2a": "osa", "osasched": "osa"}
 
 
 def sparse_args(method: str | None, method_config: dict | None) -> list[str]:
@@ -644,6 +662,16 @@ def run_generate(
     """One exclusive-GPU `sglang generate` run; re-queues on contention."""
     spec = MODELS[model]
     width, height = spec["resolutions"][res]
+    if (
+        method_config
+        and method_config.get("chunk_schedule") == "flops_matched"
+        and not method_config.get("schedule_num_frames")
+    ):
+        # The flops_matched beta solve needs the run's actual video length.
+        method_config = {
+            **method_config,
+            "schedule_num_frames": (spec["frames"][duration] + 3) // 4,
+        }
     out_dir.mkdir(parents=True, exist_ok=True)
     log = out_dir / "run.log"
     args = [

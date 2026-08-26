@@ -42,6 +42,10 @@ SECTION_CHUNKS = {
     int(c) for c in os.environ.get("OSA_SECTION_CHUNKS", "").split(",") if c.strip()
 }
 SECTION_DIR = os.environ.get("OSA_SECTION_DIR", "")
+# Optional: analysis granularity (tokens) of the section map, decoupled from
+# the config's spatial_tile so a fine map (e.g. 4-token granules) can be
+# dumped while OSA executes at its normal 64-token kernel tile.
+SECTION_TILE = int(os.environ.get("OSA_SECTION_TILE", "0"))
 # Optional: per-chunk attention mass and plan recall split by frame group
 # (sink / own chunk / recent / history), for the anchoring analysis.
 GROUP_OUT = os.environ.get("OSA_GROUP_OUT", "")
@@ -79,7 +83,7 @@ def _install(module) -> None:
         heads, q_len = query.shape[2], query.shape[1]
         frame_seqlen = layout.frame_seqlen
         num_frames = layout.num_frames
-        tile = self._config.spatial_tile
+        tile = SECTION_TILE or self._config.spatial_tile
         num_tiles = frame_seqlen // tile
         query_frames = q_len // frame_seqlen
         chunk_index = int(layout.query_chunk_index)

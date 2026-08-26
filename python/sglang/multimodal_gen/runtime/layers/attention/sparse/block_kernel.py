@@ -205,6 +205,7 @@ def build_block_plan(
     query_tile: int,
     key_tile: int,
     kv_len: int,
+    hist_tile_counts: torch.Tensor | None = None,  # [n_hist] tiles kept per frame
 ) -> BlockSparsePlan:
     """Expand the section-relative pattern into the kernel's flat block list.
 
@@ -212,22 +213,39 @@ def build_block_plan(
     tiles — the short raster tail (``frame_seqlen % key_tile`` tokens, <0.5%
     of a 720p frame) is excluded so every block is full and the kernel needs
     no masking.
+
+    ``hist_tile_counts`` lets replicated frames keep different tile counts
+    (demand-weighted allocation): frame j keeps the first
+    ``hist_tile_counts[j]`` tiles of its by-mass order in ``tiles``. The
+    per-(head, query tile) total stays identical across the grid either way,
+    which is the kernel's uniform trip count.
     """
     heads, q_tiles, band = tiles.shape
     device = tiles.device
-    # Walk order is free (online softmax is exact in any order); ascending
-    # tile position gives the DRAM-friendliest walk within each frame.
-    tiles = tiles.sort(dim=-1).values
     full_tiles = frame_seqlen // key_tile
     within = torch.arange(full_tiles, device=device, dtype=torch.int32) * key_tile
 
     # Whole frames: every full tile, identical for all heads and query tiles.
     whole_starts = (whole_offsets[:, None] + within[None, :]).reshape(-1)
     # Replicated frames: this query tile's key tiles at each frame offset.
-    hist_starts = (
-        hist_offsets[None, None, :, None]
-        + (tiles.to(torch.int32) * key_tile)[:, :, None, :]
-    ).reshape(heads, q_tiles, -1)
+    # Walk order is free (online softmax is exact in any order); ascending
+    # tile position gives the DRAM-friendliest walk within each frame.
+    if hist_tile_counts is None:
+        sorted_tiles = tiles.sort(dim=-1).values
+        hist_starts = (
+            hist_offsets[None, None, :, None]
+            + (sorted_tiles.to(torch.int32) * key_tile)[:, :, None, :]
+        ).reshape(heads, q_tiles, -1)
+    else:
+        pieces = []
+        for index, offset in enumerate(hist_offsets.tolist()):
+            kept = tiles[:, :, : int(hist_tile_counts[index])].sort(dim=-1).values
+            pieces.append(offset + kept.to(torch.int32) * key_tile)
+        hist_starts = (
+            torch.cat(pieces, dim=2)
+            if pieces
+            else tiles.new_zeros((heads, q_tiles, 0), dtype=torch.int32)
+        )
 
     starts = torch.cat(
         [whole_starts[None, None, :].expand(heads, q_tiles, -1), hist_starts], dim=2

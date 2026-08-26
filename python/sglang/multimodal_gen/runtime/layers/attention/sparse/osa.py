@@ -99,6 +99,41 @@ class OsaConfig(msgspec.Struct, frozen=True):
     # Off by default to keep the read-density comparable with the baselines
     # (which sparsify that pass too); turn on as a quality lever.
     dense_cache_update: bool = False
+    # --- Chunk-aware density schedule ---------------------------------------
+    # "constant" reproduces the historical behavior: every chunk gets the same
+    # per-call budget. "flops_matched" front-loads: chunk i's density decays
+    # toward ``schedule_floor_density`` as ``1/sqrt(kv frames)``, with the
+    # slope solved so the kv-weighted mean density over the whole video equals
+    # ``density`` (LightForcing's schedule applied to OSA's budget). Motivated
+    # by the 2026-08-26 5 s probes: attention demand is front-loaded (the own
+    # chunk alone holds 50-70% of the mass and early windows are small), so a
+    # constant per-call budget starves exactly where the mass concentrates.
+    chunk_schedule: str = "constant"
+    # Latent frames of the whole video; the flops_matched beta solve needs
+    # every chunk's kv length up front. The campaign runner injects it.
+    schedule_num_frames: int | None = None
+    # KV window cap in latent frames (-1 = full context).
+    schedule_window_frames: int = -1
+    # The density the schedule decays toward on late chunks.
+    schedule_floor_density: float = 0.02
+    # --- Demand-weighted allocation -----------------------------------------
+    # Split each chunk's pattern budget over the patterned frames proportional
+    # to measured per-frame attention demand instead of uniformly. Weights are
+    # relative per-frame demand fitted from the 2026-08-26 group probes
+    # (Self-Forcing 720p, stable across knobs and chunks): an own-chunk frame
+    # carries ~8x the mass of an old history frame, the recent frame ~4x, the
+    # sink ~2.5x, and history decays roughly as 1/age.
+    demand_weighted: bool = False
+    demand_w_own: float = 8.0
+    demand_w_recent: float = 4.0
+    demand_w_sink: float = 2.5
+    # History frame of age a weighs clip(demand_w_hist_scale / a, 1, w_recent).
+    demand_w_hist_scale: float = 8.0
+    # When False, keep_*_full frames are read whole but NOT charged against
+    # the density budget, so enabling an anchor can never starve the patterned
+    # frames below their floor (the osa2s/osa2a 5 s failure mode). True keeps
+    # the historical accounting where exemptions come out of the same budget.
+    charge_exempt_frames: bool = True
     # Spatial selection quantum in key tokens; 64 matches the kernel's key
     # tile, so a kept tile is never partially wasted.
     spatial_tile: int = 64
@@ -158,6 +193,35 @@ def measure_section_tile_mass(
     return mass
 
 
+def flops_matched_densities(
+    *,
+    num_frames: int,
+    frames_per_block: int,
+    window_frames: int,
+    mean_density: float,
+    floor_density: float,
+) -> list[float]:
+    """Per-chunk read densities, front-loaded as ``floor + beta / sqrt(kv)``.
+
+    Entry 0 is 1.0 (chunk 0 is the dense calibration chunk); entry ``i > 0``
+    is chunk i's density, with beta solved so the kv-length-weighted mean
+    density over the video equals ``mean_density`` — the same normalization as
+    LightForcing's ``calculate_chunk_sparsities``, in density form.
+    """
+    counts = list(range(2 * frames_per_block, num_frames + 1, frames_per_block))
+    kv = [c if window_frames < 0 else min(c, window_frames) for c in counts]
+    alphas = [1.0 / (c**0.5) for c in counts]
+    target = sum(mean_density * k for k in kv)
+    base = sum(floor_density * k for k in kv)
+    weighted = sum(a * k for a, k in zip(alphas, kv, strict=True))
+    if weighted == 0:
+        return [1.0] + [mean_density] * len(counts)
+    beta = (target - base) / weighted
+    return [1.0] + [
+        min(1.0, max(floor_density, floor_density + a * beta)) for a in alphas
+    ]
+
+
 def frame_ages(layout: VisibleLayout, *, query_chunk_offset: int = 0) -> np.ndarray:
     """Age of each visible frame in latent frames; the query chunk is age <= 0.
 
@@ -187,8 +251,20 @@ class OracleSparseAttention(SparseAttentionBackend):
             raise ValueError(
                 "osa needs density in (0, 1] " "(or the equivalent sparsity in [0, 1))"
             )
+        if config.chunk_schedule not in ("constant", "flops_matched"):
+            raise ValueError(
+                f"unknown chunk_schedule {config.chunk_schedule!r} "
+                "(use 'constant' or 'flops_matched')"
+            )
+        if config.chunk_schedule == "flops_matched" and not config.schedule_num_frames:
+            raise ValueError(
+                "chunk_schedule='flops_matched' needs schedule_num_frames "
+                "(the video's latent frame count)"
+            )
         self._density = density
         self._config = config
+        # chunk index -> per-call density, solved once (flops_matched only).
+        self._schedule: list[float] | None = None
         # layer -> [heads, q_tiles, k_tiles] section mass, overwritten at
         # every denoise step of chunk 0 so the surviving measurement is the
         # last step's.
@@ -386,27 +462,84 @@ class OracleSparseAttention(SparseAttentionBackend):
         full = self._whole_frame_mask(layout, own, ages)
         num_full = int(full.sum())
         num_other = num_frames - num_full
-        budget = self._density * num_frames * frame_seqlen
-        remaining = budget - num_full * frame_seqlen
-        if num_other == 0 or remaining >= num_other * frame_seqlen:
+        budget = self._call_density(layout) * num_frames * frame_seqlen
+        if self._config.charge_exempt_frames:
+            budget -= num_full * frame_seqlen
+        if num_other == 0 or budget >= num_other * frame_seqlen:
             return None  # everything is kept
-        # At least one tile per replicated frame — a zero-tile plan would
-        # leave those frames attending to nothing.
-        tiles_kept = min(
-            max(1, int(round(remaining / (num_other * tile_size)))),
-            num_tiles,
-        )
         frame_ids = torch.arange(num_frames, dtype=torch.int32, device=device)
         full_frames = torch.from_numpy(full).to(device)
+        hist_offsets = frame_ids[~full_frames] * frame_seqlen
+        if self._config.demand_weighted:
+            weights = self._demand_weights(layout, own, ages, full)
+            # At least one tile per frame — a zero-tile plan would leave that
+            # frame attending to nothing.
+            counts = np.clip(
+                np.round(budget * weights / weights.sum() / tile_size),
+                1,
+                num_tiles,
+            ).astype(np.int64)
+            return build_block_plan(
+                tiles=order,
+                hist_offsets=hist_offsets,
+                hist_tile_counts=torch.from_numpy(counts).to(device),
+                whole_offsets=frame_ids[full_frames] * frame_seqlen,
+                frame_seqlen=frame_seqlen,
+                query_tile=self._config.query_tile,
+                key_tile=tile_size,
+                kv_len=layout.kv_len,
+            )
+        # Uniform allocation: the same tile count for every patterned frame.
+        tiles_kept = min(
+            max(1, int(round(budget / (num_other * tile_size)))),
+            num_tiles,
+        )
         return build_block_plan(
             tiles=order[:, :, :tiles_kept],
-            hist_offsets=frame_ids[~full_frames] * frame_seqlen,
+            hist_offsets=hist_offsets,
             whole_offsets=frame_ids[full_frames] * frame_seqlen,
             frame_seqlen=frame_seqlen,
             query_tile=self._config.query_tile,
             key_tile=tile_size,
             kv_len=layout.kv_len,
         )
+
+    def _call_density(self, layout: VisibleLayout) -> float:
+        """This chunk's per-call density: the knob, or its scheduled value."""
+        if self._config.chunk_schedule == "constant":
+            return self._density
+        if self._schedule is None:
+            self._schedule = flops_matched_densities(
+                num_frames=self._config.schedule_num_frames,
+                frames_per_block=layout.frames_per_block,
+                window_frames=self._config.schedule_window_frames,
+                mean_density=self._density,
+                floor_density=self._config.schedule_floor_density,
+            )
+        index = min(max(int(layout.query_chunk_index), 0), len(self._schedule) - 1)
+        return self._schedule[index]
+
+    def _demand_weights(
+        self,
+        layout: VisibleLayout,
+        own: np.ndarray,
+        ages: np.ndarray,
+        full: np.ndarray,
+    ) -> np.ndarray:
+        """Relative per-frame demand of the patterned (non-full) frames."""
+        config = self._config
+        weights = np.clip(
+            config.demand_w_hist_scale / np.maximum(ages.astype(np.float64), 1.0),
+            1.0,
+            config.demand_w_recent,
+        )
+        weights[own] = config.demand_w_own
+        recent = (ages > 0) & (ages <= config.num_recent_frames)
+        weights[recent] = config.demand_w_recent
+        weights[layout.sink_frames(self._sink_frames()) & ~own & ~recent] = (
+            config.demand_w_sink
+        )
+        return weights[~full]
 
     def _log_summary(self, layout: VisibleLayout) -> None:
         # Freezing is lazy per layer during the first post-calibration chunk;

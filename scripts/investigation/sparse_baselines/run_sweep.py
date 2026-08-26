@@ -33,13 +33,20 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 DEFAULT_METHODS = ["osa", "lightforcing", "radial", "svg1", "svg2", "xattention", "sta"]
 
 
-def sweep_jobs(model: str, methods: list[str], skip_dense: bool) -> list[tuple]:
+def sweep_jobs(
+    model: str,
+    methods: list[str],
+    skip_dense: bool,
+    tiers: list[str] | None = None,
+) -> list[tuple]:
     """(tag, method, config) list from configs.json; floored tiers dedup."""
     configs = json.loads((ROOT / "configs.json").read_text())[model]
     jobs: list[tuple] = [] if skip_dense else [("dense", None, None)]
     for method in methods:
         seen_configs: list = []
         for tier, entry in configs[method].items():
+            if tiers is not None and tier not in tiers:
+                continue
             if entry["config"] in seen_configs:
                 continue  # a floored tier repeats the floor config
             seen_configs.append(entry["config"])
@@ -176,8 +183,14 @@ def main() -> None:
     parser.add_argument("--out", default="results.json")
     parser.add_argument("--runs-dir", default="runs")
     parser.add_argument("--port-base", type=int, default=36000)
+    parser.add_argument(
+        "--tiers",
+        nargs="*",
+        default=None,
+        help="restrict to these calibration tiers (e.g. 0.1 0.2 0.3); default all",
+    )
     args = parser.parse_args()
-    jobs = sweep_jobs(args.model, args.methods, args.skip_dense)
+    jobs = sweep_jobs(args.model, args.methods, args.skip_dense, tiers=args.tiers)
     if MODELS[args.model]["kind"] == "realtime":
         sweep_lingbot(args, jobs)
     else:

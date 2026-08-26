@@ -36,9 +36,12 @@ COLORS = {
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, choices=sorted(MODELS))
+    parser.add_argument("--results", default="results.json")
+    parser.add_argument("--suffix", default="", help="output filename suffix, e.g. _5s")
+    parser.add_argument("--duration", type=int, default=20)
     args = parser.parse_args()
     model_root = ROOT / args.model
-    results = json.loads((model_root / "results.json").read_text())
+    results = json.loads((model_root / args.results).read_text())
     dense = results["dense"]
 
     fig, ax = plt.subplots(figsize=(7.5, 4.8))
@@ -72,12 +75,12 @@ def main() -> None:
         label=f"dense ({dense['denoise_s']:.1f} s)",
     )
     ax.set_xlabel("achieved cumulative read density")
-    ax.set_ylabel("denoise seconds (720p / 20 s)")
+    ax.set_ylabel(f"denoise seconds (720p / {args.duration} s)")
     ax.set_title(f"{args.model}: denoise walltime vs read density")
     ax.legend(fontsize=8, ncols=2)
     ax.grid(alpha=0.3)
     fig.tight_layout()
-    out = model_root / "walltime_vs_density.png"
+    out = model_root / f"walltime_vs_density{args.suffix}.png"
     fig.savefig(out, dpi=150)
     print(f"wrote {out}")
 

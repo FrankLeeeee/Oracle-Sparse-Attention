@@ -976,3 +976,94 @@ def test_svg1_dense_sink_frames_protects_that_many_frames():
         assert bool(sink_cols.all()), f"sink frames not dense at n={sink_frames}"
         beyond = spatial[0, sink_frames * tiles_per_frame : 3 * tiles_per_frame]
         assert not bool(beyond.all()), "everything past the sink is dense too"
+
+
+def test_flops_matched_schedule_front_loads_and_matches_mean():
+    """The schedule decays as 1/sqrt(kv) and its kv-weighted mean is the knob."""
+    from sglang.multimodal_gen.runtime.layers.attention.sparse.osa import (
+        flops_matched_densities,
+    )
+
+    mean = 0.2
+    schedule = flops_matched_densities(
+        num_frames=30,
+        frames_per_block=3,
+        window_frames=-1,
+        mean_density=mean,
+        floor_density=0.02,
+    )
+    assert schedule[0] == 1.0  # chunk 0 is the dense calibration chunk
+    tail = schedule[1:]
+    assert all(a >= b for a, b in zip(tail, tail[1:], strict=False))
+    assert tail[0] > mean > tail[-1]
+    kv = list(range(6, 31, 3))
+    weighted = sum(d * k for d, k in zip(tail, kv, strict=True)) / sum(kv)
+    assert abs(weighted - mean) < 1e-6
+
+
+@requires_cuda
+def test_osa_demand_weighted_allocation_follows_group_demand():
+    """Demand weighting gives own-chunk frames more tiles than old history,
+    keeps the per-(head, query tile) trip count uniform, and — with exemptions
+    uncharged — enabling the sink anchor does not shrink the pattern budget."""
+    from sglang.multimodal_gen.runtime.layers.attention.sparse.block_kernel import (
+        BlockSparsePlan,
+    )
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    base = {
+        "density": 0.2,
+        "spatial_tile": 64,
+        "calibration_query_stride": 4,
+        "query_tile": 128,
+        "keep_own_chunk_full": False,
+        "keep_sink_full": False,
+        "keep_recent_frames_full": False,
+        "demand_weighted": True,
+        "chunk_schedule": "flops_matched",
+        "schedule_num_frames": 30,
+    }
+
+    def plan_at(config: dict, chunk_index: int) -> BlockSparsePlan:
+        backend = build_sparse_attention_backend("osa", config)
+        backend.begin_forward(_geometry(0))
+        assert backend.attend(_self_forcing_call(device, chunk_index=0)) is None
+        backend.begin_forward(_geometry(chunk_index))
+        out = backend.attend(_self_forcing_call(device, chunk_index=chunk_index))
+        assert out is not None
+        plan = backend._plans._entries[0][1]
+        assert isinstance(plan, BlockSparsePlan)
+        return plan
+
+    plan = plan_at(base, 9)
+    num_frames = 30
+    frame_of = (plan.starts[0, 0] // FRAME_SEQLEN).tolist()
+    per_frame = [frame_of.count(f) for f in range(num_frames)]
+    own = per_frame[-FRAMES_PER_BLOCK:]
+    old_hist = per_frame[1 : num_frames // 2]
+    assert min(own) > max(old_hist)  # own chunk out-weighs old history
+    recent = per_frame[num_frames - FRAMES_PER_BLOCK - 1]
+    assert recent > max(old_hist)  # the temporal anchor out-weighs old history
+    # Uniform trip count is structural: every (head, q_tile) shares n_blocks.
+    assert plan.starts.shape[2] == len(frame_of)
+
+    # Free exemptions: adding the sink anchor must not reduce any patterned
+    # frame's allocation (the osa2s starvation failure mode).
+    charged = plan_at(
+        {**base, "keep_sink_full": True, "sink_latent_frames": 1}, 9
+    )
+    frame_of_charged = (charged.starts[0, 0] // FRAME_SEQLEN).tolist()
+    free = plan_at(
+        {
+            **base,
+            "keep_sink_full": True,
+            "sink_latent_frames": 1,
+            "charge_exempt_frames": False,
+        },
+        9,
+    )
+    frame_of_free = (free.starts[0, 0] // FRAME_SEQLEN).tolist()
+    for frame in range(1, num_frames):
+        assert frame_of_free.count(frame) >= frame_of_charged.count(frame)
+    assert free.density > charged.density  # the sink is extra, not carved out
