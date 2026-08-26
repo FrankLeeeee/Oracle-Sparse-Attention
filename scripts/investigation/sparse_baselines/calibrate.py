@@ -256,10 +256,27 @@ def measure(
 # ---------------------------------------------------------------------------
 
 
+# Methods whose knob IS the target metric by construction: osasched's knob is
+# the FLOPs-weighted mean per-call density (the schedule solve guarantees it),
+# so mapping it through the run-cumulative secant would double-count the dense
+# calibration chunk and — because the schedule front-loads — push the knob far
+# below the tier (the 0.1-tier collapse: knob 0.032, ~3% per-call reads).
+EXACT_KNOB_METHODS = {"osasched"}
+
+
 def calibrate_scalar(
     model: str, method: str, gpu: int, port_base: int
 ) -> dict[str, dict]:
     spec = SCALAR_METHODS[method]
+    if method in EXACT_KNOB_METHODS:
+        base = method_base_config(method, model)
+        return {
+            str(target): {
+                "config": {**base, spec["knob"]: target},
+                "floored": False,
+            }
+            for target in targets_for(model)
+        }
     knob, (seed_hi, seed_lo) = spec["knob"], spec["seeds"]
     lo_bound, hi_bound = spec["bounds"]
     base = method_base_config(method, model)

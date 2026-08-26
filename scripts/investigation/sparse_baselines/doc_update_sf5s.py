@@ -37,6 +37,7 @@ ORDER = [
     "osa2s",
     "osa2a",
     "osa",
+    "osasched",
     "lightforcing",
     "radial",
     "svg1",
@@ -64,6 +65,15 @@ QUALITY_BULLETS: list[str] = [
     "变宽，主体尚在）；XAttention 0.21 档下半幅噪声，STA 0.25 档大面积噪声。",
     "口径提醒：5 s 稠密去噪只有 10.7 s（20 s 为 73.4 s），注意力占比大幅缩水，"
     "所有方法的加速上限被压到 ~1.4×；密度—速度曲线的对比意义大于绝对加速比。",
+    "<b>OSA + demand schedule</b>（2026-08-26 新增：无整帧豁免 + 1/√kv 前置"
+    "调度 + 按实测需求分配逐帧 tile 数；knob 直接就是 FLOPs 加权平均逐调用"
+    "密度，不再经 20 s 累计割线校准）：0.43 / 0.34 档干净，与 LightForcing "
+    "同档画质相当且更快（0.34 档 8.3 s vs LF 0.36 档 8.9 s）；0.24 档主体与"
+    "街景保持，但画面中下部仍有彩色噪声块。逐行 recall 测量定位了该缺陷：底部 "
+    "query 行的质量分布更平，等 tile 数分配比顶部少捕获 ~10 pt 质量，自回归"
+    "复利成局部崩坏；tile 形状 / 粒度实验排除了 tile 几何解释（紧凑方形 tile "
+    "反而更差，4-token 粒度仅 +4–5 pt）——下一步是逐 (head, query tile) 等"
+    "质量预算。",
 ]
 
 
@@ -233,45 +243,53 @@ def push_text() -> None:
         before="quality_sheet",
         xml=quality_section(results),
     )
-    replace_span(
-        DOC,
-        after="复现命令",
-        before="5. OSA 粒度对比",
-        xml=commands_section(),
+    # 复现命令 is the doc's last section: replace everything after its h2.
+    blocks = top_blocks(DOC)
+    start = next(
+        i for i, (t, _, x) in enumerate(blocks) if t == "h2" and "复现命令" in x
     )
+    doomed = [bid for _, ids, _ in blocks[start + 1 :] for bid in ids]
+    cli(
+        "docs", "+update", "--doc", DOC, "--command", "block_insert_after",
+        "--block-id", blocks[start][1][-1], "--content", commands_section(),
+    )
+    for i in range(0, len(doomed), 20):
+        cli(
+            "docs", "+update", "--doc", DOC, "--command", "block_delete",
+            "--block-id", ",".join(doomed[i : i + 20]),
+        )
 
 
 def push_figures() -> None:
-    blocks = top_blocks(DOC)
-    # Walltime figure: replace the 20 s plot with the 5 s one.
-    old = blocks[find_block(blocks, name="walltime_vs_density.png")][1][0]
-    replace_media(
-        DOC,
-        old,
-        str(MODEL_ROOT / "walltime_vs_density_5s.png"),
-        caption="各方法去噪耗时 vs 实际累计读取密度（720p / 5 s；虚线为 dense 参考）",
-        width=760,
-    )
-    print("replaced walltime figure")
-    # Quality sheets: replace the single 20 s sheet with the three 5 s tiers.
-    blocks = top_blocks(DOC)
-    old = blocks[find_block(blocks, name="quality_sheet_target0.3.png")][1][0]
-    anchor = replace_media(
-        DOC,
-        old,
-        str(MODEL_ROOT / "quality_sheet_target0.3_5s.png"),
-        caption="帧对比（p0 · 东京夜街，~0.30 档；行：方法；列：帧号 / 时间）",
-        width=760,
-    )
-    for tier in ("0.2", "0.1"):
-        anchor = insert_after(
-            DOC,
-            anchor,
-            str(MODEL_ROOT / f"quality_sheet_target{tier}_5s.png"),
-            caption=f"帧对比（p0 · 东京夜街，~{tier} 档）",
-            width=760,
+    """Replace each published figure with the current file of the same role."""
+    targets = [
+        (
+            ("walltime_vs_density_5s.png", "walltime_vs_density.png"),
+            MODEL_ROOT / "walltime_vs_density_5s.png",
+            "各方法去噪耗时 vs 实际累计读取密度（720p / 5 s；虚线为 dense 参考）",
+        ),
+    ] + [
+        (
+            (f"quality_sheet_target{tier}_5s.png", f"quality_sheet_target{tier}.png"),
+            MODEL_ROOT / f"quality_sheet_target{tier}_5s.png",
+            f"帧对比（p0 · 东京夜街，~{tier} 档；行：方法；列：帧号 / 时间）",
         )
-    print("replaced quality sheets")
+        for tier in ("0.3", "0.2", "0.1")
+    ]
+    for names, path, caption in targets:
+        blocks = top_blocks(DOC)
+        old = None
+        for name in names:
+            try:
+                old = blocks[find_block(blocks, text=name, tag="img")][1][0]
+                break
+            except LookupError:
+                continue
+        if old is None:
+            print(f"no published figure matching {names}; skipping")
+            continue
+        replace_media(DOC, old, str(path), caption=caption, width=760)
+        print(f"replaced {path.name}")
 
 
 # Variant keys are internal shorthand; files carry the additive switch names.
@@ -280,6 +298,7 @@ FILE_LABELS = {
     "osa2s": "osa_sink_full",
     "osa2a": "osa_sink_full_recent_full",
     "osa": "osa_own_chunk_full_sink_full_recent_full",
+    "osasched": "osa_demand_schedule",
 }
 
 
