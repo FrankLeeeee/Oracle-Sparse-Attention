@@ -549,7 +549,7 @@ def test_osa_fully_sparse_has_no_whole_frames_and_exact_density():
         out = backend.attend(call)
         assert out is not None and out.shape == call.query.shape
 
-    plan = backend._plans._entries[0][1]
+    plan, _flat = backend._plans._entries[0][1]
     assert isinstance(plan, BlockSparsePlan)
     heads = 4
     kv_len = 10 * FRAMES_PER_BLOCK * FRAME_SEQLEN
@@ -652,7 +652,7 @@ def test_osa_window_query_plans_per_chunk_and_executes():
     out = backend.attend(call)
     assert out is not None and out.shape == query.shape
 
-    plan = backend._plans._entries[0][1]
+    plan, _flat = backend._plans._entries[0][1]
     assert isinstance(plan, tuple) and len(plan) == window_chunks
     assert all(isinstance(entry, BlockSparsePlan) for entry in plan)
 
@@ -1032,7 +1032,7 @@ def test_osa_demand_weighted_allocation_follows_group_demand():
         backend.begin_forward(_geometry(chunk_index))
         out = backend.attend(_self_forcing_call(device, chunk_index=chunk_index))
         assert out is not None
-        plan = backend._plans._entries[0][1]
+        plan, _flat = backend._plans._entries[0][1]
         assert isinstance(plan, BlockSparsePlan)
         return plan
 
@@ -1067,3 +1067,54 @@ def test_osa_demand_weighted_allocation_follows_group_demand():
     for frame in range(1, num_frames):
         assert frame_of_free.count(frame) >= frame_of_charged.count(frame)
     assert free.density > charged.density  # the sink is extra, not carved out
+
+
+@requires_cuda
+def test_osa_flat_row_dense_fallback_is_exact_and_fades_with_budget():
+    """Flat rows fall back to exact dense attention over the full KV; at a
+    generous budget every row clears the threshold and no row falls back."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    base = {
+        "density": 0.15,
+        "spatial_tile": 64,
+        "calibration_query_stride": 4,
+        "query_tile": 128,
+        "keep_own_chunk_full": False,
+        "keep_sink_full": False,
+        "keep_recent_frames_full": False,
+        "demand_weighted": True,
+        "flat_row_dense": True,
+        "flat_row_retention": 0.9,  # aggressive so some rows trip on noise data
+        "flat_row_max_fraction": 0.5,
+    }
+    backend = build_sparse_attention_backend("osa", base)
+    backend.begin_forward(_geometry(0))
+    assert backend.attend(_self_forcing_call(device, chunk_index=0)) is None
+    call = _self_forcing_call(device, chunk_index=6)
+    backend.begin_forward(_geometry(6))
+    out = backend.attend(call)
+    assert out is not None
+    _plan, flat_index = backend._plans._entries[0][1]
+    assert flat_index is not None and flat_index.numel() > 0
+    flat_index = flat_index.to(device)
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        call.query[:, flat_index].transpose(1, 2),
+        call.key.transpose(1, 2),
+        call.value.transpose(1, 2),
+        scale=call.softmax_scale,
+    ).transpose(1, 2)
+    torch.testing.assert_close(
+        out[:, flat_index], reference.to(out.dtype), atol=3e-2, rtol=3e-2
+    )
+
+    # A generous budget clears the threshold: no fallback rows.
+    generous = build_sparse_attention_backend(
+        "osa", {**base, "density": 0.85, "flat_row_retention": 0.05}
+    )
+    generous.begin_forward(_geometry(0))
+    assert generous.attend(_self_forcing_call(device, chunk_index=0)) is None
+    generous.begin_forward(_geometry(6))
+    assert generous.attend(_self_forcing_call(device, chunk_index=6)) is not None
+    _plan, flat_index = generous._plans._entries[0][1]
+    assert flat_index is None or flat_index.numel() == 0

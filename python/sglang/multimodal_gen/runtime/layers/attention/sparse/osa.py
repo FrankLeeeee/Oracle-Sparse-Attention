@@ -134,6 +134,19 @@ class OsaConfig(msgspec.Struct, frozen=True):
     # frames below their floor (the osa2s/osa2a 5 s failure mode). True keeps
     # the historical accounting where exemptions come out of the same budget.
     charge_exempt_frames: bool = True
+    # --- Flat-row dense fallback --------------------------------------------
+    # A query tile whose mass distribution is flat has no peaky pattern for
+    # the frozen top-k to exploit: at a given budget its retention runs ~10 pt
+    # below the peaky rows (measured on the 4-token-granularity pair maps),
+    # and in an autoregressive rollout that local deficit compounds into a
+    # region-shaped collapse (the low-density bottom-band artifact). Rows
+    # whose retention at the chunk's own budget falls below
+    # ``flat_row_retention`` fall back to exact dense attention, capped at
+    # ``flat_row_max_fraction`` of the rows (worst first). At generous budgets
+    # every row clears the threshold, so the fallback fades out by itself.
+    flat_row_dense: bool = False
+    flat_row_retention: float = 0.5
+    flat_row_max_fraction: float = 0.25
     # Spatial selection quantum in key tokens; 64 matches the kernel's key
     # tile, so a kept tile is never partially wasted.
     spatial_tile: int = 64
@@ -272,6 +285,10 @@ class OracleSparseAttention(SparseAttentionBackend):
         # layer -> [heads, q_tiles, k_tiles] key tiles by descending mass,
         # frozen at the first post-calibration chunk.
         self._section_order: dict[int, torch.Tensor] = {}
+        # layer -> [heads, q_tiles, k_tiles] normalized retention curve (the
+        # cumulative mass of the by-mass-sorted tiles), kept for the flat-row
+        # dense fallback's per-chunk peakedness test.
+        self._retention: dict[int, torch.Tensor] = {}
         self._plans = LayoutCache()
         self._last_chunk_index = -1
         self._forwards_this_chunk = 0
@@ -292,6 +309,7 @@ class OracleSparseAttention(SparseAttentionBackend):
     def reset(self) -> None:
         self._section_mass.clear()
         self._section_order.clear()
+        self._retention.clear()
         self._plans.clear()
         self._last_chunk_index = -1
         self._forwards_this_chunk = 0
@@ -309,19 +327,37 @@ class OracleSparseAttention(SparseAttentionBackend):
         layout = self._layout(call)
         if layout is None:
             return None
-        plan = self._prepare_plan(call, layout)
-        if plan is None:
+        entry = self._prepare_plan(call, layout)
+        if entry is None:
             self._record_density(None, kv_len=call.key.shape[1])
             return None
+        plan, flat_index = entry
         if isinstance(plan, BlockSparsePlan):
-            self._record_density(None, kv_len=call.key.shape[1], fraction=plan.density)
-            return block_sparse_attention(
+            out = block_sparse_attention(
                 query=call.query,
                 key=call.key,
                 value=call.value,
                 plan=plan,
                 softmax_scale=call.softmax_scale,
             )
+            fraction = plan.density
+            if flat_index is not None and flat_index.numel():
+                # Flat rows: overwrite the patterned output with exact dense
+                # attention over the full visible KV.
+                flat_index = flat_index.to(call.query.device)
+                sub = call.query[:, flat_index].transpose(1, 2)
+                dense = torch.nn.functional.scaled_dot_product_attention(
+                    sub,
+                    call.key.transpose(1, 2),
+                    call.value.transpose(1, 2),
+                    scale=call.softmax_scale,
+                )
+                out[:, flat_index] = dense.transpose(1, 2).to(out.dtype)
+                fraction = min(
+                    1.0, fraction + flat_index.numel() / call.query.shape[1]
+                )
+            self._record_density(None, kv_len=call.key.shape[1], fraction=fraction)
+            return out
         # A rolling window: one plan per query chunk over the shared KV view.
         # A None entry means that chunk keeps everything, which the block
         # kernel cannot express — fall back to dense for the whole call
@@ -349,7 +385,14 @@ class OracleSparseAttention(SparseAttentionBackend):
 
     def _prepare_plan(
         self, call: SparseAttentionCall, layout: VisibleLayout
-    ) -> BlockSparsePlan | tuple[BlockSparsePlan | None, ...] | None:
+    ) -> (
+        tuple[
+            BlockSparsePlan | tuple[BlockSparsePlan | None, ...],
+            torch.Tensor | None,
+        ]
+        | None
+    ):
+        """The cached plan entry: (plan or window plans, flat-row token index)."""
         if self._config.dense_cache_update and self.in_cache_update:
             return None
         if (
@@ -386,12 +429,18 @@ class OracleSparseAttention(SparseAttentionBackend):
             # The frame's short tail tile (when frame_seqlen % spatial_tile
             # != 0) is excluded from selection so every (head, query tile)
             # keeps the same token count — the kernel's uniform trip count.
-            # Whole frames still include the tail.
+            # Whole frames are likewise expanded over full tiles only (the
+            # tail is <0.5% of a 720p frame; see build_block_plan).
             full_tiles = layout.frame_seqlen // self._config.spatial_tile
-            order = torch.argsort(mass[:, :, :full_tiles], dim=2, descending=True).to(
-                torch.int32
-            )
+            body = mass[:, :, :full_tiles]
+            order = torch.argsort(body, dim=2, descending=True).to(torch.int32)
             self._section_order[call.layer_index] = order
+            if self._config.flat_row_dense:
+                sorted_mass = body.sort(dim=2, descending=True).values
+                cumulative = sorted_mass.cumsum(dim=2)
+                self._retention[call.layer_index] = cumulative / cumulative[
+                    :, :, -1:
+                ].clamp(min=1e-9)
             self._section_mass.pop(call.layer_index, None)
         num_query_chunks, ragged = divmod(layout.query_frames, layout.frames_per_block)
         if ragged:
@@ -415,17 +464,43 @@ class OracleSparseAttention(SparseAttentionBackend):
                 f"{call.layer_index} has {call.num_local_heads}"
             )
             return None
+        retention = self._retention.get(call.layer_index)
         if num_query_chunks == 1:
-            plan = self._chunk_plan(layout, order, query_chunk_offset=0)
+            plan, flat_rows = self._chunk_plan(
+                layout, order, query_chunk_offset=0, retention=retention
+            )
+            entry = None
+            if plan is not None:
+                entry = (plan, self._flat_token_index(layout, flat_rows))
         else:
             plans = tuple(
-                self._chunk_plan(layout, order, query_chunk_offset=offset)
+                self._chunk_plan(
+                    layout, order, query_chunk_offset=offset, retention=None
+                )[0]
                 for offset in range(num_query_chunks)
             )
-            plan = None if all(entry is None for entry in plans) else plans
-        self._plans.put(call.layer_index, signature, plan)
+            entry = None if all(p is None for p in plans) else (plans, None)
+        self._plans.put(call.layer_index, signature, entry)
         self._log_summary(layout)
-        return plan
+        return entry
+
+    def _flat_token_index(
+        self, layout: VisibleLayout, flat_rows: tuple[int, ...]
+    ) -> torch.Tensor | None:
+        """Token index of the flat query rows, over every frame of the chunk."""
+        if not flat_rows:
+            return None
+        query_tile = self._config.query_tile
+        frame_seqlen = layout.frame_seqlen
+        spans = [
+            torch.arange(
+                frame * frame_seqlen + row * query_tile,
+                frame * frame_seqlen + min((row + 1) * query_tile, frame_seqlen),
+            )
+            for frame in range(layout.query_frames)
+            for row in flat_rows
+        ]
+        return torch.cat(spans)
 
     def _whole_frame_mask(
         self, layout: VisibleLayout, own: np.ndarray, ages: np.ndarray
@@ -445,8 +520,9 @@ class OracleSparseAttention(SparseAttentionBackend):
         order: torch.Tensor,  # [heads, q_tiles, full_tiles] by descending mass
         *,
         query_chunk_offset: int,
-    ) -> BlockSparsePlan | None:
-        """One query chunk's plan, or ``None`` if it keeps everything."""
+        retention: torch.Tensor | None = None,
+    ) -> tuple[BlockSparsePlan | None, tuple[int, ...]]:
+        """One query chunk's (plan, flat rows); plan is None if all is kept."""
         num_heads, q_tiles, num_tiles = order.shape
         frame_seqlen = layout.frame_seqlen
         tile_size = self._config.spatial_tile
@@ -457,7 +533,7 @@ class OracleSparseAttention(SparseAttentionBackend):
         if not own.any():
             # The query chunk's own keys are always in the view for the models
             # this supports; an unmapped chunk keeps everything to stay safe.
-            return None
+            return None, ()
         ages = frame_ages(layout, query_chunk_offset=query_chunk_offset)
         full = self._whole_frame_mask(layout, own, ages)
         num_full = int(full.sum())
@@ -466,7 +542,7 @@ class OracleSparseAttention(SparseAttentionBackend):
         if self._config.charge_exempt_frames:
             budget -= num_full * frame_seqlen
         if num_other == 0 or budget >= num_other * frame_seqlen:
-            return None  # everything is kept
+            return None, ()  # everything is kept
         frame_ids = torch.arange(num_frames, dtype=torch.int32, device=device)
         full_frames = torch.from_numpy(full).to(device)
         hist_offsets = frame_ids[~full_frames] * frame_seqlen
@@ -479,7 +555,7 @@ class OracleSparseAttention(SparseAttentionBackend):
                 1,
                 num_tiles,
             ).astype(np.int64)
-            return build_block_plan(
+            plan = build_block_plan(
                 tiles=order,
                 hist_offsets=hist_offsets,
                 hist_tile_counts=torch.from_numpy(counts).to(device),
@@ -489,12 +565,14 @@ class OracleSparseAttention(SparseAttentionBackend):
                 key_tile=tile_size,
                 kv_len=layout.kv_len,
             )
+            k_ref = int(np.clip(round(float(counts.mean())), 1, num_tiles))
+            return plan, self._flat_rows(retention, k_ref)
         # Uniform allocation: the same tile count for every patterned frame.
         tiles_kept = min(
             max(1, int(round(budget / (num_other * tile_size)))),
             num_tiles,
         )
-        return build_block_plan(
+        plan = build_block_plan(
             tiles=order[:, :, :tiles_kept],
             hist_offsets=hist_offsets,
             whole_offsets=frame_ids[full_frames] * frame_seqlen,
@@ -503,6 +581,24 @@ class OracleSparseAttention(SparseAttentionBackend):
             key_tile=tile_size,
             kv_len=layout.kv_len,
         )
+        return plan, self._flat_rows(retention, tiles_kept)
+
+    def _flat_rows(
+        self, retention: torch.Tensor | None, k_ref: int
+    ) -> tuple[int, ...]:
+        """Query rows whose retention at this chunk's budget is below the
+        flat-row threshold, worst first, capped by the row-fraction limit."""
+        if retention is None:
+            return ()
+        per_row = retention[:, :, k_ref - 1].mean(0)  # head-mean, [q_tiles]
+        below = per_row < self._config.flat_row_retention
+        cap = int(per_row.shape[0] * self._config.flat_row_max_fraction)
+        if cap == 0 or not bool(below.any()):
+            return ()
+        rows = torch.nonzero(below).squeeze(1)
+        if rows.numel() > cap:
+            rows = rows[per_row[rows].argsort()[:cap]]
+        return tuple(int(r) for r in rows)
 
     def _call_density(self, layout: VisibleLayout) -> float:
         """This chunk's per-call density: the knob, or its scheduled value."""

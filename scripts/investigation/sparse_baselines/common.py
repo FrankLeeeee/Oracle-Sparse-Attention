@@ -198,6 +198,9 @@ def method_base_config(method: str, model: str) -> dict:
             "demand_weighted": True,
             "chunk_schedule": "flops_matched",
             "schedule_window_frames": spec["window_frames"],
+            # Flat query rows (no peaky pattern to freeze) fall back to exact
+            # dense attention — fixes the low-density bottom-band collapse.
+            "flat_row_dense": True,
         }
     if method == "lightforcing":
         return {
