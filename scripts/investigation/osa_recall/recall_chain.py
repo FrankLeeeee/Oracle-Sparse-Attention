@@ -18,19 +18,32 @@ sys.path.insert(0, str(HERE.parent / "sparse_baselines"))
 sys.path.insert(0, str(HERE.parent))
 from common import GpuPool, GpuWatchdog, compute_apps  # noqa: E402
 
-# replan_each_chunk final timing at the shipped default (stride 32).
-JOBS = [
-    {
-        "tag": "sf20_replan32_time",
-        "args": [
-            "--no-hook",
-            "--seconds", "20",
-            "--osa-extra", '{"replan_each_chunk": true}',
-            "--tag", "sf20_replan32_time",
-            "--port-base", "29785",
-        ],
-    },
-]
+# Density 0.2 / 0.1 round: recall (exact), LF recall, and clean 20 s timing.
+REPLAN = '{"replan_each_chunk": true}'
+JOBS = []
+_port = 29740
+for _d in ("0.2", "0.1"):
+    _t = _d.replace("0.", "d0")
+    for _tag, _extra in [
+        (f"sf20x_frozen_{_t}", ["--exact"]),
+        (f"sf20x_replan_{_t}", ["--exact", "--osa-extra", REPLAN]),
+        (f"sf20_lf_{_t}", ["--method", "lightforcing"]),
+        (f"sf20t_frozen_{_t}", ["--no-hook"]),
+        (f"sf20t_replan_{_t}", ["--no-hook", "--osa-extra", REPLAN]),
+    ]:
+        JOBS.append(
+            {
+                "tag": _tag,
+                "args": [
+                    *_extra,
+                    "--seconds", "20",
+                    "--density", _d,
+                    "--tag", _tag,
+                    "--port-base", str(_port),
+                ],
+            }
+        )
+        _port += 5
 COMMON = ["--model", "self_forcing", "--density", "0.3", "--seconds", "10"]
 MAX_ATTEMPTS = 3
 
