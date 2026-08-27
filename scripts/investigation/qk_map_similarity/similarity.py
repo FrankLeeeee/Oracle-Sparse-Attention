@@ -1,0 +1,111 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Frame-to-frame pattern similarity from the raw Q/K dumps of run.py.
+
+    python similarity.py [--run p1] [--device cuda]
+
+For a captured attention call with Sq query tokens and Sk key tokens, each
+latent frame being T tokens, the map splits into (Sq/T) x (Sk/T) frame-to-frame
+pairs. For query frame i and key frame j the pair map is
+
+    A_ij = softmax(Q_i @ K_j^T / sqrt(d))   # [T, T], softmax per query row
+                                            # over that key frame only
+
+i.e. the *shape* of frame i's attention into frame j, independent of how much
+total mass frame j receives. The reported score is the cosine similarity of
+the flattened A_i0 and A_ij — column j says how similar frame i's pattern into
+key frame j is to its pattern into key frame 0 (so column 0 is 1 by
+construction). High values across j are the empirical premise behind OSA's
+replicate design: one frame-to-frame pattern per head, reused for every
+history frame.
+
+Output: results/investigation/qk_map_similarity/similarity/<run>/sim_L{l}_h{h}_c{c}_s{s}.json
+"""
+
+import argparse
+import json
+import pathlib
+import sys
+
+import torch
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+from paths import results_dir  # noqa: E402
+
+from plot_maps import load_qk  # noqa: E402
+from run import CHUNK_IDS, HEAD_SPECS, STEP_IDS  # noqa: E402
+
+ROOT = results_dir("qk_map_similarity")
+
+
+@torch.no_grad()
+def pair_softmax(
+    query_frame: torch.Tensor, key_frame: torch.Tensor
+) -> torch.Tensor:
+    """``softmax(Q_i K_j^T / sqrt(d))`` over this key frame only -> [T, T]."""
+    scale = query_frame.shape[-1] ** -0.5
+    return torch.softmax((query_frame @ key_frame.T) * scale, dim=-1)
+
+
+@torch.no_grad()
+def cosine_table(
+    query: torch.Tensor, key: torch.Tensor, *, frame_seqlen: int, device: str
+) -> list[list[float]]:
+    """``cos(A_i0, A_ij)`` for every query frame i and key frame j."""
+    query, key = query.to(device), key.to(device)
+    query_frames = query.shape[0] // frame_seqlen
+    key_frames = key.shape[0] // frame_seqlen
+    table = []
+    for i in range(query_frames):
+        q_frame = query[i * frame_seqlen : (i + 1) * frame_seqlen]
+        reference = pair_softmax(q_frame, key[:frame_seqlen]).flatten()
+        reference = reference / reference.norm()
+        row = []
+        for j in range(key_frames):
+            k_frame = key[j * frame_seqlen : (j + 1) * frame_seqlen]
+            pair = pair_softmax(q_frame, k_frame).flatten()
+            row.append(float(reference @ (pair / pair.norm())))
+        table.append(row)
+    return table
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run", default="p1")
+    parser.add_argument(
+        "--device", default="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    args = parser.parse_args()
+
+    run_dir = ROOT / "runs" / args.run
+    out_dir = ROOT / "similarity" / args.run
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for spec in HEAD_SPECS:
+        for chunk in CHUNK_IDS:
+            for step in STEP_IDS:
+                query, key, frame_seqlen = load_qk(
+                    run_dir, spec["layer"], spec["head"], chunk, step
+                )
+                table = cosine_table(
+                    query, key, frame_seqlen=frame_seqlen, device=args.device
+                )
+                record = {
+                    "run": args.run,
+                    "task": spec["task"],
+                    "layer": spec["layer"],
+                    "head": spec["head"],
+                    "chunk": chunk,
+                    "step": step,
+                    "frame_seqlen": frame_seqlen,
+                    "query_frames": len(table),
+                    "key_frames": len(table[0]),
+                    "cosine": [[round(v, 4) for v in row] for row in table],
+                }
+                name = f"sim_L{spec['layer']:02d}_h{spec['head']}_c{chunk}_s{step}.json"
+                (out_dir / name).write_text(json.dumps(record, indent=2))
+            print(f"[sim] L{spec['layer']} h{spec['head']} c{chunk}: done", flush=True)
+    print(f"[sim] wrote {len(list(out_dir.glob('sim_*.json')))} tables -> {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
