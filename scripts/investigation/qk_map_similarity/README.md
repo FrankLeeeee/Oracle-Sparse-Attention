@@ -40,6 +40,13 @@ python doc_update.py --stage verify
 python run.py --spec extra --prompts p1
 CUDA_VISIBLE_DEVICES=<idle> python similarity.py --run p1 --spec extra
 python doc_update.py --stage extra      # verification subsection + 9-row summary
+
+# self-referenced recomputation + temporal consistency
+CUDA_VISIBLE_DEVICES=<idle> python similarity.py --run p1 --spec main
+CUDA_VISIBLE_DEVICES=<idle> python similarity.py --run p1 --spec extra
+python plot_temporal.py --run p1
+python doc_update.py --stage resim      # republish intro + all 9 tables + summary
+python doc_update.py --stage temporal   # temporal subsection + figure + table
 ```
 
 - `run.py` launches plain `sglang generate` per prompt with
@@ -60,7 +67,13 @@ python doc_update.py --stage extra      # verification subsection + 9-row summar
 - `similarity.py` computes, per query frame i and key frame j,
   `A_ij = softmax(Q_i K_j^T / sqrt(d))` (softmax **within that key frame
   only**, i.e. the standalone pattern of the frame pair) and reports
-  `cos(A_i0, A_ij)` flattened — column 0 is 1 by construction.
+  `cos(A_{i,self}, A_ij)` flattened, where the reference is the query frame's
+  own self map `A_{i, Sk/T-3+i}` (the chunk's frames are the newest 3 of the
+  cache) — each row's self column is 1 by construction. It also writes a
+  temporal-consistency table per pick: the chunk-`--ref-chunk` (default 0)
+  self maps compared against every captured chunk's maps,
+  `cos(A_{C,i,self}, A_{c,i,j})`; `plot_temporal.py` renders the 9-panel
+  figure.
 
 ## Outputs
 
@@ -70,8 +83,12 @@ python doc_update.py --stage extra      # verification subsection + 9-row summar
   (query `[Sq, heads, d]`, key `[Sk, heads, d]` fp16 + geometry); Q/K captured
   for **all five** prompts, doc figures use p1.
 - `plots/p1/L{l}_h{h}_c{c}_s{s}.png` — 64 attention maps.
-- `similarity/p1/sim_L{l}_h{h}_c{c}_s{s}.json` — 64 cosine tables
-  (`cosine[i][j]`, query frames x key frames).
+- `similarity/p1/sim_L{l}_h{h}_c{c}_s{s}.json` — cosine tables
+  (`cosine[i][j]`, query frames x key frames, self-referenced; `self_columns`
+  marks each row's trivially-1 column).
+- `similarity/p1/temporal_L{l}_h{h}_ref0_s3.json` — temporal-consistency
+  tables (`chunks[c][i][j]` vs chunk-0 self maps); figure
+  `plots/p1/temporal_ref0_s3.png`.
 
 ## Gotchas
 

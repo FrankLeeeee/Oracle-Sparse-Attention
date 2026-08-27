@@ -46,6 +46,9 @@ SIM_STEP = 3  # published similarity tables: last denoising step
 SIM_CHUNK = CHUNK_IDS[-1]  # ... at the 100th-percentile chunk
 
 
+SUMMARY_H3 = "<h3>各 chunk 汇总（step 3，每行自身列除外的均值）</h3>"
+
+
 def chunk_label(chunk: int) -> str:
     return f"chunk {chunk}（{round(chunk / (NUM_CHUNKS - 1) * 100)}%）"
 
@@ -97,9 +100,7 @@ def similarity_summary_table(specs=HEAD_SPECS) -> str:
     for spec in specs:
         cells = []
         for chunk in CHUNK_IDS:
-            table = load_similarity(spec, chunk, SIM_STEP)["cosine"]
-            values = [v for row in table for v in row[1:]]
-            cells.append(f"<td>{sum(values) / len(values):.3f}</td>")
+            cells.append(f"<td>{mean_cosine(spec, chunk, SIM_STEP):.3f}</td>")
         rows.append(
             f"<tr><td><p>L{spec['layer']} · h{spec['head']}</p></td>{''.join(cells)}</tr>"
         )
@@ -118,10 +119,13 @@ def similarity_intro_xml() -> str:
         "的帧对。对 query 帧 <latex>i</latex> 与 key 帧 <latex>j</latex>，取 "
         r"<latex>A_{i,j}=\mathrm{softmax}\!\left(Q_i K_j^{\top}/\sqrt{d}\right)"
         "</latex>（softmax 仅在该 key 帧的 <latex>T</latex> 个 token 上进行，即该"
-        "帧对的独立注意力图），表中数值为展平后的余弦相似度 "
-        r"<latex>\cos\!\left(A_{i,0},\,A_{i,j}\right)</latex>——第 <latex>j</latex> "
-        "列衡量 query 帧 <latex>i</latex> 对 key 帧 <latex>j</latex> 的图案与它对 "
-        "key 帧 0 的图案有多相似，第 0 列恒为 1。"
+        "帧对的独立注意力图）。参考图取该 query 帧<b>对自身</b>的注意力图 "
+        r"<latex>A_{i,\,S_k/T-3+i}</latex>（chunk 自身的 3 帧是可见 cache 中最新的 "
+        "3 帧，query 帧 <latex>i</latex> 即倒数第 <latex>3-i</latex> 个 key 帧），"
+        "表中数值为展平后的余弦相似度 "
+        r"<latex>\cos\!\left(A_{i,\,S_k/T-3+i},\,A_{i,j}\right)</latex>——第 "
+        "<latex>j</latex> 列衡量 query 帧 <latex>i</latex> 对 key 帧 <latex>j</latex> "
+        "的图案与它对自己的图案有多相似，每行的自身列恒为 1。"
         f"下表取自 p1 的 {chunk_label(SIM_CHUNK)}、去噪步 {SIM_STEP}"
         "（末步，OSA 校准所用的步）；其余 chunk / 步的完整表见 "
         "results/investigation/qk_map_similarity/similarity/。</p>"
@@ -159,7 +163,7 @@ def sections_xml() -> str:
     for spec in HEAD_SPECS:
         parts.append(f"<h3>{spec_title(spec)}</h3>")
         parts.append(similarity_table(spec))
-    parts.append("<h3>各 chunk 汇总（step 3，key frame 0 列除外的均值）</h3>")
+    parts.append(SUMMARY_H3)
     parts.append(similarity_summary_table())
     return "".join(parts)
 
@@ -191,25 +195,40 @@ def stage_sections() -> None:
 
 
 def mean_cosine(spec: dict, chunk: int, step: int) -> float:
-    table = load_similarity(spec, chunk, step)["cosine"]
-    values = [v for row in table for v in row[1:]]
+    """Mean over all (i, j) with each row's trivially-1 self column excluded."""
+    record = load_similarity(spec, chunk, step)
+    self_columns = record["self_columns"]
+    values = [
+        value
+        for i, row in enumerate(record["cosine"])
+        for j, value in enumerate(row)
+        if j != self_columns[i]
+    ]
     return sum(values) / len(values)
+
+
+def extra_intro_xml() -> str:
+    main_means = "、".join(
+        f"L{spec['layer']}·h{spec['head']} {mean_cosine(spec, SIM_CHUNK, SIM_STEP):.2f}"
+        for spec in HEAD_SPECS
+    )
+    extra_means = "、".join(
+        f"L{spec['layer']}·h{spec['head']} {mean_cosine(spec, SIM_CHUNK, SIM_STEP):.2f}"
+        for spec in EXTRA_HEAD_SPECS
+    )
+    return (
+        f"<p>上面四组显示 pattern 相似度在层 0 很高而其余层明显更低（{main_means}）。"
+        "为验证这一深度趋势，再取 5 个此前未用过的头，均匀铺开在不同层："
+        f"{extra_means}（均为 {chunk_label(SIM_CHUNK)}、step {SIM_STEP}、"
+        "每行自身列除外的均值）。结果一致：帧对帧图案的高度可复制性基本只属于"
+        "层 0，浅层（L5）居中，中间与深层（L10–L29）大幅下降，其中 L10 / L25 "
+        "接近 0。</p>"
+    )
 
 
 def extra_xml() -> str:
     """The depth-verification subsection: intro + one table per extra pick."""
-    means = "、".join(
-        f"L{spec['layer']}·h{spec['head']} {mean_cosine(spec, SIM_CHUNK, SIM_STEP):.2f}"
-        for spec in EXTRA_HEAD_SPECS
-    )
-    parts = ["<h3>深度验证：另取 5 个不同层的头</h3>"]
-    parts.append(
-        "<p>上面四组显示 pattern 相似度在层 0 很高（均值 0.92–0.99）而层 14 / 29 "
-        "明显更低（0.06 / 0.56）。为验证这一深度趋势，再取 5 个此前未用过的头，"
-        f"均匀铺开在不同层：{means}（{chunk_label(SIM_CHUNK)}、step {SIM_STEP} "
-        "的均值）。结果一致：帧对帧图案的高度可复制性基本只属于层 0，"
-        "浅层（L5）和末层（L29）居中，中间层（L10–L25）最低。</p>"
-    )
+    parts = ["<h3>深度验证：另取 5 个不同层的头</h3>", extra_intro_xml()]
     for spec in sorted(EXTRA_HEAD_SPECS, key=lambda s: s["layer"]):
         parts.append(f"<h4>Layer {spec['layer']} · Head {spec['head']}</h4>")
         parts.append(similarity_table(spec))
@@ -239,6 +258,108 @@ def stage_extra() -> None:
         "--block-id", summary_table, "--content", similarity_summary_table(all_specs),
     )
     print("[extra] verification subsection + 9-row summary published")
+
+
+def all_specs_sorted() -> list[dict]:
+    return sorted([*HEAD_SPECS, *EXTRA_HEAD_SPECS], key=lambda s: (s["layer"], s["head"]))
+
+
+def load_temporal(spec: dict) -> dict:
+    name = f"temporal_L{spec['layer']:02d}_h{spec['head']}_ref0_s{SIM_STEP}.json"
+    return json.loads((ROOT / "similarity" / PLOT_RUN / name).read_text())
+
+
+def temporal_xml() -> str:
+    header = "".join(f"<th>{chunk_label(c)}</th>" for c in CHUNK_IDS)
+    rows = []
+    for spec in all_specs_sorted():
+        chunks = load_temporal(spec)["chunks"]
+        cells = []
+        for chunk in CHUNK_IDS:
+            values = [v for row in chunks[str(chunk)] for v in row]
+            cells.append(f"<td>{sum(values) / len(values):.3f}</td>")
+        rows.append(
+            f"<tr><td><p>L{spec['layer']} · h{spec['head']}</p></td>{''.join(cells)}</tr>"
+        )
+    table = (
+        '<table><colgroup><col width="110"/><col span="4" width="130"/></colgroup>'
+        f"<thead><tr><th></th>{header}</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+    return (
+        "<h3>时序一致性：chunk 0 的自身图案随视频推进的保持度</h3>"
+        "<p>时序一致性衡量在参考 chunk <latex>C</latex> 测得的注意力图案在后续 "
+        "chunk 是否仍然成立：取 chunk <latex>C</latex> 中 query 帧 <latex>i</latex> "
+        r"对自身的注意力图 <latex>A_{C,i,\,-3+i}</latex> 为参考（此处 "
+        "<latex>C=0</latex>，即 OSA 校准所用的 chunk），与生成 chunk "
+        "<latex>c</latex> 时的各帧对图比较，报告 "
+        r"<latex>\cos\!\left(A_{C,i,\,-3+i},\,A_{c,i,j}\right)</latex>"
+        "（<latex>c</latex> 取被捕获的 0 / 2 / 4 / 6，step 3）。下图每个子图为一个 "
+        "(层, 头)，横轴为 key 帧 <latex>j</latex>（全局编号），纵轴为对 3 个 query "
+        "帧取均值的余弦相似度，每条线为一个生成 chunk；下表为对全部 "
+        "<latex>(i, j)</latex> 的均值。层 0 的两个头全程平坦地保持在 0.92–0.99——"
+        "chunk 0 测一次、全程可复用；其余层的相似度随 chunk 推进快速衰减"
+        "（如 L14·h2 从 0.40 落到 0.06），仅各 chunk 自己的 3 帧出现小幅回升。</p>"
+        "<p>[[map:temporal_ref0_s3]]</p>"
+        f"{table}"
+    )
+
+
+def stage_resim() -> None:
+    """Republish everything the self-referenced recomputation changed."""
+    data = cli("docs", "+fetch", "--doc", DOC, "--detail", "with-ids")
+    content = data["document"]["content"]
+
+    def block_replace(block_id: str, new_content: str) -> None:
+        cli(
+            "docs", "+update", "--doc", DOC, "--command", "block_replace",
+            "--block-id", block_id, "--content", new_content,
+        )
+
+    intro = re.search(r'<p id="([^"]+)">帧对帧 pattern 相似度', content)
+    block_replace(intro.group(1), similarity_intro_xml())
+    verification = re.search(r'<p id="([^"]+)">上面四组显示', content)
+    block_replace(verification.group(1), extra_intro_xml())
+    for spec in all_specs_sorted():
+        title = (
+            spec_title(spec)
+            if spec in HEAD_SPECS
+            else f"Layer {spec['layer']} · Head {spec['head']}"
+        )
+        # The similarity table is the first table after the pick's heading in
+        # section 3 — search from the *last* occurrence of the title, since
+        # the main picks' titles also head their section-2 map tables.
+        position = content.rindex(f">{title}</h")
+        table_id = re.search(r'<table id="([^"]+)"', content[position:]).group(1)
+        block_replace(table_id, similarity_table(spec))
+    summary_h3 = re.search(r'<h3 id="([^"]+)">各 chunk 汇总[^<]*</h3>', content)
+    block_replace(summary_h3.group(1), SUMMARY_H3)
+    summary_table = re.search(
+        r'<table id="([^"]+)"', content[summary_h3.start() :]
+    ).group(1)
+    block_replace(summary_table, similarity_summary_table(all_specs_sorted()))
+    print("[resim] intro + 9 tables + verification note + summary republished")
+
+
+def stage_temporal() -> None:
+    """Append the temporal-consistency subsection at the end of section 3."""
+    data = cli("docs", "+fetch", "--doc", DOC, "--detail", "with-ids")
+    content = data["document"]["content"]
+    if "时序一致性" not in content:
+        summary_h3 = re.search(r'<h3 id="([^"]+)">各 chunk 汇总', content)
+        anchor = re.search(
+            r'<table id="([^"]+)"', content[summary_h3.start() :]
+        ).group(1)
+        cli(
+            "docs", "+update", "--doc", DOC, "--command", "block_insert_after",
+            "--block-id", anchor, "--content", temporal_xml(),
+        )
+    placeholders = fetch_placeholders()
+    figure = ROOT / "plots" / PLOT_RUN / "temporal_ref0_s3.png"
+    key = "map:temporal_ref0_s3"
+    if key in placeholders:
+        replace_media(DOC, placeholders[key], str(figure))
+    print("[temporal] subsection + figure published")
 
 
 def stage_media() -> None:
@@ -271,7 +392,8 @@ def stage_verify() -> None:
     images = content.count("<img")
     print(f"[verify] placeholders left: {leftovers or 'none'}")
     print(f"[verify] video blocks: {videos} (want {len(PROMPTS)})")
-    print(f"[verify] image blocks: {images} (want {len(HEAD_SPECS) * len(CHUNK_IDS) * len(STEP_IDS)})")
+    maps = len(HEAD_SPECS) * len(CHUNK_IDS) * len(STEP_IDS)
+    print(f"[verify] image blocks: {images} (want {maps} maps + 1 temporal figure)")
     if leftovers:
         raise SystemExit(1)
 
@@ -279,13 +401,17 @@ def stage_verify() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--stage", required=True, choices=["sections", "media", "extra", "verify"]
+        "--stage",
+        required=True,
+        choices=["sections", "media", "extra", "resim", "temporal", "verify"],
     )
     args = parser.parse_args()
     {
         "sections": stage_sections,
         "media": stage_media,
         "extra": stage_extra,
+        "resim": stage_resim,
+        "temporal": stage_temporal,
         "verify": stage_verify,
     }[args.stage]()
 

@@ -48,18 +48,48 @@ def pair_softmax(
 
 
 @torch.no_grad()
+def self_references(
+    query: torch.Tensor, key: torch.Tensor, *, frame_seqlen: int
+) -> list[torch.Tensor]:
+    """Normalized flattened ``A_{i, self}`` per query frame i.
+
+    Query frame i of a chunk is the (num_key_frames - 3 + i)-th key frame —
+    the chunk's own frames are the newest 3 of the visible cache — so this is
+    the map of each frame attending to itself.
+    """
+    key_frames = key.shape[0] // frame_seqlen
+    references = []
+    for i in range(query.shape[0] // frame_seqlen):
+        q_frame = query[i * frame_seqlen : (i + 1) * frame_seqlen]
+        j_self = key_frames - 3 + i
+        k_frame = key[j_self * frame_seqlen : (j_self + 1) * frame_seqlen]
+        flat = pair_softmax(q_frame, k_frame).flatten()
+        references.append(flat / flat.norm())
+    return references
+
+
+@torch.no_grad()
 def cosine_table(
-    query: torch.Tensor, key: torch.Tensor, *, frame_seqlen: int, device: str
+    query: torch.Tensor,
+    key: torch.Tensor,
+    *,
+    frame_seqlen: int,
+    device: str,
+    references: list[torch.Tensor] | None = None,
 ) -> list[list[float]]:
-    """``cos(A_i0, A_ij)`` for every query frame i and key frame j."""
+    """``cos(reference_i, A_ij)`` for every query frame i and key frame j.
+
+    ``references`` defaults to this call's own self maps (``A_{i, -3+i}``);
+    the temporal-consistency analysis passes another chunk's self maps in.
+    """
     query, key = query.to(device), key.to(device)
-    query_frames = query.shape[0] // frame_seqlen
+    if references is None:
+        references = self_references(query, key, frame_seqlen=frame_seqlen)
     key_frames = key.shape[0] // frame_seqlen
     table = []
-    for i in range(query_frames):
+    for i in range(query.shape[0] // frame_seqlen):
         q_frame = query[i * frame_seqlen : (i + 1) * frame_seqlen]
-        reference = pair_softmax(q_frame, key[:frame_seqlen]).flatten()
-        reference = reference / reference.norm()
+        reference = references[i].to(device)
         row = []
         for j in range(key_frames):
             k_frame = key[j * frame_seqlen : (j + 1) * frame_seqlen]
@@ -76,6 +106,13 @@ def main() -> None:
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
     parser.add_argument("--spec", default="main", choices=sorted(SPEC_SETS))
+    parser.add_argument(
+        "--ref-chunk",
+        type=int,
+        default=0,
+        help="reference chunk C of the temporal-consistency pass",
+    )
+    parser.add_argument("--temporal-step", type=int, default=3)
     args = parser.parse_args()
 
     run_dir = ROOT / "runs" / args.run
@@ -100,12 +137,52 @@ def main() -> None:
                     "frame_seqlen": frame_seqlen,
                     "query_frames": len(table),
                     "key_frames": len(table[0]),
+                    "reference": "self",
+                    "self_columns": [
+                        len(table[0]) - 3 + i for i in range(len(table))
+                    ],
                     "cosine": [[round(v, 4) for v in row] for row in table],
                 }
                 name = f"sim_L{spec['layer']:02d}_h{spec['head']}_c{chunk}_s{step}.json"
                 (out_dir / name).write_text(json.dumps(record, indent=2))
             print(f"[sim] L{spec['layer']} h{spec['head']} c{chunk}: done", flush=True)
-    print(f"[sim] wrote {len(list(out_dir.glob('sim_*.json')))} tables -> {out_dir}")
+
+        # Temporal consistency: reference the self maps A_{C,i,-3+i} of chunk
+        # C, compare against every captured chunk's maps A_{c,i,j}.
+        query, key, frame_seqlen = load_qk(
+            run_dir, spec["layer"], spec["head"], args.ref_chunk, args.temporal_step
+        )
+        refs = self_references(
+            query.to(args.device), key.to(args.device), frame_seqlen=frame_seqlen
+        )
+        chunks = {}
+        for chunk in CHUNK_IDS:
+            query, key, frame_seqlen = load_qk(
+                run_dir, spec["layer"], spec["head"], chunk, args.temporal_step
+            )
+            table = cosine_table(
+                query,
+                key,
+                frame_seqlen=frame_seqlen,
+                device=args.device,
+                references=refs,
+            )
+            chunks[chunk] = [[round(v, 4) for v in row] for row in table]
+        record = {
+            "run": args.run,
+            "layer": spec["layer"],
+            "head": spec["head"],
+            "ref_chunk": args.ref_chunk,
+            "step": args.temporal_step,
+            "chunks": chunks,
+        }
+        name = (
+            f"temporal_L{spec['layer']:02d}_h{spec['head']}"
+            f"_ref{args.ref_chunk}_s{args.temporal_step}.json"
+        )
+        (out_dir / name).write_text(json.dumps(record, indent=2))
+        print(f"[sim] L{spec['layer']} h{spec['head']} temporal: done", flush=True)
+    print(f"[sim] wrote {len(list(out_dir.glob('*.json')))} tables -> {out_dir}")
 
 
 if __name__ == "__main__":
