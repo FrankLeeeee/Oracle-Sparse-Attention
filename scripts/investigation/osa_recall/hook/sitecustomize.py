@@ -29,15 +29,20 @@ import threading
 from importlib.abc import MetaPathFinder
 
 TARGET = "sglang.multimodal_gen.runtime.layers.attention.sparse.osa"
+LF_TARGET = "sglang.multimodal_gen.runtime.layers.attention.sparse.lightforcing"
 OUT_PATH = os.environ.get("OSA_RECALL_OUT")
+LF_OUT_PATH = os.environ.get("LF_RECALL_OUT")
 QUERY_STRIDE = int(os.environ.get("OSA_RECALL_QUERY_STRIDE", "32"))
 QUERY_TILE = int(os.environ.get("OSA_RECALL_QUERY_TILE", "32"))
 # Optional: dump one layer's raw per-tile mass profile alongside the summary.
 TILE_DUMP_LAYER = int(os.environ.get("OSA_RECALL_TILE_LAYER", "-1"))
 TILE_DUMP_PATH = os.environ.get("OSA_RECALL_TILE_OUT", "")
 # Optional: dump the full frame-to-frame *section* map [heads, q_tile, k_tile],
-# which keeps the query axis the tile profile marginalises away.
-SECTION_LAYER = int(os.environ.get("OSA_SECTION_LAYER", "-1"))
+# which keeps the query axis the tile profile marginalises away. Accepts a
+# comma-separated layer list.
+SECTION_LAYERS = {
+    int(l) for l in os.environ.get("OSA_SECTION_LAYER", "-1").split(",") if l.strip()
+} - {-1}
 SECTION_CHUNKS = {
     int(c) for c in os.environ.get("OSA_SECTION_CHUNKS", "").split(",") if c.strip()
 }
@@ -49,6 +54,10 @@ SECTION_TILE = int(os.environ.get("OSA_SECTION_TILE", "0"))
 # Optional: per-chunk attention mass and plan recall split by frame group
 # (sink / own chunk / recent / history), for the anchoring analysis.
 GROUP_OUT = os.environ.get("OSA_GROUP_OUT", "")
+# Exact plan-based measurement instead of the legacy uniform-band one. Works
+# for demand-weighted / scheduled plans, whose per-frame tile counts vary; the
+# legacy path assumes a uniform band and would silently mis-slice them.
+EXACT = os.environ.get("OSA_RECALL_EXACT", "") == "1"
 
 
 def _install(module) -> None:
@@ -59,7 +68,7 @@ def _install(module) -> None:
     original_attend = backend_cls.attend
     write_lock = threading.Lock()
     steps: dict[tuple[int, int], int] = {}
-    section_steps: dict[int, int] = {}
+    section_steps: dict[tuple[int, int], int] = {}
     failed: list[str] = []
 
     def emit(record: dict) -> None:
@@ -128,13 +137,14 @@ def _install(module) -> None:
                     reduced = selected.sum(2).view(heads, count, tile, num_tiles).sum(2)
                     maps[name][:, group_start : group_start + count, :] += reduced.double()
 
+        step_key = (call.layer_index, chunk_index)
         for name, value in maps.items():
             path = (
                 f"{SECTION_DIR}/section_L{call.layer_index}"
-                f"_c{chunk_index}_s{section_steps.get(chunk_index, 0)}_{name}.npy"
+                f"_c{chunk_index}_s{section_steps.get(step_key, 0)}_{name}.npy"
             )
             np.save(path, value.cpu().numpy().astype("float32"))
-        section_steps[chunk_index] = section_steps.get(chunk_index, 0) + 1
+        section_steps[step_key] = section_steps.get(step_key, 0) + 1
 
     @torch.no_grad()
     def measure_chunk_2d(self, call, layout, plan) -> None:
@@ -216,6 +226,88 @@ def _install(module) -> None:
                 "recall_frozen": [round(v, 6) for v in recall_frozen.tolist()],
                 "recall_refreshed": [round(v, 6) for v in recall_refreshed.tolist()],
                 "whole_only": [round(v, 6) for v in whole_only.tolist()],
+            }
+        )
+
+    @torch.no_grad()
+    def measure_plan_exact(self, call, layout, plan) -> None:
+        """Recall of the plan as built, plus a free per-row oracle.
+
+        ``recall_frozen``: the mass the plan's actual key blocks capture,
+        summed straight off ``plan.starts`` — exact for any allocation
+        (uniform, demand-weighted, scheduled). ``recall_free``: the best
+        per-(head, query tile) set of the same *number* of 64-token tiles,
+        chosen freely over the whole visible KV (whole-frame exemptions and
+        replication both lifted) — the structural headroom at OSA's own
+        selection granularity.
+        """
+        query = call.query[:1]
+        key = call.key[:1]
+        heads = query.shape[2]
+        kv_len = key.shape[1]
+        frame_seqlen = layout.frame_seqlen
+        key_tile = self._config.spatial_tile
+        n_blocks = plan.starts.shape[2]
+        q_tiles = plan.starts.shape[1]
+        device = query.device
+
+        positions = torch.arange(0, query.shape[1], QUERY_STRIDE, device=device)
+        sampled = query[:, ::QUERY_STRIDE]
+        bucket = ((positions % frame_seqlen) // plan.query_tile).clamp(
+            max=q_tiles - 1
+        ).long()
+        num_sampled = sampled.shape[1]
+        k_tiles_glob = kv_len // key_tile
+
+        frozen = torch.zeros(heads, dtype=torch.float64, device=device)
+        tile_mass = torch.zeros(
+            heads, num_sampled, k_tiles_glob, dtype=torch.float32, device=device
+        )
+        starts = plan.starts.long()  # [heads, q_tiles, n_blocks]
+        for start in range(0, num_sampled, QUERY_TILE):
+            chunk = sampled[:, start : start + QUERY_TILE]
+            scores = torch.einsum("bqhd,bkhd->hqk", chunk, key).float()
+            probs = torch.softmax(scores * call.softmax_scale, dim=-1)
+            cum = torch.nn.functional.pad(probs.cumsum(-1), (1, 0))
+            idx = starts[:, bucket[start : start + QUERY_TILE]]  # [h, nq, n]
+            got = cum.gather(2, (idx + key_tile).clamp(max=kv_len)) - cum.gather(
+                2, idx
+            )
+            frozen += got.sum((1, 2)).double()
+            tile_mass[:, start : start + QUERY_TILE] = (
+                probs[..., : k_tiles_glob * key_tile]
+                .view(heads, -1, k_tiles_glob, key_tile)
+                .sum(-1)
+            )
+
+        # Free oracle: per (head, query tile) the top-n_blocks aligned tiles
+        # of the bucket-mean mass, evaluated on each query's own mass.
+        free = torch.zeros(heads, dtype=torch.float64, device=device)
+        for b in torch.unique(bucket):
+            rows = tile_mass[:, bucket == b]  # [h, nb, k_tiles_glob]
+            best = torch.topk(
+                rows.mean(1), min(n_blocks, k_tiles_glob), dim=-1
+            ).indices
+            free += rows.gather(
+                2, best[:, None, :].expand(-1, rows.shape[1], -1)
+            ).sum((1, 2)).double()
+
+        chunk_index = int(layout.query_chunk_index)
+        key_id = (call.layer_index, chunk_index)
+        step = steps.get(key_id, 0)
+        steps[key_id] = step + 1
+        emit(
+            {
+                "chunk": chunk_index,
+                "layer": int(call.layer_index),
+                "step": step,
+                "kv_frames": int(layout.num_frames),
+                "n_blocks": int(n_blocks),
+                "density": float(plan.density),
+                "recall_frozen": [
+                    round(v, 6) for v in (frozen / num_sampled).tolist()
+                ],
+                "recall_free": [round(v, 6) for v in (free / num_sampled).tolist()],
             }
         )
 
@@ -304,7 +396,7 @@ def _install(module) -> None:
                 handle.write(json.dumps(record) + "\n")
 
     def attend(self, call):
-        if SECTION_DIR and call.layer_index == SECTION_LAYER and not self.in_cache_update:
+        if SECTION_DIR and call.layer_index in SECTION_LAYERS and not self.in_cache_update:
             try:
                 layout = self._layout(call)
                 if layout is not None and layout.query_chunk_index in SECTION_CHUNKS:
@@ -321,12 +413,17 @@ def _install(module) -> None:
             if call.layer_index not in self._section_order:
                 return out
             # By now the plan is in the per-(layer, chunk) cache, so this is a
-            # pure lookup — no re-calibration, no state change.
-            plan = self._prepare_plan(call, layout)
-            if plan is None:
+            # pure lookup — no re-calibration, no state change. Since the
+            # flat-row commit the entry is a (plan, flat_token_index) tuple.
+            entry = self._prepare_plan(call, layout)
+            if entry is None:
                 return out
+            plan, _flat_index = entry
             if isinstance(plan, module.BlockSparsePlan):
-                measure_chunk_2d(self, call, layout, plan)
+                if EXACT:
+                    measure_plan_exact(self, call, layout, plan)
+                else:
+                    measure_chunk_2d(self, call, layout, plan)
                 if GROUP_OUT:
                     measure_groups(self, call, layout, plan)
             # Rolling-window tuples are not measured; the recall study runs on
@@ -341,11 +438,146 @@ def _install(module) -> None:
     print(f"[osa-recall] instrumented OSA, writing {OUT_PATH}", file=sys.stderr)
 
 
+def _install_lightforcing(module) -> None:
+    """Measure the attention mass LightForcing's per-step block mask captures.
+
+    Wraps :meth:`LightForcingAttention.prepare`. The kept-block mask is
+    captured by shadowing the module-level ``lightforcing_block_mask`` the
+    method calls; the wrapper then recomputes ``softmax(q k^T)`` on a strided
+    subset of queries, folds the key axis into LF's frame-aligned key blocks,
+    and reports per head:
+
+    ``recall``
+        mass the mask actually captures (fraction of total, like OSA's
+        ``recall_frozen``).
+    ``recall_oracle``
+        mass the best per-(head, query block) block set at the same block
+        budget would capture — the gap to it is LF's mean-pool estimator cost.
+    """
+    import torch
+
+    backend_cls = module.LightForcingAttention
+    original_prepare = backend_cls.prepare
+    original_mask_fn = module.lightforcing_block_mask
+    write_lock = threading.Lock()
+    steps: dict[tuple[int, int], int] = {}
+    failed: list[str] = []
+    holder: dict[str, object] = {}
+
+    def capture_mask(**kwargs):
+        mask = original_mask_fn(**kwargs)
+        holder["mask"] = mask
+        return mask
+
+    module.lightforcing_block_mask = capture_mask
+
+    @torch.no_grad()
+    def measure(self, call, layout, mask) -> None:
+        config = self._config
+        query = call.query[:1]
+        key = call.key[:1]
+        heads = query.shape[2]
+        kv_len = key.shape[1]
+        frame_seqlen = layout.frame_seqlen
+        blocks_per_frame = -(-frame_seqlen // config.block_k)
+        kv_blocks = layout.num_frames * blocks_per_frame
+        device = query.device
+
+        # Frame-aligned key block of every kv token, [kv_len].
+        token = torch.arange(kv_len, device=device)
+        block_of = (
+            token // frame_seqlen * blocks_per_frame
+            + (token % frame_seqlen) // config.block_k
+        )
+        positions = torch.arange(0, query.shape[1], QUERY_STRIDE, device=device)
+        sampled = query[:, ::QUERY_STRIDE]
+        bucket = (positions // config.block_q).long()  # LF's query blocks
+        num_sampled = sampled.shape[1]
+
+        captured = torch.zeros(heads, dtype=torch.float64, device=device)
+        block_mass = torch.zeros(
+            heads, num_sampled, kv_blocks, dtype=torch.float32, device=device
+        )
+        for start in range(0, num_sampled, QUERY_TILE):
+            chunk = sampled[:, start : start + QUERY_TILE]
+            scores = torch.einsum("bqhd,bkhd->hqk", chunk, key).float()
+            probs = torch.softmax(scores * call.softmax_scale, dim=-1)
+            folded = torch.zeros(
+                heads, probs.shape[1], kv_blocks, dtype=torch.float32, device=device
+            )
+            folded.index_add_(2, block_of, probs)
+            block_mass[:, start : start + QUERY_TILE] = folded
+            kept = mask[:, bucket[start : start + QUERY_TILE], :]  # [h, nq, kb]
+            captured += (folded * kept).sum((1, 2)).double()
+
+        # Oracle at the same per-(head, query block) block budget: top-k of the
+        # bucket-mean true block mass.
+        topk = int(mask[0, 0].sum())
+        buckets = torch.unique(bucket)
+        oracle = torch.zeros(heads, dtype=torch.float64, device=device)
+        for b in buckets:
+            rows = block_mass[:, bucket == b]  # [h, nb, kv_blocks]
+            mean = rows.mean(1)
+            best = torch.topk(mean, topk, dim=-1).indices  # [h, topk]
+            kept_mass = rows.gather(
+                2, best[:, None, :].expand(-1, rows.shape[1], -1)
+            ).sum((1, 2))
+            oracle += kept_mass.double()
+
+        sizes = torch.zeros(kv_blocks, dtype=torch.float64, device=device)
+        sizes.index_add_(0, block_of, torch.ones_like(token, dtype=torch.float64))
+        density = float(
+            (mask.double() * sizes).sum() / (mask.shape[0] * mask.shape[1] * kv_len)
+        )
+
+        chunk_index = int(layout.query_chunk_index)
+        key_id = (call.layer_index, chunk_index)
+        step = steps.get(key_id, 0)
+        steps[key_id] = step + 1
+        record = {
+            "chunk": chunk_index,
+            "layer": int(call.layer_index),
+            "step": step,
+            "kv_frames": int(layout.num_frames),
+            "kv_blocks": int(kv_blocks),
+            "topk": topk,
+            "density": round(density, 6),
+            "recall": [round(v, 6) for v in (captured / num_sampled).tolist()],
+            "recall_oracle": [round(v, 6) for v in (oracle / num_sampled).tolist()],
+        }
+        with write_lock:
+            with open(LF_OUT_PATH, "a") as handle:
+                handle.write(json.dumps(record) + "\n")
+
+    def prepare(self, call, layout):
+        holder.pop("mask", None)
+        execution = original_prepare(self, call, layout)
+        if execution is None or self.in_cache_update:
+            return execution
+        mask = holder.pop("mask", None)
+        if mask is None:
+            return execution
+        try:
+            measure(self, call, layout, mask)
+        except Exception as exc:  # noqa: BLE001 - never break the run
+            if not failed:
+                failed.append(str(exc))
+                print(f"[lf-recall] measurement disabled: {exc!r}", file=sys.stderr)
+        return execution
+
+    backend_cls.prepare = prepare
+    print(f"[lf-recall] instrumented LightForcing, writing {LF_OUT_PATH}", file=sys.stderr)
+
+
 class _PostImportHook(MetaPathFinder):
-    """Let the normal machinery load the OSA module, then patch it."""
+    """Let the normal machinery load the target module, then patch it."""
+
+    def __init__(self, target: str, install) -> None:
+        self._target = target
+        self._install = install
 
     def find_spec(self, fullname, path=None, target=None):
-        if fullname != TARGET:
+        if fullname != self._target:
             return None
         sys.meta_path.remove(self)
         try:
@@ -355,14 +587,17 @@ class _PostImportHook(MetaPathFinder):
         if spec is None or spec.loader is None:
             return None
         real_exec = spec.loader.exec_module
+        install = self._install
 
         def exec_module(module):
             real_exec(module)
-            _install(module)
+            install(module)
 
         spec.loader.exec_module = exec_module
         return spec
 
 
 if OUT_PATH:
-    sys.meta_path.insert(0, _PostImportHook())
+    sys.meta_path.insert(0, _PostImportHook(TARGET, _install))
+if LF_OUT_PATH:
+    sys.meta_path.insert(0, _PostImportHook(LF_TARGET, _install_lightforcing))

@@ -45,6 +45,13 @@ def frame_count(seconds: float, fps: int) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="self_forcing", choices=MODEL_KEYS)
+    parser.add_argument("--method", default="osa", choices=["osa", "lightforcing"])
+    parser.add_argument(
+        "--lf-front-loaded",
+        action="store_true",
+        help="use LightForcing's published front-loaded schedule (base 0.98) "
+        "instead of a constant per-chunk sparsity",
+    )
     parser.add_argument("--gpu", type=int, default=5)
     parser.add_argument("--density", type=float, default=0.3)
     parser.add_argument("--seconds", type=float, default=10.0)
@@ -52,9 +59,14 @@ def main() -> None:
     parser.add_argument("--query-stride", type=int, default=32)
     parser.add_argument("--port-base", type=int, default=29700)
     parser.add_argument("--tile-layer", type=int, default=-1)
+    # Comma-separated layer list for the section dumps; defaults to tile-layer.
+    parser.add_argument("--section-layers", default="")
     parser.add_argument("--section-chunks", default="")
     parser.add_argument("--whole-frames", default="", choices=["", "all", "anchors", "sink", "none"])
     parser.add_argument("--groups", action="store_true")
+    # Extra OsaConfig fields as JSON, e.g. '{"demand_weighted": true}'.
+    parser.add_argument("--osa-extra", default="")
+    parser.add_argument("--exact", action="store_true")
     parser.add_argument("--dense", action="store_true")
     parser.add_argument("--no-hook", action="store_true")
     parser.add_argument("--tag", default=None)
@@ -63,7 +75,8 @@ def main() -> None:
     spec = MODELS[args.model]
     width, height = spec["resolutions"][args.res]
     frames = frame_count(args.seconds, spec["fps"])
-    tag = args.tag or f"{args.model}_d{args.density:g}_{frames}f"
+    method = "" if args.method == "osa" else f"_{args.method}"
+    tag = args.tag or f"{args.model}{method}_d{args.density:g}_{frames}f"
     out_dir = ROOT / tag
     out_dir.mkdir(parents=True, exist_ok=True)
     sections = out_dir / "sections"
@@ -72,12 +85,26 @@ def main() -> None:
     if recall_path.exists():
         recall_path.unlink()
 
-    config = {
-        "density": args.density,
-        "sink_latent_frames": 1,
-        "num_recent_frames": 1,
-    }
-    if args.whole_frames:
+    if args.method == "lightforcing":
+        # Constant per-chunk sparsity (base == target makes the schedule flat)
+        # so every sparse call runs at the same density as OSA's constant knob;
+        # --lf-front-loaded keeps upstream's decaying schedule at the same
+        # whole-video mean instead.
+        config = {
+            "sparsity": 1.0 - args.density,
+            "sparsity_base": 0.98 if args.lf_front_loaded else 1.0 - args.density,
+            "num_output_frames": (frames + 3) // 4,
+            "local_attn_size": -1,
+        }
+    else:
+        config = {
+            "density": args.density,
+            "sink_latent_frames": 1,
+            "num_recent_frames": 1,
+        }
+    if args.method == "osa" and args.osa_extra:
+        config.update(json.loads(args.osa_extra))
+    if args.method == "osa" and args.whole_frames:
         own, sink, recent = {
             "all": (True, True, True),
             "anchors": (False, True, True),
@@ -92,7 +119,12 @@ def main() -> None:
     sparse_flags = (
         []
         if args.dense
-        else ["--sparse-attention", "osa", "--sparse-attention-config", json.dumps(config)]
+        else [
+            "--sparse-attention",
+            args.method,
+            "--sparse-attention-config",
+            json.dumps(config),
+        ]
     )
     cmd = [
         "sglang",
@@ -118,18 +150,21 @@ def main() -> None:
         "--port",
         str(args.port_base + 2),
     ]
+    hook_out = "" if args.no_hook else str(recall_path)
     env = dict(os.environ)
     env.update(
         PYTHONPATH=os.pathsep.join([str(HERE / "hook"), str(REPO / "python")]),
         FLASHINFER_DISABLE_VERSION_CHECK="1",
         CUDA_VISIBLE_DEVICES=str(args.gpu),
         SGLANG_DIFFUSION_STAGE_LOGGING="1",
-        OSA_RECALL_OUT="" if args.no_hook else str(recall_path),
+        OSA_RECALL_OUT=hook_out if args.method == "osa" else "",
+        LF_RECALL_OUT=hook_out if args.method == "lightforcing" else "",
+        OSA_RECALL_EXACT="1" if args.exact else "",
         OSA_RECALL_QUERY_STRIDE=str(args.query_stride),
         OSA_RECALL_TILE_LAYER=str(args.tile_layer),
         OSA_RECALL_TILE_OUT=str(out_dir / "tile_profile.jsonl"),
         OSA_GROUP_OUT=str(out_dir / "groups.jsonl") if args.groups else "",
-        OSA_SECTION_LAYER=str(args.tile_layer),
+        OSA_SECTION_LAYER=args.section_layers or str(args.tile_layer),
         OSA_SECTION_CHUNKS=args.section_chunks,
         OSA_SECTION_DIR=str(sections) if args.section_chunks else "",
     )
