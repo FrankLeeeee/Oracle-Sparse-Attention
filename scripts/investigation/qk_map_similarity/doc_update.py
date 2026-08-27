@@ -104,6 +104,24 @@ def similarity_summary_table() -> str:
     )
 
 
+def similarity_intro_xml() -> str:
+    return (
+        "<p>帧对帧 pattern 相似度：一次注意力调用有 <latex>S_q</latex> 个 query "
+        "token、<latex>S_k</latex> 个 key token，每个潜帧 <latex>T=3600</latex> 个 "
+        "token，即 <latex>S_q/T</latex> 个 query 帧 × <latex>S_k/T</latex> 个 key 帧"
+        "的帧对。对 query 帧 <latex>i</latex> 与 key 帧 <latex>j</latex>，取 "
+        r"<latex>A_{i,j}=\mathrm{softmax}\!\left(Q_i K_j^{\top}/\sqrt{d}\right)"
+        "</latex>（softmax 仅在该 key 帧的 <latex>T</latex> 个 token 上进行，即该"
+        "帧对的独立注意力图），表中数值为展平后的余弦相似度 "
+        r"<latex>\cos\!\left(A_{i,0},\,A_{i,j}\right)</latex>——第 <latex>j</latex> "
+        "列衡量 query 帧 <latex>i</latex> 对 key 帧 <latex>j</latex> 的图案与它对 "
+        "key 帧 0 的图案有多相似，第 0 列恒为 1。"
+        f"下表取自 p1 的 {chunk_label(SIM_CHUNK)}、去噪步 {SIM_STEP}"
+        "（末步，OSA 校准所用的步）；其余 chunk / 步的完整表见 "
+        "results/investigation/qk_map_similarity/similarity/。</p>"
+    )
+
+
 def sections_xml() -> str:
     parts = ["<h2>1. Sample Videos</h2>"]
     parts.append(
@@ -131,17 +149,7 @@ def sections_xml() -> str:
         parts.append(map_table(spec))
 
     parts.append("<h2>3. Pattern Similarity</h2>")
-    parts.append(
-        "<p>帧对帧 pattern 相似度：一次注意力调用有 Sq 个 query token、Sk 个 key "
-        "token，每个潜帧 T=3600 token，即 Sq/T 个 query 帧 × Sk/T 个 key 帧的帧对。"
-        "对 query 帧 i 与 key 帧 j，取 A_ij = softmax(Q_i K_jᵀ/√d)（softmax 仅在该 "
-        "key 帧的 T 个 token 上进行，即该帧对的独立注意力图），"
-        "表中数值为 A_i0 与 A_ij 展平后的余弦相似度——第 j 列衡量 query 帧 i "
-        "对 key 帧 j 的图案与它对 key 帧 0 的图案有多相似，第 0 列恒为 1。"
-        f"下表取自 p1 的 {chunk_label(SIM_CHUNK)}、去噪步 {SIM_STEP}"
-        "（末步，OSA 校准所用的步）；其余 chunk / 步的完整表见 "
-        "results/investigation/qk_map_similarity/similarity/。</p>"
-    )
+    parts.append(similarity_intro_xml())
     for spec in HEAD_SPECS:
         parts.append(f"<h3>{spec_title(spec)}</h3>")
         parts.append(similarity_table(spec))
