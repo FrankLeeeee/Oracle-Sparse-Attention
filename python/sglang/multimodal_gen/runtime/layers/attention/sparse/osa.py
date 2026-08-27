@@ -33,6 +33,11 @@ once during generation:
 3. Execution runs through the uniform block-sparse Triton kernel
    (``block_kernel.py``): every (head, query tile) keeps the same number of
    key tiles, so the trip count is grid-uniform and the K/V loads pipeline.
+
+``OsaConfig.replan_each_chunk`` swaps step 1-2 for a per-chunk measurement:
+each chunk's first sparse forward measures its own per-(head, query tile)
+tile mass over the whole visible window and keeps the top tiles anywhere in
+it (see the config field's rationale). Execution is unchanged.
 """
 
 import msgspec
@@ -49,6 +54,7 @@ from sglang.multimodal_gen.runtime.layers.attention.sparse.block_kernel import (
     BlockSparsePlan,
     block_sparse_attention,
     build_block_plan,
+    build_measured_block_plan,
 )
 from sglang.multimodal_gen.runtime.layers.attention.sparse.context import (
     ChunkGeometry,
@@ -134,6 +140,30 @@ class OsaConfig(msgspec.Struct, frozen=True):
     # frames below their floor (the osa2s/osa2a 5 s failure mode). True keeps
     # the historical accounting where exemptions come out of the same budget.
     charge_exempt_frames: bool = True
+    # --- Per-chunk measured re-planning -------------------------------------
+    # Replace the chunk-0-frozen replicated pattern with a plan measured on
+    # each chunk's own activations: at the chunk's first sparse forward,
+    # per-(head, query tile) key-tile mass is measured over the whole visible
+    # window (the same strided softmax recompute as the chunk-0 calibration)
+    # and the budget buys each row its top tiles *anywhere* in the window —
+    # per-frame tile variation and demand-proportional per-frame allocation
+    # fall out of the measurement instead of being replicated or ruled.
+    # Motivated by the 2026-08-27 recall study: the frozen pattern transfers
+    # across chunks and steps at 0.96-0.99, but replication caps recall at
+    # 0.83 where free per-row selection at the same budget reaches 0.90
+    # (Self-Forcing 720p, density 0.3). The keep_*_full switches and
+    # chunk_schedule compose; demand_weighted and flat_row_dense describe the
+    # replicated pattern and are rejected. Single-chunk queries only (a
+    # rolling-forcing window falls back to dense with a warning).
+    replan_each_chunk: bool = False
+    # Query sub-sampling of the per-chunk measurement. It reads the full KV
+    # for 1/stride of the queries once per (layer, chunk); that read is
+    # charged to the reported density of the planning call, and its walltime
+    # is the feature's overhead. Recall is stride-insensitive (0.8656 /
+    # 0.8657 / 0.8647 at strides 8/16/32, Self-Forcing 720p d0.3) because
+    # the per-bucket profile averages over many queries either way, so the
+    # default takes the cheapest measured setting.
+    replan_query_stride: int = 32
     # --- Flat-row dense fallback --------------------------------------------
     # A query tile whose mass distribution is flat has no peaky pattern for
     # the frozen top-k to exploit: at a given budget its retention runs ~10 pt
@@ -206,6 +236,70 @@ def measure_section_tile_mass(
     return mass
 
 
+@torch.no_grad()
+def measure_visible_tile_mass(
+    *,
+    query: torch.Tensor,  # [batch, q_len, heads, head_dim]
+    key: torch.Tensor,  # [batch, kv_len, heads, head_dim]
+    layout: VisibleLayout,
+    softmax_scale: float,
+    query_stride: int,
+    query_tile: int,
+    spatial_tile: int,
+) -> torch.Tensor:
+    """Mean mass per (query tile, visible frame, key tile): ``[heads, q_tiles, num_frames, k_tiles]``.
+
+    Unlike :func:`measure_section_tile_mass` the key axis keeps its frame
+    identity, so every visible frame gets its own profile — the input of the
+    per-chunk measured plan. Deliberately not shared with the section
+    measurement: that one runs a float32 matmul (cheap at chunk 0's KV) whose
+    numerics the frozen path's reproducibility depends on. Here the KV is the
+    whole window and the measurement runs once per (layer, chunk) inside the
+    denoise loop, so every pass over the score matrix counts: scores stay in
+    the input dtype (tensor cores, half the traffic), the softmax upcasts to
+    float32 internally via ``dtype=``, and the tile fold is a matmul with a
+    ``[frame_seqlen, k_tiles]`` indicator matrix (an index_add fold measured
+    4x slower — atomic contention over the tile slots). Logits rounded to
+    bf16 move tile masses by ~1e-3 relative — irrelevant for ranking tiles.
+    """
+    frame_seqlen = layout.frame_seqlen
+    num_frames = layout.num_frames
+    num_heads = query.shape[2]
+    kv_len = key.shape[1]
+    k_tiles = (frame_seqlen + spatial_tile - 1) // spatial_tile
+    q_tiles = (frame_seqlen + query_tile - 1) // query_tile
+    device = query.device
+
+    positions = torch.arange(0, query.shape[1], query_stride, device=device)
+    sampled = (query[:1, ::query_stride] * softmax_scale).to(query.dtype)
+    bucket = (positions % frame_seqlen) // query_tile
+    keys = key[:1]
+    within = torch.arange(frame_seqlen, device=device)
+    fold = torch.zeros(frame_seqlen, k_tiles, dtype=torch.float32, device=device)
+    fold[within, within // spatial_tile] = 1.0
+    mass = torch.zeros(
+        num_heads, q_tiles, num_frames, k_tiles, dtype=torch.float32, device=device
+    )
+    counts = torch.zeros(q_tiles, dtype=torch.float32, device=device)
+    counts.index_add_(0, bucket, torch.ones_like(bucket, dtype=torch.float32))
+    # Cap the float32 softmax buffer near 800 MB.
+    block = max(16, min(256, int(8e8 // (num_heads * kv_len * 4))))
+    for start in range(0, sampled.shape[1], block):
+        tile = sampled[:, start : start + block]
+        scores = torch.einsum("bqhd,bkhd->hqk", tile, keys)
+        # Softmax upcasts internally; keeping the probs in the input dtype
+        # halves the dominant write+read (bf16 probs move a 64-token tile
+        # mass by ~0.05% — irrelevant for ranking). The fold accumulates in
+        # float32 inside the matmul.
+        probs = torch.softmax(scores, dim=-1)
+        per_tile = probs.view(num_heads, -1, num_frames, frame_seqlen) @ fold.to(
+            probs.dtype
+        )
+        mass.index_add_(1, bucket[start : start + block], per_tile.float())
+    mass /= counts.clamp(min=1.0)[None, :, None, None]
+    return mass
+
+
 def flops_matched_densities(
     *,
     num_frames: int,
@@ -274,6 +368,14 @@ class OracleSparseAttention(SparseAttentionBackend):
                 "chunk_schedule='flops_matched' needs schedule_num_frames "
                 "(the video's latent frame count)"
             )
+        if config.replan_each_chunk and (
+            config.demand_weighted or config.flat_row_dense
+        ):
+            raise ValueError(
+                "replan_each_chunk replaces the frozen replicated pattern; "
+                "demand_weighted and flat_row_dense describe that pattern "
+                "and cannot be combined with it"
+            )
         self._density = density
         self._config = config
         # chunk index -> per-call density, solved once (flops_matched only).
@@ -293,6 +395,9 @@ class OracleSparseAttention(SparseAttentionBackend):
         self._last_chunk_index = -1
         self._forwards_this_chunk = 0
         self._logged_summary = False
+        # Full-KV read fraction of a just-run per-chunk measurement, charged
+        # to the reported density of the call that paid for it.
+        self._pending_measure_charge = 0.0
 
     def _on_begin_forward(self, geometry: ChunkGeometry) -> None:
         chunk_index = geometry.query_chunk_index
@@ -314,6 +419,7 @@ class OracleSparseAttention(SparseAttentionBackend):
         self._last_chunk_index = -1
         self._forwards_this_chunk = 0
         self._logged_summary = False
+        self._pending_measure_charge = 0.0
 
     def prepare(
         self, call: SparseAttentionCall, layout: VisibleLayout
@@ -341,6 +447,9 @@ class OracleSparseAttention(SparseAttentionBackend):
                 softmax_scale=call.softmax_scale,
             )
             fraction = plan.density
+            if self._pending_measure_charge:
+                fraction = min(1.0, fraction + self._pending_measure_charge)
+                self._pending_measure_charge = 0.0
             if flat_index is not None and flat_index.numel():
                 # Flat rows: overwrite the patterned output with exact dense
                 # attention over the full visible KV.
@@ -405,8 +514,9 @@ class OracleSparseAttention(SparseAttentionBackend):
             # Chunk 0 runs dense; every denoising step overwrites the
             # measurement so the frozen pattern is the last step's, which is
             # when the pattern has settled. The clean-latent KV-refresh pass
-            # runs after the last step and must not overwrite.
-            if not self.in_cache_update:
+            # runs after the last step and must not overwrite. The per-chunk
+            # measured path needs no chunk-0 calibration at all.
+            if not self.in_cache_update and not self._config.replan_each_chunk:
                 self._section_mass[call.layer_index] = measure_section_tile_mass(
                     query=call.query,
                     key=call.key,
@@ -417,6 +527,8 @@ class OracleSparseAttention(SparseAttentionBackend):
                     spatial_tile=self._config.spatial_tile,
                 )
             return None
+        if self._config.replan_each_chunk:
+            return self._replan_entry(call, layout)
         order = self._section_order.get(call.layer_index)
         if order is None:
             mass = self._section_mass.get(call.layer_index)
@@ -483,6 +595,109 @@ class OracleSparseAttention(SparseAttentionBackend):
         self._plans.put(call.layer_index, signature, entry)
         self._log_summary(layout)
         return entry
+
+    def _replan_entry(
+        self, call: SparseAttentionCall, layout: VisibleLayout
+    ) -> tuple[BlockSparsePlan, None] | None:
+        """The per-chunk measured plan, cached per (layer, layout signature).
+
+        The cache miss happens on the chunk's first sparse forward — a
+        denoising step, since those precede the KV-refresh pass — so the
+        measurement sees denoising activations, and every later step of the
+        chunk (and its refresh pass) reuses the plan.
+        """
+        num_query_chunks, ragged = divmod(layout.query_frames, layout.frames_per_block)
+        if ragged or num_query_chunks != 1:
+            self.warn_dense_once(
+                "replan_each_chunk needs a single-chunk query "
+                f"(got {layout.query_frames} frames of {layout.frames_per_block})"
+            )
+            return None
+        signature = (
+            call.key_segments,
+            layout.query_frames,
+            call.head_start,
+            call.num_local_heads,
+        )
+        hit, cached = self._plans.get(call.layer_index, signature)
+        if hit:
+            return cached
+        plan = self._measured_chunk_plan(call, layout)
+        entry = None if plan is None else (plan, None)
+        self._plans.put(call.layer_index, signature, entry)
+        if not self._logged_summary:
+            self._logged_summary = True
+            logger.info(
+                "OSA re-planning per chunk: target density %.2f, measured at "
+                "query stride %d over the visible window (%d frames)",
+                self._density,
+                self._config.replan_query_stride,
+                layout.num_frames,
+            )
+        return entry
+
+    def _measured_chunk_plan(
+        self, call: SparseAttentionCall, layout: VisibleLayout
+    ) -> BlockSparsePlan | None:
+        """One chunk's plan measured on its own activations.
+
+        Per (head, query tile), the budget buys the top-mass 64-token key
+        tiles anywhere in the visible window's non-whole frames; whole frames
+        follow the keep_*_full switches exactly like the frozen path, so the
+        density accounting and floors are identical. Returns ``None`` when the
+        budget keeps everything.
+        """
+        config = self._config
+        tile_size = config.spatial_tile
+        frame_seqlen = layout.frame_seqlen
+        num_frames = layout.num_frames
+        full_tiles = frame_seqlen // tile_size
+        own = layout.frames_of_offset(0)
+        if not own.any():
+            return None
+        ages = frame_ages(layout, query_chunk_offset=0)
+        full = self._whole_frame_mask(layout, own, ages)
+        num_full = int(full.sum())
+        num_other = num_frames - num_full
+        budget = self._call_density(layout) * num_frames * frame_seqlen
+        if config.charge_exempt_frames:
+            budget -= num_full * frame_seqlen
+        if num_other == 0 or budget >= num_other * frame_seqlen:
+            return None
+        stride = config.replan_query_stride
+        mass = measure_visible_tile_mass(
+            query=call.query,
+            key=call.key,
+            layout=layout,
+            softmax_scale=call.softmax_scale,
+            query_stride=stride,
+            query_tile=config.query_tile,
+            spatial_tile=tile_size,
+        )
+        self._pending_measure_charge = 1.0 / stride
+        device = mass.device
+        full_frames = torch.from_numpy(full).to(device)
+        frame_ids = torch.arange(num_frames, dtype=torch.int32, device=device)
+        candidates = mass[:, :, ~full_frames, :full_tiles]
+        heads, q_tiles = candidates.shape[:2]
+        flat = candidates.reshape(heads, q_tiles, num_other * full_tiles)
+        total_kept = min(
+            max(1, int(round(budget / tile_size))), num_other * full_tiles
+        )
+        top = flat.topk(total_kept, dim=2).indices
+        other_offsets = frame_ids[~full_frames] * frame_seqlen
+        tile_starts = (
+            other_offsets[top // full_tiles]
+            + (top % full_tiles).to(torch.int32) * tile_size
+        )
+        return build_measured_block_plan(
+            tile_starts=tile_starts,
+            whole_offsets=frame_ids[full_frames] * frame_seqlen,
+            frame_seqlen=frame_seqlen,
+            query_tile=config.query_tile,
+            key_tile=tile_size,
+            kv_len=layout.kv_len,
+        )
 
     def _flat_token_index(
         self, layout: VisibleLayout, flat_rows: tuple[int, ...]

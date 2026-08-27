@@ -1118,3 +1118,132 @@ def test_osa_flat_row_dense_fallback_is_exact_and_fades_with_budget():
     assert generous.attend(_self_forcing_call(device, chunk_index=6)) is not None
     _plan, flat_index = generous._plans._entries[0][1]
     assert flat_index is None or flat_index.numel() == 0
+
+
+def test_osa_replan_rejects_pattern_only_knobs():
+    """demand_weighted / flat_row_dense describe the frozen replicated pattern
+    and cannot be combined with per-chunk measured re-planning."""
+    for extra in ({"demand_weighted": True}, {"flat_row_dense": True}):
+        with pytest.raises(ValueError, match="replan_each_chunk"):
+            build_sparse_attention_backend(
+                "osa", {"density": 0.3, "replan_each_chunk": True, **extra}
+            )
+
+
+@requires_cuda
+def test_osa_replan_each_chunk_is_exact_and_beats_frozen_recall():
+    """replan_each_chunk plans from each chunk's own measured mass: chunk 0
+    stores no calibration, whole frames still follow the keep switches, the
+    kernel output equals masked SDPA under the plan, and — on the same
+    tensors — the measured plan captures at least as much attention mass as
+    the frozen replicated pattern at the same whole-frame geometry."""
+    from sglang.multimodal_gen.runtime.layers.attention.sparse.block_kernel import (
+        BlockSparsePlan,
+    )
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    heads, query_tile = 4, 128
+    chunk_index = 9
+    base = {
+        "density": 0.4,
+        "spatial_tile": 64,
+        "calibration_query_stride": 4,
+        "query_tile": query_tile,
+    }
+    call_c0 = _self_forcing_call(device, chunk_index=0, heads=heads)
+    call = _self_forcing_call(device, chunk_index=chunk_index, heads=heads)
+
+    def plan_and_out(config: dict):
+        backend = build_sparse_attention_backend("osa", config)
+        backend.begin_forward(_geometry(0))
+        assert backend.attend(call_c0) is None
+        backend.begin_forward(_geometry(chunk_index))
+        out = backend.attend(call)
+        assert out is not None
+        plan, _flat = backend._plans._entries[0][1]
+        assert isinstance(plan, BlockSparsePlan)
+        return backend, plan, out
+
+    backend, plan, out = plan_and_out({**base, "replan_each_chunk": True})
+    assert not backend._section_mass and not backend._section_order
+
+    kv_len = call.key.shape[1]
+    num_frames = kv_len // FRAME_SEQLEN
+    q_tiles = -(-FRAME_SEQLEN // query_tile)
+    body = (FRAME_SEQLEN // 64) * 64
+
+    def allow_mask(p: BlockSparsePlan) -> torch.Tensor:
+        allow = torch.zeros(heads, q_tiles, kv_len, dtype=torch.bool, device=device)
+        for h in range(heads):
+            for t in range(q_tiles):
+                for s0 in p.starts[h, t].tolist():
+                    allow[h, t, s0 : s0 + p.key_tile] = True
+        return allow
+
+    allow = allow_mask(plan)
+    frames = allow.view(heads, q_tiles, num_frames, FRAME_SEQLEN)
+    # Whole frames per the default keep switches: sink 0, the two recent
+    # frames, and the own chunk.
+    whole = [0, num_frames - 5, num_frames - 4, num_frames - 3, num_frames - 2,
+             num_frames - 1]
+    assert frames[:, :, whole, :body].all()
+
+    # The execution equals masked SDPA under the plan's own mask.
+    row_tile = (
+        torch.arange(call.query.shape[1], device=device) % FRAME_SEQLEN
+    ) // query_tile
+    scores = (
+        torch.einsum("qhd,khd->hqk", call.query[0].float(), call.key[0].float())
+        * call.softmax_scale
+    )
+    masked = scores.masked_fill(~allow[:, row_tile, :], float("-inf"))
+    reference = torch.softmax(masked, dim=-1) @ call.value[0].float().permute(1, 0, 2)
+    torch.testing.assert_close(
+        out[0].float(), reference.permute(1, 0, 2), atol=3e-2, rtol=3e-2
+    )
+
+    # Same tensors, frozen replicated pattern at the same geometry: the
+    # measured plan must capture at least as much true attention mass.
+    _backend, frozen_plan, _out = plan_and_out(base)
+    probs = torch.softmax(scores, dim=-1)
+    measured_mass = probs.masked_fill(~allow[:, row_tile, :], 0.0).sum()
+    frozen_mass = probs.masked_fill(
+        ~allow_mask(frozen_plan)[:, row_tile, :], 0.0
+    ).sum()
+    assert measured_mass >= frozen_mass - 1e-4
+
+
+@requires_cuda
+def test_osa_replan_declines_window_queries():
+    """A rolling-window call (multi-chunk query) falls back to dense under
+    replan_each_chunk instead of building a mis-scoped plan."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    heads, head_dim = 4, 64
+    chunk_tokens = FRAMES_PER_BLOCK * FRAME_SEQLEN
+    backend = build_sparse_attention_backend(
+        "osa", {"density": 0.4, "replan_each_chunk": True}
+    )
+    key_segments = (
+        (0, chunk_tokens),
+        (4 * chunk_tokens, chunk_tokens),
+        (5 * chunk_tokens, 3 * chunk_tokens),
+    )
+    kv_len = sum(length for _, length in key_segments)
+    query = torch.randn(
+        1, 3 * chunk_tokens, heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    key = torch.randn(1, kv_len, heads, head_dim, device=device, dtype=torch.bfloat16)
+    call = SparseAttentionCall(
+        layer_index=0,
+        query=query,
+        key=key,
+        value=torch.randn_like(key),
+        key_segments=key_segments,
+        head_start=0,
+        num_local_heads=heads,
+        softmax_scale=head_dim**-0.5,
+    )
+    backend.begin_forward(_geometry(5))
+    assert backend.attend(call) is None

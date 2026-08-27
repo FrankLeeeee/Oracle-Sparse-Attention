@@ -410,7 +410,10 @@ def _install(module) -> None:
             layout = self._layout(call)
             if layout is None or layout.query_chunk_index < 1:
                 return out
-            if call.layer_index not in self._section_order:
+            if (
+                not self._config.replan_each_chunk
+                and call.layer_index not in self._section_order
+            ):
                 return out
             # By now the plan is in the per-(layer, chunk) cache, so this is a
             # pure lookup — no re-calibration, no state change. Since the

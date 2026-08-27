@@ -262,6 +262,52 @@ def build_block_plan(
     )
 
 
+def build_measured_block_plan(
+    *,
+    tile_starts: torch.Tensor,  # [heads, q_tiles, n] absolute token starts
+    whole_offsets: torch.Tensor,  # [n_whole] int32, token offset per whole frame
+    frame_seqlen: int,
+    query_tile: int,
+    key_tile: int,
+    kv_len: int,
+) -> BlockSparsePlan:
+    """Flat block list from per-(head, query tile) *absolute* tile starts.
+
+    The per-chunk measured path (``OsaConfig.replan_each_chunk``) selects its
+    key tiles anywhere in the visible window instead of replicating one
+    section pattern, so it arrives with absolute starts already. Whole frames
+    are expanded over their full tiles exactly like :func:`build_block_plan`
+    (short raster tail excluded), and each row is sorted ascending for the
+    DRAM-friendliest walk.
+    """
+    heads, q_tiles, _ = tile_starts.shape
+    device = tile_starts.device
+    full_tiles = frame_seqlen // key_tile
+    within = torch.arange(full_tiles, device=device, dtype=torch.int32) * key_tile
+    whole_starts = (whole_offsets[:, None] + within[None, :]).reshape(-1)
+    starts = (
+        torch.cat(
+            [
+                whole_starts[None, None, :].expand(heads, q_tiles, -1),
+                tile_starts.to(torch.int32),
+            ],
+            dim=2,
+        )
+        .sort(dim=-1)
+        .values.contiguous()
+    )
+    kept = starts.shape[2] * key_tile
+    return BlockSparsePlan(
+        starts=starts,
+        q_tiles_per_frame=q_tiles,
+        frame_seqlen=frame_seqlen,
+        query_tile=query_tile,
+        key_tile=key_tile,
+        kept_tokens=kept,
+        density=kept / kv_len,
+    )
+
+
 def block_sparse_attention(
     *,
     query: torch.Tensor,  # [batch, q_len, heads, head_dim]

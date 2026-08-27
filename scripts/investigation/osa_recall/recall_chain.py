@@ -18,40 +18,16 @@ sys.path.insert(0, str(HERE.parent / "sparse_baselines"))
 sys.path.insert(0, str(HERE.parent))
 from common import GpuPool, GpuWatchdog, compute_apps  # noqa: E402
 
-# Lever experiments: exact plan recall + free oracle for the allocation knobs.
+# replan_each_chunk final timing at the shipped default (stride 32).
 JOBS = [
     {
-        "tag": "sf_exact_base",
-        "args": ["--exact", "--tag", "sf_exact_base", "--port-base", "29760"],
-    },
-    {
-        "tag": "sf_exact_dw",
+        "tag": "sf20_replan32_time",
         "args": [
-            "--exact",
-            "--osa-extra", '{"demand_weighted": true}',
-            "--tag", "sf_exact_dw",
-            "--port-base", "29770",
-        ],
-    },
-    {
-        "tag": "sf_exact_sched",
-        "args": [
-            "--exact",
-            "--osa-extra",
-            '{"chunk_schedule": "flops_matched", "schedule_num_frames": 39}',
-            "--tag", "sf_exact_sched",
-            "--port-base", "29775",
-        ],
-    },
-    {
-        "tag": "sf_exact_dw_sched",
-        "args": [
-            "--exact",
-            "--osa-extra",
-            '{"demand_weighted": true, "chunk_schedule": "flops_matched",'
-            ' "schedule_num_frames": 39}',
-            "--tag", "sf_exact_dw_sched",
-            "--port-base", "29780",
+            "--no-hook",
+            "--seconds", "20",
+            "--osa-extra", '{"replan_each_chunk": true}',
+            "--tag", "sf20_replan32_time",
+            "--port-base", "29785",
         ],
     },
 ]
