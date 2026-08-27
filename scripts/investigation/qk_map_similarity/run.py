@@ -65,7 +65,13 @@ EXTRA_HEAD_SPECS = (
     {"task": "v4", "layer": 20, "head": 7},
     {"task": "v5", "layer": 25, "head": 8},
 )
-SPEC_SETS = {"main": HEAD_SPECS, "extra": EXTRA_HEAD_SPECS}
+# The deep-dive round captures every chunk (not just the percentile four) for
+# all nine picks at once, so any chunk can serve as calibration reference.
+SPEC_SETS = {
+    "main": HEAD_SPECS,
+    "extra": EXTRA_HEAD_SPECS,
+    "all9": (*HEAD_SPECS, *EXTRA_HEAD_SPECS),
+}
 
 
 def dump_spec(specs) -> str:
@@ -94,6 +100,7 @@ def run_one(
     port_base: int,
     capture: bool,
     spec_set: str = "main",
+    chunks: tuple[int, ...] = tuple(CHUNK_IDS),
 ) -> dict:
     spec = MODELS[MODEL]
     width, height = spec["resolutions"][RES]
@@ -138,7 +145,7 @@ def run_one(
             "SGLANG_DIFFUSION_ATTENTION_MAP_QK_ONLY": "1",
             "QKDUMP_DIR": str(qk_dir),
             "QKDUMP_SPEC": dump_spec(SPEC_SETS[spec_set]),
-            "QKDUMP_CHUNKS": ",".join(str(c) for c in CHUNK_IDS),
+            "QKDUMP_CHUNKS": ",".join(str(c) for c in chunks),
             "QKDUMP_STEPS": ",".join(str(s) for s in STEP_IDS),
         }
     log = out_dir / "run.log"
@@ -180,12 +187,14 @@ def main() -> None:
     parser.add_argument("--prompts", default=",".join(PROMPTS))
     parser.add_argument("--no-capture", action="store_true")
     parser.add_argument("--spec", default="main", choices=sorted(SPEC_SETS))
+    parser.add_argument("--chunks", default=",".join(str(c) for c in CHUNK_IDS))
     parser.add_argument("--port-base", type=int, default=29800)
     args = parser.parse_args()
 
+    chunks = tuple(int(c) for c in args.chunks.split(","))
     pool = GpuPool([int(g) for g in args.gpus.split(",")])
     layer_count = len({s["layer"] for s in SPEC_SETS[args.spec]})
-    expected = len(CHUNK_IDS) * len(STEP_IDS) * layer_count
+    expected = len(chunks) * len(STEP_IDS) * layer_count
     results = {}
     for index, prompt_id in enumerate(args.prompts.split(",")):
         prompt = PROMPTS[prompt_id]["prompt"]
@@ -200,6 +209,7 @@ def main() -> None:
                     port_base=args.port_base + 10 * index,
                     capture=not args.no_capture,
                     spec_set=args.spec,
+                    chunks=chunks,
                 )
             finally:
                 pool.release(gpu)

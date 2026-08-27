@@ -75,6 +75,43 @@ python doc_update.py --stage temporal   # temporal subsection + figure + table
   `cos(A_{C,i,self}, A_{c,i,j})`; `plot_temporal.py` renders the 9-panel
   figure.
 
+## Deep dive (sparse-opportunity analysis)
+
+```bash
+python run.py --spec all9 --chunks 0,1,2,3,4,5,6 --prompts p1   # all 9 picks, every chunk
+CUDA_VISIBLE_DEVICES=<idle> python deep_dive.py --run p1
+python doc_update.py --stage deepdive
+```
+
+`deep_dive.py` computes five measurements (JSON per measurement under
+`deep_dive/p1/`, figures under `plots/p1/`):
+
+- `ref_matrix` — cos(self maps of reference chunk C, pair maps of chunk c) for
+  every (C, c): re-calibrating at any C (even C=c-1) does not rescue the
+  mid-layer whole-map replicate — their frame-pair maps change every chunk.
+- `mass_transfer` — the oracle recall: chunk-0 per-query top-p% *frame-relative*
+  key positions replicated over all visible frames; plus refreshed (same
+  chunk) and prev (previous chunk — measurable for free in its cache-update
+  forward) variants. Key result: top-k mass and whole-map cosine disagree —
+  L20·h7 has ~0.4 cosine but 0.97-1.0 mass@10%; L0·h0 has 0.92+ cosine but
+  0.16 mass (near-uniform rows). Three head families: geometric/local,
+  diffuse, content-dependent.
+- `local_window` — mass within Chebyshev radius r of the query's own grid
+  position (zero-calibration geometric pattern): L0·h1 hits 0.82 at r=1
+  (0.25% density).
+- `frame_mass` — per-key-frame distribution: L20·h7 puts 0.99 on its own 3
+  frames (skip history entirely); mid layers need 11-17 of 21 frames.
+- `step_consistency` — pair-map cosine of steps 0-2 vs 3: stable heads 0.65+,
+  mid layers tighten only late in denoising (plan late or in the cache-update
+  forward).
+
+Strategy proposal (in the doc, targeting faster-than-LightForcing at matched
+quality): offline per-head taxonomy -> static execution for local /
+own-chunk / diffuse heads (zero planning), LightForcing-style selection only
+for content-dependent heads with the plan measured once per chunk in the
+previous chunk's KV-cache-update forward and reused across all 4 steps, and
+per-head density budgets instead of one global knob.
+
 ## Outputs
 
 `results/investigation/qk_map_similarity/`

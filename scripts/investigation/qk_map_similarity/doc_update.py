@@ -395,6 +395,228 @@ def stage_temporal() -> None:
     print("[temporal] subsection + figure published")
 
 
+REPRO_DEEPDIVE = """\
+cd scripts/investigation/qk_map_similarity
+# 全 7 个 chunk x 9 组 (层, 头) 的 Q/K 捕获（确定性重生成 p1）
+python run.py --spec all9 --chunks 0,1,2,3,4,5,6 --prompts p1
+# 参考 chunk 矩阵 / oracle 质量召回 / 局部窗口 / 帧级分布 / 步间一致性
+CUDA_VISIBLE_DEVICES=<idle-gpu> python deep_dive.py --run p1
+python doc_update.py --stage deepdive"""
+
+
+def deep_dive_results() -> dict:
+    root = ROOT / "deep_dive" / PLOT_RUN
+    return {
+        name: json.loads((root / f"{name}.json").read_text())
+        for name in (
+            "ref_matrix",
+            "mass_transfer",
+            "local_window",
+            "frame_mass",
+            "step_consistency",
+        )
+    }
+
+
+def pick_key(spec: dict) -> str:
+    return f"L{spec['layer']:02d}_h{spec['head']}"
+
+
+def pick_label(spec: dict) -> str:
+    return f"L{spec['layer']} · h{spec['head']}"
+
+
+def ref_sweep_xml() -> str:
+    return (
+        "<h3>参考 chunk 扫描：换任何参考都救不了中间层的整图复制</h3>"
+        "<p>把参考 chunk <latex>C</latex> 与生成 chunk <latex>c</latex> 全部扫一遍"
+        "（cos 对全部 <latex>(i, j)</latex> 取均值，step 3，全部 7 个 chunk 均已"
+        "捕获）。结论：换参考几乎不改变图景。层 0 两个头对任意 <latex>C</latex> "
+        "都是 0.92–0.99；中间层即使用<b>上一个 chunk</b>（<latex>C=c-1</latex>，"
+        "最新可能的冻结参考）也只有 0.04–0.2（L10 / L14 / L25），与 "
+        "<latex>C=0</latex> 相差无几；L20·h7 用 <latex>C\\le 4</latex> 保持 "
+        "0.4–0.6，但 <latex>C=5,6</latex> 反而更差（其图案后期自身在漂移）。"
+        "整图级的 pattern 复制在中间层不成立，不是"
+        "“校准得太早”的问题，而是这些头的帧对图本身逐 chunk 变化。</p>"
+        "<p>[[map:ref_matrix]]</p>"
+    )
+
+
+def mass_recall_table() -> str:
+    transfer = deep_dive_results()["mass_transfer"]
+    header = (
+        "<th>frozen@10% c0</th><th>frozen@10% c3</th><th>frozen@10% c6</th>"
+        "<th>prev@10% c6</th><th>refreshed@10% c6</th><th>frozen@20% c6</th>"
+    )
+    rows = []
+    for spec in all_specs_sorted():
+        record = transfer[pick_key(spec)]
+        cells = [
+            record["frozen@0.10"][0],
+            record["frozen@0.10"][3],
+            record["frozen@0.10"][6],
+            record["prev@0.10"][6],
+            record["refreshed@0.10"][6],
+            record["frozen@0.20"][6],
+        ]
+        body = "".join(f"<td>{value:.3f}</td>" for value in cells)
+        rows.append(f"<tr><td><p>{pick_label(spec)}</p></td>{body}</tr>")
+    return (
+        '<table><colgroup><col width="100"/><col span="6" width="118"/></colgroup>'
+        f"<thead><tr><th></th>{header}</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def mass_recall_xml() -> str:
+    return (
+        "<p>实验定义：取 chunk 0 的自身图 <latex>A_{0,i,i}</latex>，对其中每个 "
+        "query token 取帧内 top-p% 的 key 位置（<b>帧相对</b>索引）。生成 chunk "
+        "<latex>c</latex> 时对全部可见 KV 做完整 softmax，把这些位置复制到每个"
+        "可见帧上并把注意力值求和，得到该 query 的被捕获质量——质量接近 1 说明"
+        "冻结的逐 query 位置足以支撑稀疏注意力。两条对照：<b>refreshed</b> 用"
+        "当前 chunk 自身图取位置（逐 chunk 重校准的上限）；<b>prev</b> 用上一 "
+        "chunk 的自身图（可在上一 chunk 的 KV cache 刷新 forward 里免费测得，"
+        "部署上最现实）。下图与下表均为对 query 取平均、再对 3 个 query 帧取"
+        "平均，step 3。</p>"
+        "<p>[[map:mass_transfer]]</p>"
+        f"{mass_recall_table()}"
+        "<p><b>发现一：top-k 质量与整图余弦是两回事。</b>L20·h7 整图余弦只有 "
+        "~0.4 却有 0.97–1.00 的 top-10% 质量——它的 top 集合稳定，变的只是低质量"
+        "部分；L0·h0 余弦 0.92+ 但 top-10% 只收 0.16——它的行近乎均匀，"
+        "“图相似”只是因为都均匀，top-k 无意义。第 3 节的余弦低不直接否定稀疏"
+        "可行性，本节的质量召回才是决定性指标。"
+        "<b>发现二：九个头分成三个家族。</b>几何 / 局部头（L0·h1、L20·h7）："
+        "冻结即 ~1.0；弥散头（L0·h0、L5·h4）：任何 10% 都只收 0.16–0.31，"
+        "质量随密度线性走（行近均匀）；内容依赖头（L10 / L14 / L15 / L25 / "
+        "L29）：冻结 0.25–0.63 且随 chunk 衰减，逐 chunk 重校准 +0.05–0.24，"
+        "prev 版本恢复其中大部分（如 L10：0.44 → prev 0.62 → refreshed 0.68）。"
+        "<b>发现三：弥散头的低召回并不致命。</b>行近均匀时注意力输出是大范围"
+        "均值，等步长 / 池化子采样即可低方差近似——这类头适合无选择的结构化"
+        "降采样而不是 top-k。</p>"
+        f"{repro_pre(REPRO_DEEPDIVE)}"
+    )
+
+
+def structure_table() -> str:
+    results = deep_dive_results()
+    header = (
+        "<th>90% 质量需要的帧数 / 21</th><th>own 3 帧质量</th>"
+        "<th>recent 帧质量</th><th>sink 帧质量</th>"
+        "<th>步间 cos s0↔s3</th><th>步间 cos s2↔s3</th>"
+    )
+    rows = []
+    for spec in all_specs_sorted():
+        key = pick_key(spec)
+        frame = results["frame_mass"][key]
+        steps = results["step_consistency"][key]
+        own = sum(frame["per_frame"][18:21])
+        cells = (
+            f"<td>{frame['frames_for_90pct']}</td><td>{own:.2f}</td>"
+            f"<td>{frame['per_frame'][17]:.2f}</td>"
+            f"<td>{frame['per_frame'][0]:.2f}</td>"
+            f"<td>{steps['s0_vs_s3']:.2f}</td><td>{steps['s2_vs_s3']:.2f}</td>"
+        )
+        rows.append(f"<tr><td><p>{pick_label(spec)}</p></td>{cells}</tr>")
+    return (
+        '<table><colgroup><col width="100"/><col span="6" width="118"/></colgroup>'
+        f"<thead><tr><th></th>{header}</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def strategy_xml() -> str:
+    return (
+        "<h2>稀疏结构画像与策略提议</h2>"
+        "<p>目标：<b>比 LightForcing 更快、视频质量相当</b>。LightForcing 的成本"
+        "结构是三笔钱：每个注意力调用（每层 × 每去噪步）都要 mean-pool Q/K、"
+        "算 block 分数、取 top-k 生成 mask（逐调用规划）；所有层 / 头共用同一个 "
+        "sparsity 参数；所有头都走同一种内容依赖选择。本节的测量说明这三笔都有"
+        "可省的空间。</p>"
+        "<h3>结构画像</h3>"
+        "<p><b>空间局部性</b>（下图：以 query 自身网格位置为中心、切比雪夫半径 "
+        "<latex>r</latex> 的窗口复制到所有帧后捕获的质量，chunk 6、step 3）："
+        "L0·h1 半径 1（密度 0.25%）即 0.82、半径 2（0.7%）0.91——纯几何图案，"
+        "零校准零规划；L20·h7 半径 4（2.3%）0.76；L25·h8 半径 9（10%）0.76。"
+        "其余头不局部，局部窗口对它们只是按密度线性收质量。</p>"
+        "<p>[[map:local_window]]</p>"
+        "<p><b>帧级分布与步间一致性</b>（下表，chunk 6）：L20·h7 的 own 3 帧就有 "
+        "0.99 的质量、90% 质量只需 3 帧——它根本不看历史，直接跳过历史 KV；"
+        "L0·h1 / L5·h4 / L25·h8 需要 4–6 帧（own + 少量 recent）；"
+        "L10 / L14 / L15 / L29 需要 11–17 帧，是真正的全局头。步间一致性上，"
+        "稳定头（L0 / L5 / L20 / L29）s0↔s3 已有 0.65–0.98，计划一次全 chunk "
+        "复用是安全的；中间层 s0↔s3 只有 0.11–0.27 但随去噪单调上升"
+        "（s2↔s3 0.38–0.56）——它们的图案在去噪过程中才收紧成形，规划宜取"
+        "晚步测量，或直接用上一 chunk 的 cache 刷新 forward（输入是干净潜变量，"
+        "天然等价于“最末步之后”）。</p>"
+        f"{structure_table()}"
+        "<h3>策略提议</h3>"
+        "<p><b>一、离线逐头画像，分家族执行。</b>用本文的三个指标（top-k 质量"
+        "召回、局部窗口质量、90% 质量帧数）把每个 (层, 头) 一次性归入四类——"
+        "局部头：静态 frame-relative 窗口（逐头半径），连续 block、零运行时"
+        "规划；own-chunk / 短窗头：只读自身 chunk 加逐头 w 个 recent 帧，零规划；"
+        "弥散头：等步长 / 池化 KV 降采样（输出≈均值，低方差近似），零规划；"
+        "内容依赖头（本样本中主要在 L10–L15 与部分深层）：保留 LightForcing 式"
+        "逐 query-block 的运行时选择。画像是内容无关的（多 prompt 轮已证密度与"
+        "图案跨内容稳定），一个模型只需标定一次。</p>"
+        "<p><b>二、把规划移出逐步循环。</b>内容依赖头的 top-k 位置在上一 chunk "
+        "的 KV cache 刷新 forward 里顺带测量（该 forward 本来就要跑，且输入干净），"
+        "本 chunk 的 4 个去噪步全部复用。上表 prev@10% 已证明这一近似只比逐步"
+        "重校准低 0.03–0.07（L10 0.62 vs 0.68），而规划调用数从 每步×每层 降到 "
+        "每 chunk×内容依赖头子集。这是对 LightForcing 最直接的加速点：它的逐"
+        "调用规划被整体摊销掉。</p>"
+        "<p><b>三、逐头预算分配代替全局单一 knob。</b>局部 / own-chunk 头跑在 "
+        "0.25%–2.3% 的密度，释放的预算给内容依赖头加密（它们从 10% 提到 20% "
+        "收益明显：L10 0.44→0.61）；同一平均密度下总召回高于所有头共用一个 "
+        "sparsity 的方案，这就是在不掉质量的前提下把平均密度压得比 LightForcing "
+        "低的空间。</p>"
+        "<p><b>四、待验证的下一步。</b>(a) 全 30×12=360 头的画像扫描（只需 "
+        "c0 / c3 / c6 末步的全头 Q/K，约 7 GB dump）确认各家族占比，占比直接"
+        "决定可摊销的规划比例；(b) 用 osa_recall 的 LightForcing hook 在匹配密度"
+        "下对拍逐头质量召回，把“质量相当”落到可比数字；(c) 原型混合 backend："
+        "静态三家族 + prev-chunk 规划的内容依赖头，端到端对 LightForcing 计时。"
+        "</p>"
+        f"{repro_pre(REPRO_DEEPDIVE)}"
+    )
+
+
+def stage_deepdive() -> None:
+    """Publish the deep-dive: ref sweep (sec 3), mass recall, strategy section."""
+    data = cli("docs", "+fetch", "--doc", DOC, "--detail", "with-ids")
+    content = data["document"]["content"]
+    if "参考 chunk 扫描" not in content:
+        temporal = content.index("时序一致性")
+        anchor = re.search(r'<table id="([^"]+)"', content[temporal:]).group(1)
+        cli(
+            "docs", "+update", "--doc", DOC, "--command", "block_insert_after",
+            "--block-id", anchor, "--content", ref_sweep_xml(),
+        )
+    if "实验定义" not in content:
+        oracle = re.search(
+            r'<h2 id="([^"]+)"[^>]*>Oracle Attention Mass Recall</h2>'
+            r'(?:<p id="([^"]+)"></p>)?',
+            content,
+        )
+        anchor = oracle.group(2) or oracle.group(1)
+        cli(
+            "docs", "+update", "--doc", DOC, "--command", "block_insert_after",
+            "--block-id", anchor, "--content", mass_recall_xml(),
+        )
+    if "稀疏结构画像" not in content:
+        cli(
+            "docs", "+update", "--doc", DOC, "--command", "append",
+            "--content", strategy_xml(),
+        )
+    placeholders = fetch_placeholders()
+    for name in ("ref_matrix", "mass_transfer", "local_window"):
+        key = f"map:{name}"
+        if key in placeholders:
+            replace_media(
+                DOC, placeholders[key], str(ROOT / "plots" / PLOT_RUN / f"{name}.png")
+            )
+    print("[deepdive] ref sweep + mass recall + strategy sections published")
+
+
 def stage_repro() -> None:
     """Insert one reproduction-command code block at the end of each section."""
     data = cli("docs", "+fetch", "--doc", DOC, "--detail", "with-ids")
@@ -462,7 +684,10 @@ def main() -> None:
     parser.add_argument(
         "--stage",
         required=True,
-        choices=["sections", "media", "extra", "resim", "temporal", "repro", "verify"],
+        choices=[
+            "sections", "media", "extra", "resim",
+            "temporal", "repro", "deepdive", "verify",
+        ],
     )
     args = parser.parse_args()
     {
@@ -472,6 +697,7 @@ def main() -> None:
         "resim": stage_resim,
         "temporal": stage_temporal,
         "repro": stage_repro,
+        "deepdive": stage_deepdive,
         "verify": stage_verify,
     }[args.stage]()
 
