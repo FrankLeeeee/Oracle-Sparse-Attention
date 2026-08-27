@@ -23,6 +23,7 @@ COLORS = {
     "osa2": "#0b3d91",
     "osa2s": "#17becf",
     "osa2a": "#bcbd22",
+    "osasched": "#004c99",
     "osa1d": "#9edae5",
     "lightforcing": "#ff7f0e",
     "radial": "#2ca02c",
@@ -39,13 +40,15 @@ def main() -> None:
     parser.add_argument("--results", default="results.json")
     parser.add_argument("--suffix", default="", help="output filename suffix, e.g. _5s")
     parser.add_argument("--duration", type=int, default=20)
+    parser.add_argument("--methods", nargs="*", default=None,
+                        help="restrict plotted methods (default: all)")
     args = parser.parse_args()
     model_root = ROOT / args.model
     results = json.loads((model_root / args.results).read_text())
     dense = results["dense"]
 
     fig, ax = plt.subplots(figsize=(7.5, 4.8))
-    for method in METHODS:
+    for method in (args.methods or METHODS):
         runs = sorted(
             (
                 entry

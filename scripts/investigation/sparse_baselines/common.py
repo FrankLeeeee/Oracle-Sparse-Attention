@@ -74,6 +74,23 @@ MODELS = {
         "pinned_sink_frames": 0,
         "latents_20s": 81,
     },
+    "causal_forcing_long": {
+        # The checkpoint Causal-Forcing ships specifically for long-video
+        # generation (github.com/thu-ml/Causal-Forcing/tree/main/long_video,
+        # longvideo.pt generator_ema); it runs the Rolling-Forcing pipeline,
+        # so its geometry matches rolling_forcing, not causal_forcing.
+        "path": "frankleeeee/CausalForcing-Long-Wan2.1-T2V-1.3B-Diffusers",
+        "frames": {5: 81, 20: 321, 30: 477},
+        "resolutions": {"480p": (832, 480), "720p": (1280, 720)},
+        "kind": "generate",
+        "fps": 16,
+        "token_downsample": 16,
+        "window_frames": 21,
+        "sink_frames": 3,
+        "pinned_sink_frames": 3,
+        # LightForcing's num_output_frames for this model's 30 s runs.
+        "latents_20s": 120,
+    },
     "rolling_forcing": {
         "path": "frankleeeee/RollingForcing-Wan2.1-T2V-1.3B-Diffusers",
         "frames": {5: 81, 20: 321},
