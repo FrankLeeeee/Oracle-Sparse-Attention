@@ -48,6 +48,36 @@ SIM_CHUNK = CHUNK_IDS[-1]  # ... at the 100th-percentile chunk
 
 SUMMARY_H3 = "<h3>各 chunk 汇总（step 3，每行自身列除外的均值）</h3>"
 
+REPRO_VIDEOS = """\
+cd scripts/investigation/qk_map_similarity
+# 5 个 prompt 的 dense 视频 + 四组 (层, 头) 的 Q/K 捕获（独占 GPU，自动等空闲卡）
+python run.py
+# 发布：文本骨架 + 视频/图占位替换
+python doc_update.py --stage sections
+python doc_update.py --stage media"""
+
+REPRO_MAPS = """\
+cd scripts/investigation/qk_map_similarity
+# 由 runs/p1/qk/ 的原始 Q/K 重算全 key 轴 softmax，渲染 4 组 x 4 chunk x 4 步的图
+CUDA_VISIBLE_DEVICES=<idle-gpu> python plot_maps.py --run p1
+python doc_update.py --stage media"""
+
+REPRO_SIMILARITY = """\
+cd scripts/investigation/qk_map_similarity
+# 深度验证的 5 个额外 (层, 头) 需补一次捕获（确定性重生成 p1，dump 共享到 runs/p1/qk/）
+python run.py --spec extra --prompts p1
+# 自参考余弦表 + 以 chunk 0 自身图为参考的时序一致性表（temporal_*.json）
+CUDA_VISIBLE_DEVICES=<idle-gpu> python similarity.py --run p1 --spec main
+CUDA_VISIBLE_DEVICES=<idle-gpu> python similarity.py --run p1 --spec extra
+python plot_temporal.py --run p1
+# 发布：--stage sections 已含主表与汇总；验证小节 / 时序小节各自追加
+python doc_update.py --stage extra
+python doc_update.py --stage temporal"""
+
+
+def repro_pre(code: str) -> str:
+    return f'<pre lang="bash" caption="复现命令"><code>{escape(code)}</code></pre>'
+
 
 def chunk_label(chunk: int) -> str:
     return f"chunk {chunk}（{round(chunk / (NUM_CHUNKS - 1) * 100)}%）"
@@ -143,6 +173,7 @@ def sections_xml() -> str:
         parts.append(f"<p><b>{pid} · {escape(entry['label'])}</b></p>")
         parts.append(f"<p>{escape(entry['prompt'])}</p>")
         parts.append(f"<p>[[video:{pid}]]</p>")
+    parts.append(repro_pre(REPRO_VIDEOS))
 
     parts.append("<h2>2. Attention Map</h2>")
     parts.append(
@@ -157,6 +188,7 @@ def sections_xml() -> str:
     for spec in HEAD_SPECS:
         parts.append(f"<h3>{spec_title(spec)}</h3>")
         parts.append(map_table(spec))
+    parts.append(repro_pre(REPRO_MAPS))
 
     parts.append("<h2>3. Pattern Similarity</h2>")
     parts.append(similarity_intro_xml())
@@ -165,6 +197,7 @@ def sections_xml() -> str:
         parts.append(similarity_table(spec))
     parts.append(SUMMARY_H3)
     parts.append(similarity_summary_table())
+    parts.append(repro_pre(REPRO_SIMILARITY))
     return "".join(parts)
 
 
@@ -362,6 +395,32 @@ def stage_temporal() -> None:
     print("[temporal] subsection + figure published")
 
 
+def stage_repro() -> None:
+    """Insert one reproduction-command code block at the end of each section."""
+    data = cli("docs", "+fetch", "--doc", DOC, "--detail", "with-ids")
+    content = data["document"]["content"]
+    if "复现命令" in content:
+        print("[repro] blocks already present, nothing to do")
+        return
+    section2 = content.index(">2. Attention Map</h2>")
+    section3 = content.index(">3. Pattern Similarity</h2>")
+    temporal = content.index("时序一致性", section3)
+    anchors = [
+        # end of section 1: the last video figure before the section-2 h2
+        (re.findall(r'<figure id="([^"]+)"', content[:section2])[-1], REPRO_VIDEOS),
+        # end of section 2: the last map table before the section-3 h2
+        (re.findall(r'<table id="([^"]+)"', content[:section3])[-1], REPRO_MAPS),
+        # end of section 3: the temporal-consistency mean table
+        (re.search(r'<table id="([^"]+)"', content[temporal:]).group(1), REPRO_SIMILARITY),
+    ]
+    for anchor, code in anchors:
+        cli(
+            "docs", "+update", "--doc", DOC, "--command", "block_insert_after",
+            "--block-id", anchor, "--content", repro_pre(code),
+        )
+    print("[repro] three command blocks inserted")
+
+
 def stage_media() -> None:
     placeholders = fetch_placeholders()
     print(f"[media] {len(placeholders)} placeholders to fill")
@@ -403,7 +462,7 @@ def main() -> None:
     parser.add_argument(
         "--stage",
         required=True,
-        choices=["sections", "media", "extra", "resim", "temporal", "verify"],
+        choices=["sections", "media", "extra", "resim", "temporal", "repro", "verify"],
     )
     args = parser.parse_args()
     {
@@ -412,6 +471,7 @@ def main() -> None:
         "extra": stage_extra,
         "resim": stage_resim,
         "temporal": stage_temporal,
+        "repro": stage_repro,
         "verify": stage_verify,
     }[args.stage]()
 
