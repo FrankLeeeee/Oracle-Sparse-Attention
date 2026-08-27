@@ -24,15 +24,20 @@ DENSE = (
     REPO
     / "results/investigation/sparse_baselines/self_forcing/runs/dense"
 )
+CAMPAIGN = REPO / "results/investigation/sparse_baselines/self_forcing/runs"
 ROWS = [
     ("Dense", DENSE),
     ("OSA frozen d=0.2", ROOT / "sf20t_frozen_d02"),
     ("OSA replan d=0.2", ROOT / "sf20t_replan_d02"),
+    ("LF constant d=0.2", ROOT / "sf20_lf_d02"),
+    ("LF front-loaded d=0.2", CAMPAIGN / "lightforcing_0.2"),
     ("OSA frozen d=0.1", ROOT / "sf20t_frozen_d01"),
     ("OSA replan d=0.1", ROOT / "sf20t_replan_d01"),
+    ("LF constant d=0.1", ROOT / "sf20_lf_d01"),
+    ("LF front-loaded d=0.1", CAMPAIGN / "lightforcing_0.1"),
 ]
 FRAME_IDX = [16, 80, 160, 240, 304]  # t = 1, 5, 10, 15, 19 s @ 16 fps
-LABEL_WIDTH = 260
+LABEL_WIDTH = 330
 
 
 def video_path(run_dir: pathlib.Path) -> str:
