@@ -30,7 +30,13 @@ sys.path.insert(0, str(HERE.parent))
 from doc_media import cli, replace_media  # noqa: E402
 from paths import results_dir  # noqa: E402
 
-from run import CHUNK_IDS, HEAD_SPECS, NUM_CHUNKS, STEP_IDS  # noqa: E402
+from run import (  # noqa: E402
+    CHUNK_IDS,
+    EXTRA_HEAD_SPECS,
+    HEAD_SPECS,
+    NUM_CHUNKS,
+    STEP_IDS,
+)
 
 DOC = "Rs3sdTCinoc6kqxdiGxcUDIQnfd"
 ROOT = results_dir("qk_map_similarity")
@@ -84,11 +90,11 @@ def similarity_table(spec: dict) -> str:
     )
 
 
-def similarity_summary_table() -> str:
+def similarity_summary_table(specs=HEAD_SPECS) -> str:
     """Mean cosine over all (q frame, key frame>0) pairs, per pick and chunk."""
     header = "".join(f"<th>{chunk_label(c)}</th>" for c in CHUNK_IDS)
     rows = []
-    for spec in HEAD_SPECS:
+    for spec in specs:
         cells = []
         for chunk in CHUNK_IDS:
             table = load_similarity(spec, chunk, SIM_STEP)["cosine"]
@@ -184,6 +190,57 @@ def stage_sections() -> None:
     print(f"[sections] appended, {len(fetch_placeholders())} placeholders")
 
 
+def mean_cosine(spec: dict, chunk: int, step: int) -> float:
+    table = load_similarity(spec, chunk, step)["cosine"]
+    values = [v for row in table for v in row[1:]]
+    return sum(values) / len(values)
+
+
+def extra_xml() -> str:
+    """The depth-verification subsection: intro + one table per extra pick."""
+    means = "、".join(
+        f"L{spec['layer']}·h{spec['head']} {mean_cosine(spec, SIM_CHUNK, SIM_STEP):.2f}"
+        for spec in EXTRA_HEAD_SPECS
+    )
+    parts = ["<h3>深度验证：另取 5 个不同层的头</h3>"]
+    parts.append(
+        "<p>上面四组显示 pattern 相似度在层 0 很高（均值 0.92–0.99）而层 14 / 29 "
+        "明显更低（0.06 / 0.56）。为验证这一深度趋势，再取 5 个此前未用过的头，"
+        f"均匀铺开在不同层：{means}（{chunk_label(SIM_CHUNK)}、step {SIM_STEP} "
+        "的均值）。结果一致：帧对帧图案的高度可复制性基本只属于层 0，"
+        "浅层（L5）和末层（L29）居中，中间层（L10–L25）最低。</p>"
+    )
+    for spec in sorted(EXTRA_HEAD_SPECS, key=lambda s: s["layer"]):
+        parts.append(f"<h4>Layer {spec['layer']} · Head {spec['head']}</h4>")
+        parts.append(similarity_table(spec))
+    return "".join(parts)
+
+
+def stage_extra() -> None:
+    """Insert the verification tables and widen the summary to all nine picks."""
+    data = cli("docs", "+fetch", "--doc", DOC, "--detail", "with-ids")
+    content = data["document"]["content"]
+    summary_h3 = re.search(r'<h3 id="([^"]+)">各 chunk 汇总', content)
+    assert summary_h3, "summary h3 not found"
+    anchor = re.findall(r'<table id="([^"]+)"', content[: summary_h3.start()])[-1]
+    if "深度验证" not in content:
+        cli(
+            "docs", "+update", "--doc", DOC, "--command", "block_insert_after",
+            "--block-id", anchor, "--content", extra_xml(),
+        )
+    summary_table = re.search(
+        r'<table id="([^"]+)"', content[summary_h3.start() :]
+    ).group(1)
+    all_specs = sorted(
+        [*HEAD_SPECS, *EXTRA_HEAD_SPECS], key=lambda s: (s["layer"], s["head"])
+    )
+    cli(
+        "docs", "+update", "--doc", DOC, "--command", "block_replace",
+        "--block-id", summary_table, "--content", similarity_summary_table(all_specs),
+    )
+    print("[extra] verification subsection + 9-row summary published")
+
+
 def stage_media() -> None:
     placeholders = fetch_placeholders()
     print(f"[media] {len(placeholders)} placeholders to fill")
@@ -221,11 +278,16 @@ def stage_verify() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", required=True, choices=["sections", "media", "verify"])
+    parser.add_argument(
+        "--stage", required=True, choices=["sections", "media", "extra", "verify"]
+    )
     args = parser.parse_args()
-    {"sections": stage_sections, "media": stage_media, "verify": stage_verify}[
-        args.stage
-    ]()
+    {
+        "sections": stage_sections,
+        "media": stage_media,
+        "extra": stage_extra,
+        "verify": stage_verify,
+    }[args.stage]()
 
 
 if __name__ == "__main__":

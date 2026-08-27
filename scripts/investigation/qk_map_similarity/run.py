@@ -55,7 +55,30 @@ HEAD_SPECS = (
     {"task": "2.3", "layer": MIDDLE_LAYER, "head": 2},
     {"task": "2.4", "layer": LAST_LAYER, "head": 3},
 )
-QKDUMP_SPEC = f"0:0,1;{MIDDLE_LAYER}:2;{LAST_LAYER}:3"
+# Verification picks for the depth trend seen in the first round (pattern
+# similarity ~0.92-0.99 in layer 0 but 0.05-0.66 at layers 14/29): five more
+# distinct heads spread evenly over depth.
+EXTRA_HEAD_SPECS = (
+    {"task": "v1", "layer": 5, "head": 4},
+    {"task": "v2", "layer": 10, "head": 5},
+    {"task": "v3", "layer": 15, "head": 6},
+    {"task": "v4", "layer": 20, "head": 7},
+    {"task": "v5", "layer": 25, "head": 8},
+)
+SPEC_SETS = {"main": HEAD_SPECS, "extra": EXTRA_HEAD_SPECS}
+
+
+def dump_spec(specs) -> str:
+    by_layer: dict[int, list[int]] = {}
+    for spec in specs:
+        by_layer.setdefault(spec["layer"], []).append(spec["head"])
+    return ";".join(
+        f"{layer}:{','.join(str(h) for h in heads)}"
+        for layer, heads in sorted(by_layer.items())
+    )
+
+
+QKDUMP_SPEC = dump_spec(HEAD_SPECS)
 # 0/33/66/100th percentile of the 7 chunks of a 5 s video (21 latent frames,
 # 3 per chunk), and every one of Self-Forcing's 4 denoising steps.
 NUM_CHUNKS = 7
@@ -64,13 +87,23 @@ STEP_IDS = (0, 1, 2, 3)
 
 
 def run_one(
-    *, prompt_id: str, prompt: str, gpu: int, port_base: int, capture: bool
+    *,
+    prompt_id: str,
+    prompt: str,
+    gpu: int,
+    port_base: int,
+    capture: bool,
+    spec_set: str = "main",
 ) -> dict:
     spec = MODELS[MODEL]
     width, height = spec["resolutions"][RES]
-    out_dir = ROOT / "runs" / prompt_id
+    # Non-main capture rounds run in a scratch dir (their video is a bitwise
+    # re-generation of the main run's) but dump into the shared qk/ dir, so
+    # the analysis scripts read one place per prompt.
+    suffix = "" if spec_set == "main" else f"_{spec_set}"
+    out_dir = ROOT / "runs" / f"{prompt_id}{suffix}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    qk_dir = out_dir / "qk"
+    qk_dir = ROOT / "runs" / prompt_id / "qk"
     cmd = [
         "sglang",
         "generate",
@@ -104,7 +137,7 @@ def run_one(
             "SGLANG_DIFFUSION_ATTENTION_MAP_DIR": str(out_dir / "probe_meta"),
             "SGLANG_DIFFUSION_ATTENTION_MAP_QK_ONLY": "1",
             "QKDUMP_DIR": str(qk_dir),
-            "QKDUMP_SPEC": QKDUMP_SPEC,
+            "QKDUMP_SPEC": dump_spec(SPEC_SETS[spec_set]),
             "QKDUMP_CHUNKS": ",".join(str(c) for c in CHUNK_IDS),
             "QKDUMP_STEPS": ",".join(str(s) for s in STEP_IDS),
         }
@@ -128,13 +161,15 @@ def run_one(
             proc.wait()
         finally:
             watchdog.stop()
+    layers = {s["layer"] for s in SPEC_SETS[spec_set]}
+    dumps = sum(1 for layer in layers for _ in qk_dir.glob(f"qk_L{layer:02d}_*.npz"))
     result = parse_log(log)
     result.update(
         returncode=proc.returncode,
         contended=watchdog.contended,
         wall_s=round(time.time() - started, 1),
         gpu=gpu,
-        dumps=len(list(qk_dir.glob("qk_*.npz"))) if capture else 0,
+        dumps=dumps if capture else 0,
     )
     return result
 
@@ -144,11 +179,13 @@ def main() -> None:
     parser.add_argument("--gpus", default="0,1,2,3,4,5,6,7")
     parser.add_argument("--prompts", default=",".join(PROMPTS))
     parser.add_argument("--no-capture", action="store_true")
+    parser.add_argument("--spec", default="main", choices=sorted(SPEC_SETS))
     parser.add_argument("--port-base", type=int, default=29800)
     args = parser.parse_args()
 
     pool = GpuPool([int(g) for g in args.gpus.split(",")])
-    expected = len(CHUNK_IDS) * len(STEP_IDS) * len({s["layer"] for s in HEAD_SPECS})
+    layer_count = len({s["layer"] for s in SPEC_SETS[args.spec]})
+    expected = len(CHUNK_IDS) * len(STEP_IDS) * layer_count
     results = {}
     for index, prompt_id in enumerate(args.prompts.split(",")):
         prompt = PROMPTS[prompt_id]["prompt"]
@@ -162,6 +199,7 @@ def main() -> None:
                     gpu=gpu,
                     port_base=args.port_base + 10 * index,
                     capture=not args.no_capture,
+                    spec_set=args.spec,
                 )
             finally:
                 pool.release(gpu)
@@ -178,7 +216,8 @@ def main() -> None:
             raise SystemExit(
                 f"{prompt_id}: expected {expected} Q/K dumps, got {result['dumps']}"
             )
-    (ROOT / "runs" / "summary.json").write_text(json.dumps(results, indent=2))
+    suffix = "" if args.spec == "main" else f"_{args.spec}"
+    (ROOT / "runs" / f"summary{suffix}.json").write_text(json.dumps(results, indent=2))
     print(f"[done] {len(results)} runs -> {ROOT / 'runs'}")
 
 

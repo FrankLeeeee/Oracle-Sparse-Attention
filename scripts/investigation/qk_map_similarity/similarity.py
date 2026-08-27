@@ -33,7 +33,7 @@ sys.path.insert(0, str(HERE.parent))
 from paths import results_dir  # noqa: E402
 
 from plot_maps import load_qk  # noqa: E402
-from run import CHUNK_IDS, HEAD_SPECS, STEP_IDS  # noqa: E402
+from run import CHUNK_IDS, SPEC_SETS, STEP_IDS  # noqa: E402
 
 ROOT = results_dir("qk_map_similarity")
 
@@ -75,12 +75,13 @@ def main() -> None:
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
+    parser.add_argument("--spec", default="main", choices=sorted(SPEC_SETS))
     args = parser.parse_args()
 
     run_dir = ROOT / "runs" / args.run
     out_dir = ROOT / "similarity" / args.run
     out_dir.mkdir(parents=True, exist_ok=True)
-    for spec in HEAD_SPECS:
+    for spec in SPEC_SETS[args.spec]:
         for chunk in CHUNK_IDS:
             for step in STEP_IDS:
                 query, key, frame_seqlen = load_qk(

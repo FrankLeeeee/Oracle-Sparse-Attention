@@ -16,7 +16,11 @@ Published to Feishu doc `Rs3sdTCinoc6kqxdiGxcUDIQnfd`（OSA Properties）.
 - Prompts: `scripts/investigation/prompts.json` (p1–p5, from the SF study's
   multi-prompt validation).
 - (layer, head) picks (30 layers, 12 heads): layer 0 heads 0 and 1, middle
-  layer 14 head 2, last layer 29 head 3.
+  layer 14 head 2, last layer 29 head 3. A second "extra" round (`--spec
+  extra`) adds five depth-verification picks L5·h4 / L10·h5 / L15·h6 / L20·h7
+  / L25·h8 after the first round showed frame-pattern similarity is high only
+  in layer 0 (0.92–0.99 vs 0.03–0.67 elsewhere; mid layers lowest, both ends
+  higher).
 - Chunks: 0 / 2 / 4 / 6 = the 0 / 33 / 66 / 100th percentiles of 7 chunks;
   all 4 denoising steps of each.
 
@@ -30,6 +34,12 @@ CUDA_VISIBLE_DEVICES=<idle> python similarity.py --run p1    # 64 cosine tables
 python doc_update.py --stage sections   # doc text + tables with placeholders
 python doc_update.py --stage media      # upload videos/plots into placeholders
 python doc_update.py --stage verify
+
+# depth-verification round (5 extra heads; re-generates p1 deterministically
+# into runs/p1_extra/, dumps land in the shared runs/p1/qk/)
+python run.py --spec extra --prompts p1
+CUDA_VISIBLE_DEVICES=<idle> python similarity.py --run p1 --spec extra
+python doc_update.py --stage extra      # verification subsection + 9-row summary
 ```
 
 - `run.py` launches plain `sglang generate` per prompt with
