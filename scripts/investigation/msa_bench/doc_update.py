@@ -252,12 +252,108 @@ def stage_videos() -> None:
     print("[msa-doc] tier table + videos published")
 
 
+def profiling_xml() -> str:
+    summary = json.loads((ROOT / "profiling" / "summary.json").read_text())["runs"]
+
+    def row(method: str, seconds: int) -> str:
+        record = summary[f"{method}_{seconds}s"]
+        return (
+            f"<tr><td><p>{METHOD_LABELS[method]}</p></td><td>{seconds} s</td>"
+            f"<td>{record['self_attn_denoise_total_ms'] / 1000:.2f} s</td>"
+            f"<td>{record['self_attn_cache_update_total_ms'] / 1000:.2f} s</td>"
+            f"<td>{record['forward_denoise_total_ms'] / 1000:.2f} s</td></tr>"
+        )
+
+    table = (
+        '<table><colgroup><col width="190"/><col width="70"/>'
+        '<col span="3" width="150"/></colgroup>'
+        "<thead><tr><th></th><th>时长</th><th>自注意力（去噪步合计）</th>"
+        "<th>自注意力（cache 刷新）</th><th>DiT forward 合计</th></tr></thead>"
+        "<tbody>"
+        + "".join(row(m, s) for s in (5, 20) for m in ("dense", "msa", "lightforcing"))
+        + "</tbody></table>"
+    )
+    micro = json.loads((ROOT / "profiling" / "micro.json").read_text())
+    m21, m81 = micro["21"], micro["81"]
+    return (
+        "<h3>运行时剖析：MSA vs LightForcing</h3>"
+        "<p>两个视角。<b>真实运行</b>（chunk-timing 探针，CUDA event 包住每个注意力"
+        "模块，b1、独占 GPU）：下图为每 chunk 的自注意力耗时曲线，下表为合计。"
+        "<b>逐调用 microbenchmark</b>（第 14 层：2 静态 + 10 内容头，合成形状、"
+        "独占 GPU）：按组件拆分单次 attend() 的去向。</p>"
+        "<p>[[map:profile_curves]]</p>"
+        f"{table}"
+        "<p>[[map:profile_components]]</p>"
+        "<p><b>发现一：5 秒档两者的注意力时间几乎相同，MSA 的端到端优势来自"
+        "规划的摊销。</b>去噪步自注意力合计 MSA 3.24 s vs LF 3.17 s、DiT forward "
+        "合计 7.29 vs 7.26 s——差距不在 GPU 上；e2e 去噪 8.73 vs 9.00 s 的差主要是"
+        " forward 之外的主机侧开销（MSA 1.44 s vs LF 1.74 s）：LF 每层每步都要"
+        "发起 pool + 打分 + top-k 的一串小算子（实测每调用 "
+        f"{m21['lf_plan_ms']:.2f} ms），MSA 每 chunk 只做一次"
+        f"（计划命中时整调用 {m21['msa_attend_hit_ms']:.2f} ms vs 未命中 "
+        f"{m21['msa_attend_miss_ms']:.2f} ms），cache 刷新 forward 也复用计划"
+        "（其注意力 0.39 vs 0.50 s）。</p>"
+        "<p><b>发现二：20 秒档的差距不是 kernel 质量，而是密度调度策略。</b>"
+        "microbenchmark 里 MSA 的静态头成本随上下文<b>恒定</b>"
+        f"（{m21['msa_static_kernel_ms']:.2f} ms，从 6 帧到 81 帧不变——短窗头"
+        "只读最新 m 帧的设计兑现了）；内容头 kernel 则随可见帧数线性增长"
+        f"（21 帧 {m21['msa_content_kernel_ms']:.2f} ms → 81 帧 "
+        f"{m81['msa_content_kernel_ms']:.2f} ms），因为 MSA 的 content_density "
+        "是每调用恒定的 0.2；而 LightForcing 的 chunk 感知 sparsity 调度让晚期 "
+        "chunk 越来越稀（其累计密度日志从 0.50 一路降到 0.20），81 帧时它每调用"
+        "读的 key 少得多（exec kernel "
+        f"{m81['lf_exec_kernel_ms']:.2f} ms vs MSA 内容头 "
+        f"{m81['msa_content_kernel_ms']:.2f} ms）。真实运行曲线一致：20 秒档 LF "
+        "每 chunk 注意力近乎平坦（300→740 ms），MSA 线性上升（400→1130 ms）。"
+        "≤21 帧（整个 5 秒档）MSA 每调用反而更快。</p>"
+        "<p><b>含义：</b>把 MSA 内容头的密度做成 chunk 级调度（如 OSA 曾用的 "
+        "1/√kv 前置递减，或 LF 式随进度衰减）即可在不动 kernel 的情况下抹平 "
+        "20 秒档的大部分差距——静态头已经天然平坦。</p>"
+        '<pre lang="bash" caption="复现命令"><code>'
+        + escape(
+            "cd scripts/investigation/msa_bench\n"
+            "python profile_runtime.py --stage runs   # b1 x {dense,msa,lf} x {5s,20s}, chunk-timing 探针\n"
+            "python profile_runtime.py --stage micro  # 独占 GPU 逐调用组件拆分\n"
+            "python profile_runtime.py --stage report # 曲线/组件图 + summary.json\n"
+            "python doc_update.py --stage profiling"
+        )
+        + "</code></pre>"
+    )
+
+
+def stage_profiling() -> None:
+    data = cli("docs", "+fetch", "--doc", DOC, "--detail", "with-ids")
+    content = data["document"]["content"]
+    if "运行时剖析：MSA vs LightForcing" not in content:
+        cli(
+            "docs", "+update", "--doc", DOC, "--command", "append",
+            "--content", profiling_xml(),
+        )
+        data = cli("docs", "+fetch", "--doc", DOC, "--detail", "with-ids")
+        content = data["document"]["content"]
+    placeholders = dict(
+        re.findall(r'<p id="([^"]+)"[^>]*>\[\[map:([\w.]+)\]\]</p>', content)
+    )
+    placeholders = {name: block for block, name in placeholders.items()}
+    for name in ("profile_curves", "profile_components"):
+        if name in placeholders:
+            replace_media(
+                DOC, placeholders[name], str(ROOT / "profiling" / f"{name}.png")
+            )
+    print("[msa-doc] profiling subsection published")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", default="section", choices=["section", "videos"])
+    parser.add_argument(
+        "--stage", default="section", choices=["section", "videos", "profiling"]
+    )
     args = parser.parse_args()
     if args.stage == "videos":
         stage_videos()
+        return
+    if args.stage == "profiling":
+        stage_profiling()
         return
     data = cli("docs", "+fetch", "--doc", DOC)
     if "MSA：混合稀疏注意力" in data["document"]["content"]:
