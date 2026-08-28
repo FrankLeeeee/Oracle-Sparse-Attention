@@ -54,16 +54,18 @@ TAXONOMY = str(HERE.parent / "qk_map_similarity" / "msa_taxonomy_self_forcing.js
 def method_flags(method: str) -> list[str]:
     if method == "dense":
         return []
-    if method in ("msa", "msa25"):
+    if method in ("msa", "msa25", "msa10"):
         config = {
             "taxonomy_path": TAXONOMY,
-            "content_density": 0.25 if method == "msa25" else 0.2,
+            "content_density": {"msa": 0.2, "msa25": 0.25, "msa10": 0.1}[method],
         }
         method = "msa"
-    elif method == "lightforcing":
+    elif method in ("lightforcing", "lf10"):
+        tier = "0.1" if method == "lf10" else "0.2"
         config = json.loads((SPARSE_ROOT / "configs.json").read_text())[MODEL][
             "lightforcing"
-        ]["0.2"]["config"]
+        ][tier]["config"]
+        method = "lightforcing"
     else:
         raise ValueError(method)
     return ["--sparse-attention", method, "--sparse-attention-config", json.dumps(config)]

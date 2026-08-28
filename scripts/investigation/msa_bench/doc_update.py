@@ -4,15 +4,18 @@
     python doc_update.py
 """
 
+import argparse
 import json
 import pathlib
+import re
+import shutil
 import statistics
 import sys
 from xml.sax.saxutils import escape
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-from doc_media import cli  # noqa: E402
+from doc_media import cli, replace_media  # noqa: E402
 from paths import results_dir  # noqa: E402
 
 DOC = "Rs3sdTCinoc6kqxdiGxcUDIQnfd"
@@ -22,8 +25,12 @@ METHOD_LABELS = {
     "dense": "dense",
     "msa": "MSA（content 0.20）",
     "msa25": "MSA（content 0.25）",
+    "msa10": "MSA（content 0.10）",
     "lightforcing": "LightForcing（0.2 档）",
+    "lf10": "LightForcing（0.1 档）",
 }
+# The video gallery, per prompt, in presentation order.
+VIDEO_METHODS = ("dense", "msa", "msa10", "lightforcing", "lf10")
 
 
 def bench_5s_table() -> str:
@@ -160,7 +167,98 @@ def section_xml() -> str:
     )
 
 
+def tier_table(methods: tuple[str, ...]) -> str:
+    results = json.loads((ROOT / "results_5s.json").read_text())
+    dense_mean = statistics.mean(
+        results[f"b{i}_dense_5s"]["denoise_s"] for i in range(1, 6)
+    )
+    header = (
+        "<th>去噪耗时（均值）</th><th>对 dense 加速</th><th>实际累计密度</th>"
+        "<th>PSNR vs dense（均值）</th><th>前 2 秒 PSNR</th>"
+    )
+    rows = []
+    for method in methods:
+        entries = [results[f"b{i}_{method}_5s"] for i in range(1, 6)]
+        denoise = statistics.mean(e["denoise_s"] for e in entries)
+        psnr = statistics.mean(e["psnr"] for e in entries)
+        first = statistics.mean(e["psnr_first"] for e in entries)
+        rows.append(
+            f"<tr><td><p>{METHOD_LABELS[method]}</p></td>"
+            f"<td>{denoise:.2f} s</td><td>{dense_mean / denoise:.2f}×</td>"
+            f"<td>{entries[1]['density']:.3f}</td>"
+            f"<td>{psnr:.2f}</td><td>{first:.2f}</td></tr>"
+        )
+    return (
+        '<table><colgroup><col width="190"/><col span="5" width="128"/></colgroup>'
+        f"<thead><tr><th></th>{header}</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def videos_xml() -> str:
+    parts = ["<h3>0.1 档对比与原始视频</h3>"]
+    parts.append(
+        "<p>补充 0.1 档（MSA content 0.10、LightForcing 0.1 档标定配置）："
+        "下表为 5 个基准 prompt 的均值，之后按 prompt 给出全部原始视频"
+        "（顺序：dense、MSA 0.2、MSA 0.1、LightForcing 0.2、LightForcing 0.1）。</p>"
+    )
+    parts.append(tier_table(("msa", "msa10", "lightforcing", "lf10")))
+    results = json.loads((ROOT / "results_5s.json").read_text())
+    for pid, entry in PROMPTS.items():
+        parts.append(f"<p><b>{pid} · {escape(entry['label'])}</b></p>")
+        for method in VIDEO_METHODS:
+            record = results.get(f"{pid}_{method}_5s", {})
+            note = ""
+            if record.get("psnr") is not None:
+                note = f"（PSNR {record['psnr']:.1f}）"
+            parts.append(
+                f"<p>{METHOD_LABELS[method]}{note}</p>"
+                f"<p>[[video:{pid}_{method}]]</p>"
+            )
+    return "".join(parts)
+
+
+def newest_mp4(tag: str) -> pathlib.Path:
+    candidates = sorted(
+        (ROOT / "runs" / tag / "outputs").glob("*.mp4"), key=lambda p: p.stat().st_mtime
+    )
+    assert candidates, f"no video for {tag}"
+    return candidates[-1]
+
+
+def stage_videos() -> None:
+    data = cli("docs", "+fetch", "--doc", DOC, "--detail", "with-ids")
+    content = data["document"]["content"]
+    if "0.1 档对比与原始视频" not in content:
+        cli(
+            "docs", "+update", "--doc", DOC, "--command", "append",
+            "--content", videos_xml(),
+        )
+        data = cli("docs", "+fetch", "--doc", DOC, "--detail", "with-ids")
+        content = data["document"]["content"]
+    placeholders = dict(
+        re.findall(r'<p id="([^"]+)"[^>]*>\[\[video:([\w.]+)\]\]</p>', content)
+    )
+    placeholders = {name: block for block, name in placeholders.items()}
+    for pid in PROMPTS:
+        for method in VIDEO_METHODS:
+            key = f"{pid}_{method}"
+            if key not in placeholders:
+                continue
+            source = newest_mp4(f"{pid}_{method}_5s")
+            named = source.parent / f"self_forcing_720p_5s_{key}.mp4"
+            shutil.copyfile(source, named)
+            replace_media(DOC, placeholders[key], str(named), media_type="file")
+    print("[msa-doc] tier table + videos published")
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--stage", default="section", choices=["section", "videos"])
+    args = parser.parse_args()
+    if args.stage == "videos":
+        stage_videos()
+        return
     data = cli("docs", "+fetch", "--doc", DOC)
     if "MSA：混合稀疏注意力" in data["document"]["content"]:
         print("[msa-doc] section already present")
