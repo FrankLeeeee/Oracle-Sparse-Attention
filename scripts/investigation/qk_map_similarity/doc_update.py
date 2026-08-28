@@ -557,8 +557,11 @@ def strategy_xml() -> str:
         "规划；own-chunk / 短窗头：只读自身 chunk 加逐头 w 个 recent 帧，零规划；"
         "弥散头：等步长 / 池化 KV 降采样（输出≈均值，低方差近似），零规划；"
         "内容依赖头（本样本中主要在 L10–L15 与部分深层）：保留 LightForcing 式"
-        "逐 query-block 的运行时选择。画像是内容无关的（多 prompt 轮已证密度与"
-        "图案跨内容稳定），一个模型只需标定一次。</p>"
+        "逐 query-block 的运行时选择。画像的家族划分在保守划界下跨内容稳定"
+        "（静态家族严格内容无关；内容依赖头的指标本身随内容波动，因而必须走"
+        "运行时选择——直接证据与限定见下文「画像的内容无关性验证」节），"
+        "一个模型只需标定一次家族归属。</p>"
+        f"{family_examples_xml()}"
         "<p><b>二、把规划移出逐步循环。</b>内容依赖头的 top-k 位置在上一 chunk "
         "的 KV cache 刷新 forward 里顺带测量（该 forward 本来就要跑，且输入干净），"
         "本 chunk 的 4 个去噪步全部复用。上表 prev@10% 已证明这一近似只比逐步"
@@ -679,6 +682,99 @@ def stability_xml() -> str:
         "静态头的具体图案</b>，不是每个头的逐 token 位置。</p>"
         f"{repro_pre(REPRO_STABILITY)}"
     )
+
+
+def family_examples_xml() -> str:
+    """One exemplar head per family, with its measured evidence."""
+    deep = deep_dive_results()
+    stability = stability_results()
+    runs = stability["runs"]
+
+    def transfer(key: str, name: str, index: int) -> float:
+        return deep["mass_transfer"][key][name][index]
+
+    local = deep["local_window"]
+    own_share = lambda key: sum(deep["frame_mass"][key]["per_frame"][18:21])  # noqa: E731
+    frames90 = lambda key: deep["frame_mass"][key]["frames_for_90pct"]  # noqa: E731
+    own_range = lambda key: [  # noqa: E731
+        stability["picks"][key][run]["own@10%"] for run in runs
+    ]
+    overlap = sum(stability["picks"]["L00_h1"][run]["overlap"] for run in runs) / len(
+        runs
+    )
+    content_own = own_range("L14_h2")
+    rows = [
+        (
+            "局部头",
+            "L0 · h1",
+            f"半径 1 窗口（密度 0.25%）即 {local['L00_h1']['1']:.2f} 质量、"
+            f"半径 2（0.7%）{local['L00_h1']['2']:.2f}；top-10% 位置跨 prompt "
+            f"重合率 {overlap:.2f}，own@10% 在 5 个 prompt 上均为 1.00",
+            "静态 frame-relative 窗口（逐头半径），零规划",
+        ),
+        (
+            "短窗头",
+            "L20 · h7",
+            f"own 3 帧质量 {own_share('L20_h7'):.2f}、90% 质量只需 "
+            f"{frames90('L20_h7')} 帧；冻结 top-10% 质量 "
+            f"{transfer('L20_h7', 'frozen@0.10', 6):.2f}（c6），历史帧可整体不读",
+            "只读自身 chunk（+ 逐头 w 个 recent 帧），零规划",
+        ),
+        (
+            "弥散头",
+            "L0 · h0",
+            f"top-10% 只收 {transfer('L00_h0', 'frozen@0.10', 6):.2f}、top-20% "
+            f"{transfer('L00_h0', 'frozen@0.20', 6):.2f}（质量≈密度，行近均匀）；"
+            f"r=9 几何窗口也只有 {local['L00_h0']['9']:.2f}——不是选择问题，"
+            "是没有可选的峰",
+            "等步长 / 池化 KV 降采样（输出≈均值），零规划",
+        ),
+        (
+            "内容依赖头",
+            "L14 · h2",
+            f"冻结 top-10% 从 {transfer('L14_h2', 'frozen@0.10', 0):.2f}（c0）衰减到 "
+            f"{transfer('L14_h2', 'frozen@0.10', 6):.2f}（c6），prev-chunk 规划回到 "
+            f"{transfer('L14_h2', 'prev@0.10', 6):.2f}；90% 质量需 "
+            f"{frames90('L14_h2')} 帧；own@10% 跨 prompt 波动 "
+            f"{min(content_own):.2f}–{max(content_own):.2f}",
+            "LightForcing 式运行时选择，prev-chunk 规划、全步复用",
+        ),
+    ]
+    body = "".join(
+        f"<tr><td><p><b>{family}</b></p></td><td><p>{example}</p></td>"
+        f"<td><p>{evidence}</p></td><td><p>{policy}</p></td></tr>"
+        for family, example, evidence, policy in rows
+    )
+    l5_own = own_range("L05_h4")
+    return (
+        '<table><colgroup><col width="90"/><col width="80"/>'
+        '<col width="330"/><col width="220"/></colgroup>'
+        "<thead><tr><th>家族</th><th>代表头</th>"
+        "<th>证据（chunk 6、step 3，另注明处除外）</th><th>执行方式</th></tr></thead>"
+        f"<tbody>{body}</tbody></table>"
+        "<p>家族在帧级与帧内两个维度上可组合：L5·h4 帧级上是短窗头"
+        f"（90% 质量只需 {frames90('L05_h4')} 帧、own 3 帧 "
+        f"{own_share('L05_h4'):.2f}），但帧内弥散（top-10% 只收 "
+        f"{min(l5_own):.2f}–{max(l5_own):.2f}），执行上应为"
+        "“短窗 × 帧内降采样”。</p>"
+    )
+
+
+def stage_examples() -> None:
+    """Insert the per-family exemplar table after the taxonomy paragraph."""
+    data = cli("docs", "+fetch", "--doc", DOC, "--detail", "with-ids")
+    content = data["document"]["content"]
+    if "代表头" in content:
+        print("[examples] table already present, nothing to do")
+        return
+    anchor = re.search(
+        r'<p id="([^"]+)"[^>]*><b>一、离线逐头画像', content
+    ).group(1)
+    cli(
+        "docs", "+update", "--doc", DOC, "--command", "block_insert_after",
+        "--block-id", anchor, "--content", family_examples_xml(),
+    )
+    print("[examples] family exemplar table inserted")
 
 
 def stage_stability() -> None:
@@ -815,7 +911,7 @@ def main() -> None:
         required=True,
         choices=[
             "sections", "media", "extra", "resim", "temporal",
-            "repro", "deepdive", "stability", "verify",
+            "repro", "deepdive", "stability", "examples", "verify",
         ],
     )
     args = parser.parse_args()
@@ -828,6 +924,7 @@ def main() -> None:
         "repro": stage_repro,
         "deepdive": stage_deepdive,
         "stability": stage_stability,
+        "examples": stage_examples,
         "verify": stage_verify,
     }[args.stage]()
 
