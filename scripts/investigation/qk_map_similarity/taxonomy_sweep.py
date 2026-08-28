@@ -209,6 +209,12 @@ def main() -> None:
     parser.add_argument("--runs", default="p1_sweep,p4_sweep")
     parser.add_argument("--tau", type=float, default=0.85)
     parser.add_argument(
+        "--export",
+        default="",
+        help="also write a backend-consumable taxonomy JSON (family + params "
+        "per head) to this path, for --sparse-attention msa",
+    )
+    parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
     args = parser.parse_args()
@@ -267,6 +273,20 @@ def main() -> None:
     plot(records, ROOT / "plots" / "taxonomy_map.png")
     print(json.dumps(summary, indent=2))
     print(f"[tax] wrote {out}")
+    if args.export:
+        compact = {
+            key: {
+                name: value
+                for name, value in record.items()
+                if name in ("family", "r", "m")
+            }
+            for key, record in records.items()
+        }
+        export = pathlib.Path(args.export)
+        export.write_text(
+            json.dumps({"summary": summary, "heads": compact}, indent=2)
+        )
+        print(f"[tax] exported backend taxonomy -> {export}")
 
 
 if __name__ == "__main__":

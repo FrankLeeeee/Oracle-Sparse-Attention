@@ -16,6 +16,10 @@ package is constructed or called. Otherwise it names one method:
 ``fastar``              FAST-AR's TempCache + AnnSA.
 ``lightforcing``        Light Forcing's chunk-aware sparsity schedule +
                         hierarchical frame/block top-k selection.
+``msa``                 Mixed Sparse Attention: offline per-head taxonomy —
+                        static window / short-window / strided heads at zero
+                        planning cost, pooled top-k only for the
+                        content-dependent heads.
 ======================  ====================================================
 
 ``--sparse-attention-config`` passes the method's knobs as JSON or ``k=v``
@@ -39,6 +43,10 @@ from sglang.multimodal_gen.runtime.layers.attention.sparse.fastar import (
 from sglang.multimodal_gen.runtime.layers.attention.sparse.lightforcing import (
     LightForcingAttention,
     LightForcingConfig,
+)
+from sglang.multimodal_gen.runtime.layers.attention.sparse.msa import (
+    MixedSparseAttention,
+    MsaConfig,
 )
 from sglang.multimodal_gen.runtime.layers.attention.sparse.osa import (
     OracleSparseAttention,
@@ -75,6 +83,7 @@ _METHODS: dict[str, tuple[type[SparseAttentionBackend], type[msgspec.Struct]]] =
     "sta": (StaAttention, StaConfig),
     "fastar": (FastArAttention, FastArConfig),
     "lightforcing": (LightForcingAttention, LightForcingConfig),
+    "msa": (MixedSparseAttention, MsaConfig),
 }
 
 SPARSE_ATTENTION_METHODS = tuple(_METHODS)

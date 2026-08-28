@@ -1247,3 +1247,188 @@ def test_osa_replan_declines_window_queries():
     )
     backend.begin_forward(_geometry(5))
     assert backend.attend(call) is None
+
+
+# --------------------------------------------------------------------------
+# MSA (mixed sparse attention)
+# --------------------------------------------------------------------------
+
+
+def _msa_taxonomy(tmp_path, families):
+    """A taxonomy file assigning ``families[h]`` to head h of layer 0."""
+    import json as _json
+
+    heads = {}
+    for head, (family, params) in enumerate(families):
+        heads[f"L00_h{head}"] = {"family": family, **params}
+    path = tmp_path / "taxonomy.json"
+    path.write_text(_json.dumps({"heads": heads}))
+    return str(path)
+
+
+def _msa_backend(tmp_path, **config):
+    families = [
+        ("local", {"r": 1}),
+        ("shortwin", {"m": 3}),
+        ("diffuse", {}),
+        ("content", {}),
+    ]
+    return build_sparse_attention_backend(
+        "msa",
+        {
+            "taxonomy_path": _msa_taxonomy(tmp_path, families),
+            "content_density": 0.3,
+            "block_q": 64,
+            "block_k": 64,
+            **config,
+        },
+    )
+
+
+def _msa_expected_mask(backend, call, layout):
+    """The key mask MSA's own descriptors describe, [heads, q_blocks, kv_len]."""
+    from sglang.multimodal_gen.runtime.layers.attention.sparse.lightforcing import (
+        frame_aligned_block_bounds,
+    )
+    from sglang.multimodal_gen.runtime.layers.attention.sparse.msa import (
+        diffuse_ranges,
+        local_ranges,
+    )
+
+    config = backend._config
+    device = call.query.device
+    q_len = call.query.shape[1]
+    kv_len = call.key.shape[1]
+    frame_seqlen = layout.frame_seqlen
+    num_frames = layout.num_frames
+    q_blocks = -(-q_len // config.block_q)
+    mask = torch.zeros(4, q_blocks, kv_len, dtype=torch.bool, device=device)
+    for q_block in range(q_blocks):
+        for lo, hi in local_ranges(
+            q_block,
+            radius=1,
+            block_m=config.block_q,
+            q_len=q_len,
+            frame_seqlen=frame_seqlen,
+            grid_height=15,
+            grid_width=26,
+        ):
+            for frame in range(num_frames):
+                mask[0, q_block, frame * frame_seqlen + lo : frame * frame_seqlen + hi] = True
+    mask[1, :, (num_frames - 3) * frame_seqlen :] = True
+    for lo, hi in diffuse_ranges(
+        frame_seqlen=frame_seqlen, density=config.diffuse_density
+    ):
+        for frame in range(num_frames):
+            mask[2, :, frame * frame_seqlen + lo : frame * frame_seqlen + hi] = True
+    content_mask, _, _ = backend._content_mask(call, layout, [3])
+    block_lo, block_hi = frame_aligned_block_bounds(
+        num_frames=num_frames,
+        frame_seqlen=frame_seqlen,
+        block=config.block_k,
+        device=device,
+    )
+    for q_block in range(q_blocks):
+        for block, kept in enumerate(content_mask[0, q_block].tolist()):
+            if kept:
+                mask[3, q_block, block_lo[block] : block_hi[block]] = True
+    return mask
+
+
+@requires_cuda
+def test_msa_matches_its_own_descriptor_mask(tmp_path):
+    """Both MSA kernels compute exactly the attention their descriptors say."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    backend = _msa_backend(tmp_path)
+    call = _self_forcing_call(device, chunk_index=4)
+    backend.begin_forward(_geometry(4))
+    layout = visible_layout(
+        call.key_segments, geometry=_geometry(4), query_tokens=call.query.shape[1]
+    )
+    out = backend.attend(call)
+    assert out is not None
+    key_mask = _msa_expected_mask(backend, call, layout)
+    reference = masked_reference(
+        call.query,
+        call.key,
+        call.value,
+        key_mask,
+        block_m=backend._config.block_q,
+        softmax_scale=call.softmax_scale,
+    )
+    torch.testing.assert_close(
+        out.float(), reference.float(), atol=3e-2, rtol=3e-2
+    )
+    density = key_mask.float().mean().item()
+    assert density < 0.7, f"msa kept too much ({density:.3f})"
+
+
+@requires_cuda
+def test_msa_declines_chunk0_but_sparsifies_cache_updates(tmp_path):
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    backend = _msa_backend(tmp_path)
+    call = _self_forcing_call(device, chunk_index=0)
+    backend.begin_forward(_geometry(0))
+    assert backend.attend(call) is None
+    call = _self_forcing_call(device, chunk_index=4)
+    backend.begin_forward(_geometry(4))
+    # Cache refreshes run sparse too (LightForcing parity).
+    with backend.cache_update_scope():
+        assert backend.attend(call) is not None
+    assert backend.attend(call) is not None
+
+
+@requires_cuda
+def test_msa_static_descriptors_are_cached_per_layout(tmp_path):
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    backend = _msa_backend(tmp_path)
+    call = _self_forcing_call(device, chunk_index=4)
+    backend.begin_forward(_geometry(4))
+    layout = visible_layout(
+        call.key_segments, geometry=_geometry(4), query_tokens=call.query.shape[1]
+    )
+    backend.attend(call)
+    hit, plan = backend._static_cache.get(
+        0, (layout.num_frames, layout.frame_seqlen, call.query.shape[1])
+    )
+    assert hit and plan.head_ids.shape[0] == 3
+    # The static side of the density is exact and strictly below dense.
+    assert 0.0 < plan.fraction_sum < 3.0
+
+
+def test_msa_local_ranges_straddle_and_merge():
+    from sglang.multimodal_gen.runtime.layers.attention.sparse.msa import (
+        local_ranges,
+    )
+
+    # Query block 6 of block_m=64 at frame_seqlen 390 covers tokens 384..448,
+    # straddling the frame boundary: two windows, one at the frame's bottom
+    # rows and one at its top.
+    ranges = local_ranges(
+        6,
+        radius=1,
+        block_m=64,
+        q_len=1170,
+        frame_seqlen=390,
+        grid_height=15,
+        grid_width=26,
+    )
+    assert len(ranges) == 2
+    for lo, hi in ranges:
+        assert 0 <= lo < hi <= 390
+    assert ranges[0][0] == 0  # the top window starts at row 0
+    assert ranges[1][1] == 390  # the bottom window ends at the last row
+
+
+def test_msa_diffuse_ranges_hit_the_requested_density():
+    from sglang.multimodal_gen.runtime.layers.attention.sparse.msa import (
+        diffuse_ranges,
+    )
+
+    ranges = diffuse_ranges(frame_seqlen=3600, density=0.10)
+    kept = sum(hi - lo for lo, hi in ranges)
+    assert abs(kept / 3600 - 0.10) < 0.03
+    assert all(0 <= lo < hi <= 3600 for lo, hi in ranges)
