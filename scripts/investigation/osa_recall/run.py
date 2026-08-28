@@ -53,6 +53,7 @@ def main() -> None:
         "instead of a constant per-chunk sparsity",
     )
     parser.add_argument("--gpu", type=int, default=5)
+    parser.add_argument("--prompt", default=PROMPT_KEY, help="key into common.PROMPTS")
     parser.add_argument("--density", type=float, default=0.3)
     parser.add_argument("--seconds", type=float, default=10.0)
     parser.add_argument("--res", default="720p")
@@ -76,7 +77,8 @@ def main() -> None:
     width, height = spec["resolutions"][args.res]
     frames = frame_count(args.seconds, spec["fps"])
     method = "" if args.method == "osa" else f"_{args.method}"
-    tag = args.tag or f"{args.model}{method}_d{args.density:g}_{frames}f"
+    prompt_tag = "" if args.prompt == PROMPT_KEY else f"_{args.prompt}"
+    tag = args.tag or f"{args.model}{method}{prompt_tag}_d{args.density:g}_{frames}f"
     out_dir = ROOT / tag
     out_dir.mkdir(parents=True, exist_ok=True)
     sections = out_dir / "sections"
@@ -132,7 +134,7 @@ def main() -> None:
         "--model-path",
         spec["path"],
         "--prompt",
-        PROMPTS[PROMPT_KEY],
+        PROMPTS[args.prompt],
         "--width",
         str(width),
         "--height",

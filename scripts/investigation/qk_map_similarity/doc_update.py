@@ -777,6 +777,145 @@ def stage_examples() -> None:
     print("[examples] family exemplar table inserted")
 
 
+REPRO_NEXTSTEPS = """\
+cd scripts/investigation/qk_map_similarity
+# (a) 全 360 头画像扫描：p1/p4 全头捕获（c0/c3/c6、末步）+ 分类
+python run.py --spec sweep --chunks 0,3,6 --steps 3 --prompts p1,p4
+CUDA_VISIBLE_DEVICES=<idle-gpu> python taxonomy_sweep.py
+# (b) LightForcing 逐头召回（真实 mask，osa_recall 的 LF hook）+ 对拍
+cd ../osa_recall
+python run.py --model self_forcing --method lightforcing --density 0.2 \\
+  --seconds 5 --res 720p --prompt p1_forest --gpu <idle-gpu>
+python run.py --model self_forcing --method lightforcing --density 0.3 \\
+  --seconds 5 --res 720p --prompt p1_forest --gpu <idle-gpu>
+cd ../qk_map_similarity
+CUDA_VISIBLE_DEVICES=<idle-gpu> python lf_compare.py
+# (c) LF 规划成本 microbenchmark
+CUDA_VISIBLE_DEVICES=<idle-gpu> python bench_lf_plan.py
+python doc_update.py --stage nextsteps"""
+
+
+def nextsteps_xml() -> str:
+    taxonomy = json.loads((ROOT / "deep_dive" / "taxonomy.json").read_text())
+    compare = json.loads((ROOT / "deep_dive" / "lf_compare.json").read_text())
+    bench = json.loads((ROOT / "deep_dive" / "bench_lf_plan.json").read_text())
+    counts = taxonomy["summary"]["family_counts"]
+    total = sum(counts.values())
+    mean_density = taxonomy["summary"]["mean_density"]
+
+    family_rows = "".join(
+        f"<tr><td><p>{name}</p></td><td>{counts[key]}</td>"
+        f"<td>{counts[key] / total:.1%}</td></tr>"
+        for key, name in (
+            ("local", "局部头（静态窗口）"),
+            ("shortwin", "短窗头（own+recent 帧）"),
+            ("frozen", "冻结头（chunk-0 top-10% 位置）"),
+            ("diffuse", "弥散头（降采样）"),
+            ("content", "内容依赖头（运行时选择）"),
+        )
+    )
+    family_table = (
+        '<table><colgroup><col width="240"/><col span="2" width="110"/></colgroup>'
+        "<thead><tr><th>家族</th><th>头数</th><th>占比</th></tr></thead>"
+        f"<tbody>{family_rows}</tbody></table>"
+    )
+
+    def compare_row(label: str, record: dict, density_key: str) -> str:
+        return (
+            f"<tr><td><p>{label}</p></td><td>{record[density_key]:.3f}</td>"
+            f"<td>{record['mean_recall']:.3f}</td><td>{record['p10_recall']:.3f}</td>"
+            f"<td>{record['share_below_0.5']:.1%}</td></tr>"
+        )
+
+    compare_table = (
+        '<table><colgroup><col width="250"/><col span="4" width="120"/></colgroup>'
+        "<thead><tr><th>方案</th><th>平均密度</th><th>平均召回</th>"
+        "<th>p10 召回</th><th>召回&lt;0.5 头占比</th></tr></thead><tbody>"
+        + compare_row("hybrid（内容头用 top-20% 复制代理）", compare["hybrid"], "mean_density")
+        + compare_row(
+            "hybrid（内容头用 LF 自身选择）", compare["hybrid_lf_content"], "mean_density"
+        )
+        + compare_row("LightForcing d0.2", compare["lf_d0.2"], "per_call_density")
+        + compare_row("LightForcing d0.3", compare["lf_d0.3"], "per_call_density")
+        + "</tbody></table>"
+    )
+
+    plan_c6 = bench["c6"]["plan_ms"]
+    dense_c6 = bench["c6"]["dense_attention_ms"]
+    plan_total = bench["per_video"]["estimated_total_plan_s"]
+    return (
+        "<h2>「待验证的下一步」执行结果</h2>"
+        "<p>三项均在 720p / 5 秒、seed 42 上完成；(a)(b) 为真实测量，(c) 为 "
+        "microbenchmark + 由实测数字外推的预估。</p>"
+        "<h3>(a) 全 360 头画像扫描</h3>"
+        "<p>对全部 30 层 × 12 头，在 p1（最难）与 p4（最易）两个内容极端上捕获 "
+        "c0 / c3 / c6 的末步 Q/K，按保守规则分类（阈值 τ=0.85 须在两个 prompt "
+        "上同时满足，family 按执行密度从便宜到贵依次尝试）。结果："
+        f"<b>{total - counts['content']} / {total}（"
+        f"{taxonomy['summary']['planning_free_share']:.1%}）的头零规划成本</b>，"
+        f"全队平均密度 <b>{mean_density:.3f}</b>（内容头预算按 20% 计），"
+        "平均策略召回 p1 0.769 / p4 0.831。静态家族集中在网络两端（层 0 有 "
+        "11/12 静态，层 27–29 有 6–8 个），中间层（9–26）几乎全部内容依赖——"
+        "与九头抽样的深度结论一致。</p>"
+        "<p>[[map:taxonomy_map]]</p>"
+        f"{family_table}"
+        "<h3>(b) 与 LightForcing 的逐头质量召回对拍</h3>"
+        "<p>LightForcing 侧用 osa_recall 的 LF hook 在真实运行中测其 mask 的逐头"
+        "捕获质量（p1、720p/5s、chunk 6、step 3——与画像同一口径）。"
+        "组合系统（静态家族按画像执行 + 内容依赖头沿用 LF 自身的选择）在 "
+        f"<b>{compare['hybrid_lf_content']['mean_density']:.3f}</b> 的平均密度"
+        f"（LF d0.2 的 84%）下达到平均召回 "
+        f"<b>{compare['hybrid_lf_content']['mean_recall']:.3f}</b>"
+        f"（LF d0.2 为 {compare['lf_d0.2']['mean_recall']:.3f}），p10 与低召回头"
+        "占比同样接近——<b>质量代理指标与 LF 基本持平，key 读取量少 16%</b>。"
+        "纯冻结代理（内容头用 top-20% 帧复制位置）则落后 LF 明显，再次确认内容头"
+        "必须保留运行时选择。</p>"
+        "<p>[[map:lf_compare]]</p>"
+        f"{compare_table}"
+        "<h3>(c) 规划成本 microbenchmark 与端到端预估</h3>"
+        f"<p>用 LightForcing 真实的规划流水线（pool + block mask + 计划构建）在 "
+        f"c6 形状（12 头、10800 q × 75600 kv）上实测：<b>每调用 {plan_c6:.2f} "
+        f"ms</b>，同形状稠密注意力 {dense_c6:.1f} ms——规划只占注意力调用的 "
+        f"~2–4%，整段 5 秒视频的规划总量约 <b>{plan_total:.2f} s</b>"
+        "（840 次调用）。这推翻了我们此前的一个预期：在 LongLive-2 上决定性的"
+        "“摊销规划”杠杆，在 Self-Forcing 720p 的大注意力调用下只值 ~3%；"
+        "<b>真正的杠杆是密度</b>。把 LF 的实测密度-耗时阶梯（dense 10.67 s，"
+        "d0.50/0.36/0.22 → 9.86/8.85/8.11 s）线性拟合（t ≈ 7.76 + 3.10·d），"
+        "组合系统在密度 0.166、规划移出去噪路径后预估去噪 <b>≈ 8.0 s：比 dense "
+        "快 1.34×，比 LF d0.2（实测 8.85 s）快 ~1.1×</b>。预估未计入的上行空间："
+        "静态头的连续 pattern（滑窗 / 帧区间）kernel 效率高于散点 block；"
+        "5 秒时注意力占比低，时长越长密度优势放大。<b>结论与下一步：</b>在 5 秒"
+        "档，混合方案对 LF 的优势是实在但有限的（~10%），瓶颈是 63.6% 的内容"
+        "依赖头占比——要拿到显著优势需要 (1) 压缩内容头份额（更细的静态图案，"
+        "如逐头帧集合、对角带 mask），(2) 更强 / 更便宜的运行时选择器，"
+        "(3) 真实 backend 原型做端到端计时验证（本节预估的最终检验）。</p>"
+        f"{repro_pre(REPRO_NEXTSTEPS)}"
+    )
+
+
+def stage_nextsteps() -> None:
+    """Publish the next-step experiment results as a final section."""
+    data = cli("docs", "+fetch", "--doc", DOC, "--detail", "with-ids")
+    content = data["document"]["content"]
+    if "「待验证的下一步」执行结果" not in content:
+        cli(
+            "docs", "+update", "--doc", DOC, "--command", "append",
+            "--content", nextsteps_xml(),
+        )
+    if "（执行结果见文末" not in content:
+        cli(
+            "docs", "+update", "--doc", DOC, "--command", "str_replace",
+            "--pattern", "四、待验证的下一步。",
+            "--content", "四、待验证的下一步（执行结果见文末的结果节）。",
+        )
+    placeholders = fetch_placeholders()
+    for name in ("taxonomy_map", "lf_compare"):
+        key = f"map:{name}"
+        if key in placeholders:
+            replace_media(DOC, placeholders[key], str(ROOT / "plots" / f"{name}.png"))
+    print("[nextsteps] results section published")
+
+
 def stage_stability() -> None:
     """Publish the cross-prompt content-independence section."""
     data = cli("docs", "+fetch", "--doc", DOC, "--detail", "with-ids")
@@ -911,7 +1050,7 @@ def main() -> None:
         required=True,
         choices=[
             "sections", "media", "extra", "resim", "temporal",
-            "repro", "deepdive", "stability", "examples", "verify",
+            "repro", "deepdive", "stability", "examples", "nextsteps", "verify",
         ],
     )
     args = parser.parse_args()
@@ -925,6 +1064,7 @@ def main() -> None:
         "deepdive": stage_deepdive,
         "stability": stage_stability,
         "examples": stage_examples,
+        "nextsteps": stage_nextsteps,
         "verify": stage_verify,
     }[args.stage]()
 

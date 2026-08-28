@@ -156,3 +156,28 @@ strategy's claim was accordingly qualified in place: family assignment is
 calibrate-once only under conservative boundaries; borderline heads go to
 runtime selection, and content-head budgets must be sized on worst-case
 (high-motion) content.
+
+## Next-step experiments (a)(b)(c)
+
+```bash
+python run.py --spec sweep --chunks 0,3,6 --steps 3 --prompts p1,p4  # all 360 heads
+CUDA_VISIBLE_DEVICES=<idle> python taxonomy_sweep.py                 # (a) classify
+# (b) LightForcing per-head mask recall (osa_recall LF hook, p1_forest, 5s):
+#     ../osa_recall/run.py --method lightforcing --density 0.2/0.3 --seconds 5 --prompt p1_forest
+CUDA_VISIBLE_DEVICES=<idle> python lf_compare.py                     # (b) compare
+CUDA_VISIBLE_DEVICES=<idle> python bench_lf_plan.py                  # (c) plan cost
+python doc_update.py --stage nextsteps
+```
+
+Results (720p/5s, p1, chunk 6, step 3): (a) 131/360 heads (36.4%) are
+planning-free (50 local, 63 short-window, 8 frozen, 10 diffuse), fleet mean
+density 0.167, static families cluster at the network ends. (b) the composed
+system (static families + LF's own selection for the 229 content heads)
+reaches mean recall 0.792 at density 0.166 vs LF-d0.2's 0.815 at 0.198 —
+parity-level quality proxy at 84% of the keys. (c) LF planning is only
+0.34 ms/call (~3% of a 8-14 ms attention call; ~0.29 s per video) — the
+amortization lever that decided LongLive-2 is minor here; density is the
+lever. Linear fit of LF's measured density-time ladder projects the hybrid
+at ~8.0 s denoise = 1.34x over dense, ~1.1x over LF-d0.2 at 5 s (larger at
+longer durations). Remaining: shrink the 64% content-head share and build
+the real backend for e2e timing.

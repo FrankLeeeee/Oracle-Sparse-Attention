@@ -67,11 +67,16 @@ EXTRA_HEAD_SPECS = (
 )
 # The deep-dive round captures every chunk (not just the percentile four) for
 # all nine picks at once, so any chunk can serve as calibration reference.
+# "sweep" captures EVERY head of EVERY layer (for the 360-head taxonomy scan);
+# its dumps go to a separate runs/<p>_sweep/qk dir since the files are
+# 12-head-wide and would shadow the pick-based captures.
 SPEC_SETS = {
     "main": HEAD_SPECS,
     "extra": EXTRA_HEAD_SPECS,
     "all9": (*HEAD_SPECS, *EXTRA_HEAD_SPECS),
+    "sweep": None,
 }
+NUM_HEADS = 12
 
 
 def dump_spec(specs) -> str:
@@ -101,6 +106,7 @@ def run_one(
     capture: bool,
     spec_set: str = "main",
     chunks: tuple[int, ...] = tuple(CHUNK_IDS),
+    steps: tuple[int, ...] = STEP_IDS,
 ) -> dict:
     spec = MODELS[MODEL]
     width, height = spec["resolutions"][RES]
@@ -110,7 +116,9 @@ def run_one(
     suffix = "" if spec_set == "main" else f"_{spec_set}"
     out_dir = ROOT / "runs" / f"{prompt_id}{suffix}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    qk_dir = ROOT / "runs" / prompt_id / "qk"
+    qk_dir = (
+        out_dir / "qk" if spec_set == "sweep" else ROOT / "runs" / prompt_id / "qk"
+    )
     cmd = [
         "sglang",
         "generate",
@@ -144,9 +152,14 @@ def run_one(
             "SGLANG_DIFFUSION_ATTENTION_MAP_DIR": str(out_dir / "probe_meta"),
             "SGLANG_DIFFUSION_ATTENTION_MAP_QK_ONLY": "1",
             "QKDUMP_DIR": str(qk_dir),
-            "QKDUMP_SPEC": dump_spec(SPEC_SETS[spec_set]),
+            "QKDUMP_SPEC": (
+                # flat form = every head of every layer
+                ",".join(str(h) for h in range(NUM_HEADS))
+                if spec_set == "sweep"
+                else dump_spec(SPEC_SETS[spec_set])
+            ),
             "QKDUMP_CHUNKS": ",".join(str(c) for c in chunks),
-            "QKDUMP_STEPS": ",".join(str(s) for s in STEP_IDS),
+            "QKDUMP_STEPS": ",".join(str(s) for s in steps),
         }
     log = out_dir / "run.log"
     started = time.time()
@@ -168,7 +181,11 @@ def run_one(
             proc.wait()
         finally:
             watchdog.stop()
-    layers = {s["layer"] for s in SPEC_SETS[spec_set]}
+    layers = (
+        set(range(NUM_LAYERS))
+        if spec_set == "sweep"
+        else {s["layer"] for s in SPEC_SETS[spec_set]}
+    )
     dumps = sum(1 for layer in layers for _ in qk_dir.glob(f"qk_L{layer:02d}_*.npz"))
     result = parse_log(log)
     result.update(
@@ -188,13 +205,19 @@ def main() -> None:
     parser.add_argument("--no-capture", action="store_true")
     parser.add_argument("--spec", default="main", choices=sorted(SPEC_SETS))
     parser.add_argument("--chunks", default=",".join(str(c) for c in CHUNK_IDS))
+    parser.add_argument("--steps", default=",".join(str(s) for s in STEP_IDS))
     parser.add_argument("--port-base", type=int, default=29800)
     args = parser.parse_args()
 
     chunks = tuple(int(c) for c in args.chunks.split(","))
+    steps = tuple(int(s) for s in args.steps.split(","))
     pool = GpuPool([int(g) for g in args.gpus.split(",")])
-    layer_count = len({s["layer"] for s in SPEC_SETS[args.spec]})
-    expected = len(chunks) * len(STEP_IDS) * layer_count
+    layer_count = (
+        NUM_LAYERS
+        if args.spec == "sweep"
+        else len({s["layer"] for s in SPEC_SETS[args.spec]})
+    )
+    expected = len(chunks) * len(steps) * layer_count
     results = {}
     for index, prompt_id in enumerate(args.prompts.split(",")):
         prompt = PROMPTS[prompt_id]["prompt"]
@@ -210,6 +233,7 @@ def main() -> None:
                     capture=not args.no_capture,
                     spec_set=args.spec,
                     chunks=chunks,
+                    steps=steps,
                 )
             finally:
                 pool.release(gpu)
