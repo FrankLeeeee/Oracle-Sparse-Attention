@@ -1,0 +1,173 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Publish the MSA implementation + benchmark section into the OSA Properties doc.
+
+    python doc_update.py
+"""
+
+import json
+import pathlib
+import statistics
+import sys
+from xml.sax.saxutils import escape
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+from doc_media import cli  # noqa: E402
+from paths import results_dir  # noqa: E402
+
+DOC = "Rs3sdTCinoc6kqxdiGxcUDIQnfd"
+ROOT = results_dir("msa_bench")
+PROMPTS = json.loads((HERE / "bench_prompts.json").read_text())
+METHOD_LABELS = {
+    "dense": "dense",
+    "msa": "MSA（content 0.20）",
+    "msa25": "MSA（content 0.25）",
+    "lightforcing": "LightForcing（0.2 档）",
+}
+
+
+def bench_5s_table() -> str:
+    results = json.loads((ROOT / "results_5s.json").read_text())
+    header = (
+        "<th>去噪耗时（5 prompt 均值）</th><th>对 dense 加速</th>"
+        "<th>实际累计密度</th><th>PSNR vs dense（均值）</th><th>前 2 秒 PSNR</th>"
+    )
+    dense_mean = statistics.mean(
+        results[f"b{i}_dense_5s"]["denoise_s"] for i in range(1, 6)
+    )
+    rows = []
+    for method in ("dense", "msa", "msa25", "lightforcing"):
+        entries = [results[f"b{i}_{method}_5s"] for i in range(1, 6)]
+        denoise = statistics.mean(e["denoise_s"] for e in entries)
+        cells = [f"<td>{denoise:.2f} s</td><td>{dense_mean / denoise:.2f}×</td>"]
+        if method == "dense":
+            cells.append("<td>1.0</td><td>—</td><td>—</td>")
+        else:
+            psnr = statistics.mean(e["psnr"] for e in entries)
+            first = statistics.mean(e["psnr_first"] for e in entries)
+            cells.append(
+                f"<td>{entries[1]['density']:.3f}</td>"
+                f"<td>{psnr:.2f}</td><td>{first:.2f}</td>"
+            )
+        rows.append(
+            f"<tr><td><p>{METHOD_LABELS[method]}</p></td>{''.join(cells)}</tr>"
+        )
+    return (
+        '<table><colgroup><col width="190"/><col span="5" width="128"/></colgroup>'
+        f"<thead><tr><th></th>{header}</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def per_prompt_table() -> str:
+    results = json.loads((ROOT / "results_5s.json").read_text())
+    header = "".join(
+        f"<th>{pid} · {escape(PROMPTS[pid]['label'])}</th>" for pid in PROMPTS
+    )
+    rows = []
+    for method in ("msa", "msa25", "lightforcing"):
+        cells = "".join(
+            f"<td>{results[f'{pid}_{method}_5s']['psnr']:.1f}</td>" for pid in PROMPTS
+        )
+        rows.append(f"<tr><td><p>{METHOD_LABELS[method]}</p></td>{cells}</tr>")
+    return (
+        '<table><colgroup><col width="190"/><col span="5" width="105"/></colgroup>'
+        f"<thead><tr><th>PSNR vs dense</th>{header}</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def bench_20s_table() -> str:
+    results = json.loads((ROOT / "results_20s.json").read_text())
+    rows = []
+    for method in ("dense", "msa", "lightforcing"):
+        entry = results[f"b1_{method}_20s"]
+        density = entry.get("density")
+        rows.append(
+            f"<tr><td><p>{METHOD_LABELS[method]}</p></td>"
+            f"<td>{entry['denoise_s']:.2f} s</td>"
+            f"<td>{density if density else 1.0}</td></tr>"
+        )
+    return (
+        '<table><colgroup><col width="190"/><col span="2" width="150"/></colgroup>'
+        "<thead><tr><th></th><th>去噪耗时（b1）</th><th>实际累计密度</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def section_xml() -> str:
+    prompt_items = "".join(
+        f"<p><b>{pid} · {escape(entry['label'])}</b>：{escape(entry['prompt'])}</p>"
+        for pid, entry in PROMPTS.items()
+    )
+    return (
+        "<h2>MSA：混合稀疏注意力的实现与基准</h2>"
+        "<p>把上文的策略落成了可运行的 backend（<code>--sparse-attention msa</code>，"
+        "commit 7ad05e42e 起）：每个头按离线画像的家族执行——<b>局部头</b>"
+        "（r≤2 的静态行窗口，逐帧复制）与<b>短窗头</b>（只读最新 m 帧）零运行时"
+        "规划，由 <code>msa_kernel.py</code> 的帧复制 Triton kernel 执行"
+        "（帧复制写在循环结构里，静态计划只有几百字节、按 (层, 布局) 缓存）；"
+        "<b>内容依赖头</b>走 LightForcing 语义的两阶段 pooled top-k 选择，由"
+        "带头索引的 range kernel 执行，且<b>计划每 chunk 只做一次</b>"
+        "（首个去噪步测、其余步与 cache 刷新复用——LightForcing 每次调用都要"
+        "重新规划）。画像用给定的 5 个 prompt（p1–p5）标定（τ=0.85 需 5 个 "
+        "prompt 同时满足），并加执行感知的门槛：行量化后执行密度超过内容头"
+        "预算的 local 头（r≥4 时为每帧 22–44%）与统计上不稳的弥散头一律改走"
+        "运行时选择——最终 87/360 头静态（34 局部 + 53 短窗）、273 头内容。"
+        "校准文件 <code>qk_map_similarity/msa_taxonomy_self_forcing.json</code>，"
+        "单测 59 项全过（kernel 对掩码参考逐位校验）。</p>"
+        "<h3>基准设置与新 prompt</h3>"
+        "<p>画像标定用了 p1–p5，因此基准换用 5 个<b>新写的</b> prompt（标定外），"
+        "720p / 5 秒、seed 42、独占 GPU 串行计时；质量为对同 prompt dense 输出的 "
+        "PSNR。LightForcing 用 sparse_baselines 标定的 0.2 档配置"
+        "（即已发表 5 秒数字背后的设置）。</p>"
+        f"{prompt_items}"
+        "<h3>结果（720p / 5 秒）</h3>"
+        f"{bench_5s_table()}"
+        f"{per_prompt_table()}"
+        "<p><b>结论：</b>MSA（content 0.25）在质量与 LightForcing 相当"
+        "（PSNR 均值 17.72 vs 17.86，逐 prompt 差 ≤0.7 dB）的同时略快"
+        "（8.94 vs 9.00 s）；MSA（content 0.20）再快 3%（8.73 s，比 dense 快 "
+        "1.22×），代价是均值低 ~0.85 dB。两档读取的 key 都少于 LightForcing"
+        "（0.337 / 0.369 vs 0.357）。</p>"
+        "<h3>20 秒计时与已知短板</h3>"
+        f"{bench_20s_table()}"
+        "<p>20 秒档 MSA（33.2 s）仍慢于 LightForcing（29.0 s）：静态头的帧复制"
+        "图案在 81 个可见帧下退化为大量短 key 走查（局部头每帧 4–6 个 tile），"
+        "kernel 吞吐 ~250–320 TFLOP/s，低于合并长 range 的 ~500；LightForcing "
+        "的两阶段资格约束天然把保留块聚拢成长 range。修复方向（未实现）："
+        "静态头改 gather-复制执行（OSA 曾验证 gather + FA varlen ~607 TFLOP/s）、"
+        "或 query 置换后做真正的 2-D 窗口。开发过程中被基准推翻的两个预设也值得"
+        "记录：纯全局 top-k 的内容选择比两阶段版本执行慢 ~2×（散块不合并）；"
+        "弥散头的帧抽样在短视频上有统计偏差（b5 PSNR 掉 2.8 dB），最终并入"
+        "运行时选择。</p>"
+        '<pre lang="bash" caption="复现命令"><code>'
+        + escape(
+            "# 画像标定（需 p1-p5 的 sweep 捕获，见上文）+ 导出 backend 校准文件\n"
+            "cd scripts/investigation/qk_map_similarity\n"
+            "CUDA_VISIBLE_DEVICES=<idle> python taxonomy_sweep.py \\\n"
+            "  --runs p1_sweep,p2_sweep,p3_sweep,p4_sweep,p5_sweep --export msa_taxonomy_self_forcing.json\n"
+            "cd ../msa_bench\n"
+            "python run_bench.py                                  # dense/msa/lightforcing x b1-b5, 5s\n"
+            "python run_bench.py --methods msa25                  # content 0.25 档\n"
+            "python run_bench.py --seconds 20 --prompts b1        # 20s 计时\n"
+            "python doc_update.py\n"
+            "# 单测\n"
+            "PYTHONPATH=python python -m pytest \\\n"
+            "  python/sglang/multimodal_gen/test/unit/realtime/test_sparse_attention.py -q"
+        )
+        + "</code></pre>"
+    )
+
+
+def main() -> None:
+    data = cli("docs", "+fetch", "--doc", DOC)
+    if "MSA：混合稀疏注意力" in data["document"]["content"]:
+        print("[msa-doc] section already present")
+        return
+    cli("docs", "+update", "--doc", DOC, "--command", "append", "--content", section_xml())
+    print("[msa-doc] section appended")
+
+
+if __name__ == "__main__":
+    main()
