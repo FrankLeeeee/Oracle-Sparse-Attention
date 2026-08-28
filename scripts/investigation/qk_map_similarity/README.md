@@ -136,3 +136,23 @@ per-head density budgets instead of one global knob.
 - Feishu can't insert media mid-doc: `doc_update.py` writes `[[kind:name]]`
   placeholder paragraphs (including inside table cells), then media-inserts at
   the doc end and `block_move_after`s each file behind its placeholder.
+
+## Content independence check
+
+```bash
+python run.py --spec all9 --chunks 0,1,2,3,4,5,6 --prompts p2,p3,p4,p5
+CUDA_VISIBLE_DEVICES=<idle> python content_stability.py
+python doc_update.py --stage stability
+```
+
+`content_stability.py` repeats the taxonomy metrics on all five prompts and
+adds the direct test: positions calibrated on prompt A's chunk 0 deployed on
+prompt B (`cross@10%`). Result (in the doc's 「画像的内容无关性验证」 section):
+static-family heads are strictly content-independent (L0·h1 own 1.00 on every
+prompt, position overlap 0.98; L20·h7 0.96-0.99; diffuse heads equally tight),
+but the content-dependent heads' metrics swing with content (L10·h5 own
+0.44-0.83, local_r9 0.34-0.92; the chaotic p1 is always the hardest). The
+strategy's claim was accordingly qualified in place: family assignment is
+calibrate-once only under conservative boundaries; borderline heads go to
+runtime selection, and content-head budgets must be sized on worst-case
+(high-motion) content.

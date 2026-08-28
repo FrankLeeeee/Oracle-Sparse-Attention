@@ -580,6 +580,135 @@ def strategy_xml() -> str:
     )
 
 
+REPRO_STABILITY = """\
+cd scripts/investigation/qk_map_similarity
+# p2-p5 的全 chunk Q/K 捕获（p1 已有；同 seed、不同内容）
+python run.py --spec all9 --chunks 0,1,2,3,4,5,6 --prompts p2,p3,p4,p5
+# 跨 prompt 稳定性：own/cross@10%、top-k 位置重合率、局部窗口、90% 帧数
+CUDA_VISIBLE_DEVICES=<idle-gpu> python content_stability.py
+python doc_update.py --stage stability"""
+
+
+def stability_results() -> dict:
+    return json.loads(
+        (ROOT / "deep_dive" / "content_stability.json").read_text()
+    )
+
+
+def stability_table(record: dict) -> str:
+    runs = record["runs"]
+    header = (
+        "<th>own@10%（5 prompt 范围）</th><th>cross@10%（范围）</th>"
+        "<th>top-10% 位置重合率</th><th>local r=9（范围）</th>"
+        "<th>90% 帧数（范围）</th>"
+    )
+    rows = []
+    for spec in all_specs_sorted():
+        pick = record["picks"][pick_key(spec)]
+        own = [pick[run]["own@10%"] for run in runs]
+        cross = [pick[run]["cross@10%"] for run in runs]
+        overlap = [pick[run]["overlap"] for run in runs]
+        local = [pick[run]["local_r9"] for run in runs]
+        frames = [pick[run]["frames_90"] for run in runs]
+        cells = (
+            f"<td>{min(own):.2f}–{max(own):.2f}</td>"
+            f"<td>{min(cross):.2f}–{max(cross):.2f}</td>"
+            f"<td>{sum(overlap) / len(overlap):.2f}</td>"
+            f"<td>{min(local):.2f}–{max(local):.2f}</td>"
+            f"<td>{min(frames)}–{max(frames)}</td>"
+        )
+        rows.append(f"<tr><td><p>{pick_label(spec)}</p></td>{cells}</tr>")
+    return (
+        '<table><colgroup><col width="100"/><col span="5" width="140"/></colgroup>'
+        f"<thead><tr><th></th>{header}</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def stability_xml() -> str:
+    record = stability_results()
+    runs = record["runs"]
+
+    def stats(key: str, metric: str) -> tuple[float, float, list[float]]:
+        values = [record["picks"][key][run][metric] for run in runs]
+        return min(values), max(values), values
+
+    static_lines = []
+    for key, family in (
+        ("L00_h1", "几何"), ("L20_h7", "own-chunk"),
+        ("L00_h0", "弥散"), ("L05_h4", "弥散"),
+    ):
+        low, high, _ = stats(key, "own@10%")
+        overlap = sum(record["picks"][key][run]["overlap"] for run in runs) / len(runs)
+        label = key.replace("_", "·").replace("L0", "L", 1)
+        static_lines.append(
+            f"{label}（{family}）own@10% {low:.2f}–{high:.2f}、位置重合率 {overlap:.2f}"
+        )
+    volatile_lines = []
+    for key in ("L10_h5", "L14_h2", "L25_h8", "L29_h3"):
+        low, high, _ = stats(key, "own@10%")
+        r_low, r_high, _ = stats(key, "local_r9")
+        label = key.replace("_", "·")
+        volatile_lines.append(
+            f"{label} own@10% {low:.2f}–{high:.2f}、local r9 {r_low:.2f}–{r_high:.2f}"
+        )
+    return (
+        "<h2>画像的内容无关性验证（跨 prompt）</h2>"
+        "<p>上文策略引用了“画像内容无关，一个模型只需标定一次”。此前只有间接"
+        "证据（多 prompt 实验里各稀疏方法的实际读取密度跨 prompt 一致）。本节"
+        "直接检验：对全部 5 个 prompt（同 seed、不同内容）重复全 chunk Q/K "
+        "捕获，在 chunk 6、step 3 上比较画像的三个决定性指标，并做最直接的"
+        "测试——用 prompt A 的 chunk 0 校准出的逐 query top-10% 位置，部署到 "
+        "prompt B 的生成上收集质量（cross@10%）。</p>"
+        "<p>[[map:content_stability]]</p>"
+        f"{stability_table(record)}"
+        "<p><b>结论一：静态家族的画像严格内容无关。</b>"
+        f"{'；'.join(static_lines)}——四个静态家族头在 5 个 prompt 上数值几乎不"
+        "动，几何 / own-chunk 头的位置集合本身跨内容高度重合，cross ≈ own，"
+        "“标定一次、任意内容部署”对它们在位置层面成立。"
+        "<b>结论二：内容依赖头的指标本身随内容明显波动，原句需要限定。</b>"
+        f"{'；'.join(volatile_lines)}——同一个头在静态场景（茶杯、浣熊）上"
+        "接近可冻结，在高动态场景（p1 雨林逃亡在每个波动头上都处于最低端）上"
+        "显著变难，90% 帧数的极差可达 11 帧（L25·h8）。对它们，"
+        "cross@10% 也系统性低于 own@10%。<b>对策略的含义：</b>家族划分本身"
+        "仍可一次标定，但必须<b>保守划界</b>——(a) 只有在全部标定内容上都处于"
+        "安全区的头才进静态家族，边界头（如 L25·h8）一律归入运行时选择；"
+        "(b) 内容依赖头恰好就是策略里保留逐 chunk 运行时选择的那部分，其内容"
+        "波动正是运行时选择存在的理由；(c) 它们的密度预算要按最难内容（高动态"
+        "场景）标定，而不是按均值。内容无关的是<b>家族归属（在保守边界下）与"
+        "静态头的具体图案</b>，不是每个头的逐 token 位置。</p>"
+        f"{repro_pre(REPRO_STABILITY)}"
+    )
+
+
+def stage_stability() -> None:
+    """Publish the cross-prompt content-independence section."""
+    data = cli("docs", "+fetch", "--doc", DOC, "--detail", "with-ids")
+    content = data["document"]["content"]
+    if "内容无关性验证" not in content:
+        cli(
+            "docs", "+update", "--doc", DOC, "--command", "append",
+            "--content", stability_xml(),
+        )
+    marker = "画像是内容无关的（多 prompt 轮已证密度与图案跨内容稳定），一个模型只需标定一次"
+    if marker in content:
+        cli(
+            "docs", "+update", "--doc", DOC, "--command", "str_replace",
+            "--pattern", marker,
+            "--content",
+            "画像的家族划分在保守划界下跨内容稳定（静态家族严格内容无关；"
+            "内容依赖头的指标本身随内容波动，因而必须走运行时选择——直接证据与"
+            "限定见下文「画像的内容无关性验证」节），一个模型只需标定一次家族归属",
+        )
+    placeholders = fetch_placeholders()
+    key = "map:content_stability"
+    if key in placeholders:
+        replace_media(
+            DOC, placeholders[key], str(ROOT / "plots" / "content_stability.png")
+        )
+    print("[stability] content-independence section published")
+
+
 def stage_deepdive() -> None:
     """Publish the deep-dive: ref sweep (sec 3), mass recall, strategy section."""
     data = cli("docs", "+fetch", "--doc", DOC, "--detail", "with-ids")
@@ -685,8 +814,8 @@ def main() -> None:
         "--stage",
         required=True,
         choices=[
-            "sections", "media", "extra", "resim",
-            "temporal", "repro", "deepdive", "verify",
+            "sections", "media", "extra", "resim", "temporal",
+            "repro", "deepdive", "stability", "verify",
         ],
     )
     args = parser.parse_args()
@@ -698,6 +827,7 @@ def main() -> None:
         "temporal": stage_temporal,
         "repro": stage_repro,
         "deepdive": stage_deepdive,
+        "stability": stage_stability,
         "verify": stage_verify,
     }[args.stage]()
 
