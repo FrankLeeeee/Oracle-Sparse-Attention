@@ -46,6 +46,7 @@ from sglang.multimodal_gen.runtime.layers.attention.sparse.kernel import (
 )
 from sglang.multimodal_gen.runtime.layers.attention.sparse.lightforcing import (
     frame_aligned_block_bounds,
+    lightforcing_block_mask,
     mean_pool_blocks,
 )
 from sglang.multimodal_gen.runtime.layers.attention.sparse.msa_kernel import (
@@ -68,6 +69,22 @@ class MsaConfig(msgspec.Struct, frozen=True):
     block_q: int = 128
     # Key block of the content estimator's pooled, frame-aligned scoring.
     block_k: int = 128
+    # Two-stage eligibility of the content selection (LightForcing semantics):
+    # stage 1 keeps the top ``keep_frames`` past frames per query block plus
+    # the sink, the near window and the own chunk; stage 2 takes the block
+    # top-k inside them. Besides matching the measured composed system, the
+    # restriction makes the kept blocks contiguous — merged ranges execute
+    # ~2x faster than the same density scattered over every frame.
+    keep_frames: int = 6
+    keep_sink: int = 1
+    keep_near: int = 2
+    # Plan the content heads once per (layer, chunk) — at the chunk's first
+    # denoising step — and reuse the plan for the remaining steps and the
+    # cache refresh. LightForcing replans on every call; the study's
+    # step-consistency and prev-chunk-recall measurements showed the selection
+    # barely moves within a chunk, so this amortizes most of MSA's remaining
+    # planning cost. Set True to replan per call (LightForcing parity).
+    replan_each_step: bool = False
 
 
 class HeadSpec(msgspec.Struct, frozen=True):
@@ -167,6 +184,8 @@ class MixedSparseAttention(SparseAttentionBackend):
         self._taxonomy = load_taxonomy(config.taxonomy_path)
         self._static_cache = LayoutCache()
         self._pooled_history = LayoutCache()
+        self._content_cache = LayoutCache()
+        self._content_ids: dict[tuple[int, int], torch.Tensor] = {}
         # layer -> (static [(local head, spec)], content local-head ids); the
         # split depends only on the taxonomy, resolved per layer on first use.
         self._layer_split: dict[tuple[int, int, int], tuple[list, list[int]]] = {}
@@ -301,12 +320,16 @@ class MixedSparseAttention(SparseAttentionBackend):
         pooled_key = torch.cat([pooled_history, pooled_own], dim=0)
 
         index = torch.tensor(content, device=query.device)
-        scores = pooled_query.index_select(1, index).permute(
-            1, 0, 2
-        ) @ pooled_key.index_select(1, index).permute(1, 2, 0)
-        lut = torch.topk(scores, topk, dim=-1, sorted=False).indices
-        mask = torch.zeros_like(scores, dtype=torch.bool)
-        mask.scatter_(-1, lut, True)
+        mask = lightforcing_block_mask(
+            pooled_query=pooled_query.index_select(1, index).permute(1, 0, 2),
+            pooled_key=pooled_key.index_select(1, index).permute(1, 0, 2),
+            blocks_per_frame=blocks_per_frame,
+            past_frames=layout.num_frames - layout.query_frames,
+            keep_frames=config.keep_frames,
+            keep_sink=config.keep_sink,
+            keep_near=config.keep_near,
+            topk=topk,
+        )
         return mask, topk, kv_blocks
 
     def attend(self, call: SparseAttentionCall) -> torch.Tensor | None:
@@ -361,27 +384,40 @@ class MixedSparseAttention(SparseAttentionBackend):
             fraction += plan.fraction_sum
 
         if content:
-            mask, topk, kv_blocks = self._content_mask(call, layout, content)
-            block_lo, block_hi = frame_aligned_block_bounds(
-                num_frames=layout.num_frames,
-                frame_seqlen=layout.frame_seqlen,
-                block=self._config.block_k,
-                device=query.device,
-            )
-            content_plan = plan_from_segment_mask(
-                mask,
-                segment_starts=block_lo,
-                segment_ends=block_hi,
-                block_m=self._config.block_q,
-            )
+            signature = (call.key_segments, kv_len)
+            hit, cached = self._content_cache.get(call.layer_index, signature)
+            if hit and not self._config.replan_each_step:
+                content_plan, topk, kv_blocks = cached
+            else:
+                mask, topk, kv_blocks = self._content_mask(call, layout, content)
+                block_lo, block_hi = frame_aligned_block_bounds(
+                    num_frames=layout.num_frames,
+                    frame_seqlen=layout.frame_seqlen,
+                    block=self._config.block_k,
+                    device=query.device,
+                )
+                content_plan = plan_from_segment_mask(
+                    mask,
+                    segment_starts=block_lo,
+                    segment_ends=block_hi,
+                    block_m=self._config.block_q,
+                )
+                self._content_cache.put(
+                    call.layer_index, signature, (content_plan, topk, kv_blocks)
+                )
+            ids_key = (call.layer_index, call.head_start)
+            content_ids = self._content_ids.get(ids_key)
+            if content_ids is None:
+                content_ids = torch.tensor(
+                    content, dtype=torch.int32, device=query.device
+                )
+                self._content_ids[ids_key] = content_ids
             msa_content_attention(
                 query=query,
                 key=key,
                 value=value,
                 out=out,
-                head_ids=torch.tensor(
-                    content, dtype=torch.int32, device=query.device
-                ),
+                head_ids=content_ids,
                 range_starts=content_plan.range_starts,
                 range_ends=content_plan.range_ends,
                 range_counts=content_plan.range_counts,
