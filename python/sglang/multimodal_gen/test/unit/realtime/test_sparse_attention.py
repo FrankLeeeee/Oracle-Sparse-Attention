@@ -1291,7 +1291,7 @@ def _msa_expected_mask(backend, call, layout):
         frame_aligned_block_bounds,
     )
     from sglang.multimodal_gen.runtime.layers.attention.sparse.msa import (
-        diffuse_ranges,
+        diffuse_frame_step,
         local_ranges,
     )
 
@@ -1316,11 +1316,13 @@ def _msa_expected_mask(backend, call, layout):
             for frame in range(num_frames):
                 mask[0, q_block, frame * frame_seqlen + lo : frame * frame_seqlen + hi] = True
     mask[1, :, (num_frames - 3) * frame_seqlen :] = True
-    for lo, hi in diffuse_ranges(
-        frame_seqlen=frame_seqlen, density=config.diffuse_density
-    ):
-        for frame in range(num_frames):
-            mask[2, :, frame * frame_seqlen + lo : frame * frame_seqlen + hi] = True
+    step = diffuse_frame_step(config.diffuse_density)
+    tail = min(layout.query_frames, num_frames)
+    kept_frames = list(range(0, num_frames - tail, step)) + list(
+        range(num_frames - tail, num_frames)
+    )
+    for frame in kept_frames:
+        mask[2, :, frame * frame_seqlen : (frame + 1) * frame_seqlen] = True
     content_mask, _, _ = backend._content_mask(call, layout, [3])
     block_lo, block_hi = frame_aligned_block_bounds(
         num_frames=num_frames,
@@ -1423,12 +1425,11 @@ def test_msa_local_ranges_straddle_and_merge():
     assert ranges[1][1] == 390  # the bottom window ends at the last row
 
 
-def test_msa_diffuse_ranges_hit_the_requested_density():
+def test_msa_diffuse_frame_step_matches_density():
     from sglang.multimodal_gen.runtime.layers.attention.sparse.msa import (
-        diffuse_ranges,
+        diffuse_frame_step,
     )
 
-    ranges = diffuse_ranges(frame_seqlen=3600, density=0.10)
-    kept = sum(hi - lo for lo, hi in ranges)
-    assert abs(kept / 3600 - 0.10) < 0.03
-    assert all(0 <= lo < hi <= 3600 for lo, hi in ranges)
+    assert diffuse_frame_step(0.10) == 10
+    assert diffuse_frame_step(0.5) == 2
+    assert diffuse_frame_step(1.0) == 1

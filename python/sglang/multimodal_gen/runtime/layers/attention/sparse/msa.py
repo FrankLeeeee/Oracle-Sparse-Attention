@@ -12,9 +12,10 @@ dense runs of the calibration prompts):
     only the newest ``m`` visible frames (own chunk + recent), read fully —
     zero runtime planning.
 ``diffuse``
-    evenly strided 64-token tiles of every frame: these heads' attention rows
-    are near-uniform, so a structured subsample approximates their output
-    (a mean) without any selection.
+    every k-th history frame read in full (plus the whole own chunk): these
+    heads' attention rows are near-uniform, so a structured subsample
+    approximates their output (a mean) without any selection — and whole
+    frames keep the key walks contiguous, unlike within-frame striding.
 ``content`` (and ``frozen``, folded in)
     per-call top-k of mean-pooled key blocks per query block — the same
     estimator family LightForcing uses, restricted to the heads that actually
@@ -98,6 +99,8 @@ class MsaStaticPlan(msgspec.Struct, frozen=True):
 
     head_ids: torch.Tensor  # [groups] int32
     frame_lo: torch.Tensor  # [groups] int32
+    frame_step: torch.Tensor  # [groups] int32
+    frame_tail: torch.Tensor  # [groups] int32, own-chunk frames always read
     ranges: torch.Tensor  # [groups, q_blocks, max_ranges, 2] int32
     counts: torch.Tensor  # [groups, q_blocks] int32
     # Mean over (head, q_block) of kept keys / kv_len, summed over the groups —
@@ -165,14 +168,9 @@ def local_ranges(
     return merged
 
 
-def diffuse_ranges(*, frame_seqlen: int, density: float) -> list[tuple[int, int]]:
-    """Evenly spread 64-token tiles keeping ~``density`` of each frame."""
-    tile = 64
-    kept = max(1, round(density * frame_seqlen / tile))
-    starts = sorted(
-        {min(round(i * frame_seqlen / kept), frame_seqlen - tile) for i in range(kept)}
-    )
-    return [(start, min(start + tile, frame_seqlen)) for start in starts]
+def diffuse_frame_step(density: float) -> int:
+    """The history-frame stride keeping ~``density`` of the history frames."""
+    return max(1, round(1.0 / density))
 
 
 class MixedSparseAttention(SparseAttentionBackend):
@@ -239,6 +237,8 @@ class MixedSparseAttention(SparseAttentionBackend):
         groups = len(static)
         head_ids = torch.empty(groups, dtype=torch.int32)
         frame_lo = torch.zeros(groups, dtype=torch.int32)
+        frame_step = torch.ones(groups, dtype=torch.int32)
+        frame_tail = torch.zeros(groups, dtype=torch.int32)
         ranges = torch.zeros(
             (groups, q_blocks, _MAX_STATIC_RANGES, 2), dtype=torch.int32
         )
@@ -253,10 +253,11 @@ class MixedSparseAttention(SparseAttentionBackend):
                     q_block: [(0, frame_seqlen)] for q_block in range(q_blocks)
                 }
             elif spec.family == "diffuse":
-                shared = diffuse_ranges(
-                    frame_seqlen=frame_seqlen, density=config.diffuse_density
-                )
-                head_ranges = {q_block: shared for q_block in range(q_blocks)}
+                frame_step[group] = diffuse_frame_step(config.diffuse_density)
+                frame_tail[group] = min(layout.query_frames, num_frames)
+                head_ranges = {
+                    q_block: [(0, frame_seqlen)] for q_block in range(q_blocks)
+                }
             else:  # local
                 head_ranges = {
                     q_block: local_ranges(
@@ -277,11 +278,16 @@ class MixedSparseAttention(SparseAttentionBackend):
                     ranges[group, q_block, index, 0] = lo
                     ranges[group, q_block, index, 1] = hi
                 kept_per_frame += sum(hi - lo for lo, hi in block_ranges)
-            visible = num_frames - int(frame_lo[group])
+            tail = int(frame_tail[group])
+            visible = tail + len(
+                range(int(frame_lo[group]), num_frames - tail, int(frame_step[group]))
+            )
             fraction_sum += (kept_per_frame / q_blocks) * visible / layout.kv_len
         plan = MsaStaticPlan(
             head_ids=head_ids.to(device),
             frame_lo=frame_lo.to(device),
+            frame_step=frame_step.to(device),
+            frame_tail=frame_tail.to(device),
             ranges=ranges.to(device),
             counts=counts.to(device),
             fraction_sum=fraction_sum,
@@ -374,6 +380,8 @@ class MixedSparseAttention(SparseAttentionBackend):
                 out=out,
                 head_ids=plan.head_ids,
                 frame_lo=plan.frame_lo,
+                frame_step=plan.frame_step,
+                frame_tail=plan.frame_tail,
                 ranges=plan.ranges,
                 counts=plan.counts,
                 num_frames=layout.num_frames,

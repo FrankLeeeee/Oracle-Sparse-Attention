@@ -44,6 +44,8 @@ def _msa_static_kernel(
     out_ptr,
     head_ids_ptr,
     frame_lo_ptr,
+    frame_step_ptr,
+    frame_tail_ptr,
     range_ptr,  # [groups, q_blocks, max_ranges, 2] within-frame token bounds
     count_ptr,  # [groups, q_blocks]
     stride_qb,
@@ -96,10 +98,42 @@ def _msa_static_kernel(
     v_base = v_ptr + batch * stride_vb + head * stride_vh
 
     frame_lo = tl.load(frame_lo_ptr + group)
+    frame_step = tl.load(frame_step_ptr + group)
+    # The last ``frame_tail`` frames (the query's own chunk) are always read
+    # in full, whatever the stride — a strided head skipping its own frames
+    # would break the within-chunk bidirectional attention.
+    frame_tail = tl.load(frame_tail_ptr + group)
     range_base = group * stride_range_g + pid_m * stride_range_q
     num_ranges = tl.load(count_ptr + group * stride_count_g + pid_m)
 
-    for frame in range(frame_lo, num_frames):
+    for frame in range(frame_lo, num_frames - frame_tail, frame_step):
+        frame_base = frame * frame_seqlen
+        for range_index in range(num_ranges):
+            range_lo = tl.load(range_ptr + range_base + range_index * 2)
+            range_hi = tl.load(range_ptr + range_base + range_index * 2 + 1)
+            for tile_start in range(range_lo, range_hi, BLOCK_N):
+                offs_n = frame_base + tile_start + tl.arange(0, BLOCK_N)
+                tile_mask = tile_start + tl.arange(0, BLOCK_N) < range_hi
+                k_tile = tl.load(
+                    k_base + offs_n[:, None] * stride_kn + offs_d[None, :],
+                    mask=tile_mask[:, None],
+                    other=0.0,
+                )
+                qk = tl.dot(q_tile, tl.trans(k_tile)).to(tl.float32) * qk_scale
+                qk = tl.where(tile_mask[None, :], qk, float("-inf"))
+                new_max = tl.maximum(row_max, tl.max(qk, 1))
+                rescale = tl.math.exp2(row_max - new_max)
+                probs = tl.math.exp2(qk - new_max[:, None])
+                row_sum = row_sum * rescale + tl.sum(probs, 1)
+                acc = acc * rescale[:, None]
+                v_tile = tl.load(
+                    v_base + offs_n[:, None] * stride_vn + offs_d[None, :],
+                    mask=tile_mask[:, None],
+                    other=0.0,
+                )
+                acc += tl.dot(probs.to(v_tile.dtype), v_tile)
+                row_max = new_max
+    for frame in range(num_frames - frame_tail, num_frames):
         frame_base = frame * frame_seqlen
         for range_index in range(num_ranges):
             range_lo = tl.load(range_ptr + range_base + range_index * 2)
@@ -239,6 +273,8 @@ def msa_static_attention(
     out: torch.Tensor,
     head_ids: torch.Tensor,  # [groups] int32
     frame_lo: torch.Tensor,  # [groups] int32
+    frame_step: torch.Tensor,  # [groups] int32
+    frame_tail: torch.Tensor,  # [groups] int32
     ranges: torch.Tensor,  # [groups, q_blocks, max_ranges, 2] int32
     counts: torch.Tensor,  # [groups, q_blocks] int32
     num_frames: int,
@@ -257,6 +293,8 @@ def msa_static_attention(
         out,
         head_ids,
         frame_lo,
+        frame_step,
+        frame_tail,
         ranges,
         counts,
         query.stride(0),

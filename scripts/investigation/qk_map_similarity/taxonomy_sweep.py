@@ -274,14 +274,32 @@ def main() -> None:
     print(json.dumps(summary, indent=2))
     print(f"[tax] wrote {out}")
     if args.export:
-        compact = {
-            key: {
+        # Execution-aware gate: the backend executes a local head as a
+        # row-quantized window, (2r + ~2)/grid_height of every frame — for
+        # r >= 4 that is denser than the content heads' runtime-selected
+        # budget, so exporting those as "local" would make them strictly
+        # worse than runtime selection. They ship as content instead.
+        grid_height = 45
+        compact = {}
+        for key, record in records.items():
+            entry = {
                 name: value
                 for name, value in record.items()
                 if name in ("family", "r", "m")
             }
-            for key, record in records.items()
-        }
+            if (
+                entry["family"] == "local"
+                and (2 * entry["r"] + 2) / grid_height >= CONTENT_BUDGET
+            ):
+                entry = {"family": "content"}
+            # Diffuse heads also ship as content: executing them as a frame
+            # subsample is either statistically crude (few frames at short
+            # context) or dense (within-frame tiles at long context), and at
+            # 10/360 heads the runtime selector handles their uniform rows
+            # for free under the already-amortized per-chunk planning.
+            if entry["family"] == "diffuse":
+                entry = {"family": "content"}
+            compact[key] = entry
         export = pathlib.Path(args.export)
         export.write_text(
             json.dumps({"summary": summary, "heads": compact}, indent=2)

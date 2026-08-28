@@ -27,17 +27,17 @@
   },
   "heads": {
     "L00_h0": {
-      "family": "diffuse"
+      "family": "content"
     },
     "L00_h1": {
       "family": "local",
       "r": 2
     },
     "L00_h2": {
-      "family": "diffuse"
+      "family": "content"
     },
     "L00_h3": {
-      "family": "diffuse"
+      "family": "content"
     },
     "L00_h4": {
       "family": "local",
@@ -55,13 +55,13 @@
       "family": "content"
     },
     "L00_h8": {
-      "family": "diffuse"
+      "family": "content"
     },
     "L00_h9": {
-      "family": "diffuse"
+      "family": "content"
     },
     "L00_h10": {
-      "family": "diffuse"
+      "family": "content"
     },
     "L00_h11": {
       "family": "local",
@@ -84,14 +84,13 @@
       "m": 5
     },
     "L01_h4": {
-      "family": "local",
-      "r": 4
+      "family": "content"
     },
     "L01_h5": {
       "family": "content"
     },
     "L01_h6": {
-      "family": "diffuse"
+      "family": "content"
     },
     "L01_h7": {
       "family": "content"
@@ -128,7 +127,7 @@
       "m": 5
     },
     "L02_h5": {
-      "family": "diffuse"
+      "family": "content"
     },
     "L02_h6": {
       "family": "content"
@@ -224,7 +223,7 @@
       "family": "content"
     },
     "L04_h9": {
-      "family": "diffuse"
+      "family": "content"
     },
     "L04_h10": {
       "family": "content"
@@ -294,7 +293,7 @@
       "family": "content"
     },
     "L06_h6": {
-      "family": "diffuse"
+      "family": "content"
     },
     "L06_h7": {
       "family": "content"
@@ -310,8 +309,7 @@
       "family": "content"
     },
     "L06_h11": {
-      "family": "local",
-      "r": 4
+      "family": "content"
     },
     "L07_h0": {
       "family": "shortwin",
@@ -367,8 +365,7 @@
       "m": 4
     },
     "L08_h4": {
-      "family": "local",
-      "r": 4
+      "family": "content"
     },
     "L08_h5": {
       "family": "shortwin",
@@ -387,8 +384,7 @@
       "family": "content"
     },
     "L08_h10": {
-      "family": "local",
-      "r": 4
+      "family": "content"
     },
     "L08_h11": {
       "family": "shortwin",
@@ -524,16 +520,14 @@
       "family": "content"
     },
     "L12_h6": {
-      "family": "local",
-      "r": 9
+      "family": "content"
     },
     "L12_h7": {
       "family": "shortwin",
       "m": 4
     },
     "L12_h8": {
-      "family": "local",
-      "r": 4
+      "family": "content"
     },
     "L12_h9": {
       "family": "content"
@@ -579,8 +573,7 @@
       "family": "content"
     },
     "L13_h11": {
-      "family": "local",
-      "r": 9
+      "family": "content"
     },
     "L14_h0": {
       "family": "content"
@@ -706,15 +699,13 @@
       "family": "content"
     },
     "L17_h3": {
-      "family": "local",
-      "r": 9
+      "family": "content"
     },
     "L17_h4": {
       "family": "content"
     },
     "L17_h5": {
-      "family": "local",
-      "r": 9
+      "family": "content"
     },
     "L17_h6": {
       "family": "content"
@@ -723,15 +714,13 @@
       "family": "frozen"
     },
     "L17_h8": {
-      "family": "local",
-      "r": 9
+      "family": "content"
     },
     "L17_h9": {
       "family": "content"
     },
     "L17_h10": {
-      "family": "local",
-      "r": 9
+      "family": "content"
     },
     "L17_h11": {
       "family": "content"
@@ -776,8 +765,7 @@
       "family": "content"
     },
     "L19_h1": {
-      "family": "local",
-      "r": 9
+      "family": "content"
     },
     "L19_h2": {
       "family": "local",
@@ -810,8 +798,7 @@
       "m": 4
     },
     "L19_h11": {
-      "family": "local",
-      "r": 9
+      "family": "content"
     },
     "L20_h0": {
       "family": "content"
@@ -948,8 +935,7 @@
       "family": "content"
     },
     "L23_h4": {
-      "family": "local",
-      "r": 9
+      "family": "content"
     },
     "L23_h5": {
       "family": "content"
@@ -1010,8 +996,7 @@
       "family": "content"
     },
     "L25_h0": {
-      "family": "local",
-      "r": 9
+      "family": "content"
     },
     "L25_h1": {
       "family": "content"
@@ -1135,8 +1120,7 @@
       "r": 2
     },
     "L28_h2": {
-      "family": "local",
-      "r": 9
+      "family": "content"
     },
     "L28_h3": {
       "family": "content"

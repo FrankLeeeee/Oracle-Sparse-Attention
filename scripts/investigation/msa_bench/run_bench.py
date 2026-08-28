@@ -54,8 +54,12 @@ TAXONOMY = str(HERE.parent / "qk_map_similarity" / "msa_taxonomy_self_forcing.js
 def method_flags(method: str) -> list[str]:
     if method == "dense":
         return []
-    if method == "msa":
-        config = {"taxonomy_path": TAXONOMY, "content_density": 0.2}
+    if method in ("msa", "msa25"):
+        config = {
+            "taxonomy_path": TAXONOMY,
+            "content_density": 0.25 if method == "msa25" else 0.2,
+        }
+        method = "msa"
     elif method == "lightforcing":
         config = json.loads((SPARSE_ROOT / "configs.json").read_text())[MODEL][
             "lightforcing"
