@@ -18,25 +18,36 @@ sys.path.insert(0, str(HERE.parent / "sparse_baselines"))
 sys.path.insert(0, str(HERE.parent))
 from common import GpuPool, GpuWatchdog, compute_apps  # noqa: E402
 
-# Density 0.2 / 0.1 round: recall (exact), LF recall, and clean 20 s timing.
+# 5 s round (native SF duration): timing+video for every method (LF speed
+# included) + recall, to test whether recall tracks PSNR when trajectories
+# have little room to diverge. Plus the two missing LF-constant 20 s timings.
 REPLAN = '{"replan_each_chunk": true}'
-JOBS = []
-_port = 29740
+JOBS = [
+    {
+        "tag": "sf5t_dense",
+        "args": ["--no-hook", "--dense", "--seconds", "5",
+                 "--tag", "sf5t_dense", "--port-base", "29740"],
+    },
+]
+_port = 29745
 for _d in ("0.2", "0.1"):
     _t = _d.replace("0.", "d0")
     for _tag, _extra in [
-        (f"sf20x_frozen_{_t}", ["--exact"]),
-        (f"sf20x_replan_{_t}", ["--exact", "--osa-extra", REPLAN]),
-        (f"sf20_lf_{_t}", ["--method", "lightforcing"]),
-        (f"sf20t_frozen_{_t}", ["--no-hook"]),
-        (f"sf20t_replan_{_t}", ["--no-hook", "--osa-extra", REPLAN]),
+        (f"sf5t_frozen_{_t}", ["--no-hook"]),
+        (f"sf5t_replan_{_t}", ["--no-hook", "--osa-extra", REPLAN]),
+        (f"sf5t_lfconst_{_t}", ["--no-hook", "--method", "lightforcing"]),
+        (f"sf5t_lfsched_{_t}",
+         ["--no-hook", "--method", "lightforcing", "--lf-front-loaded"]),
+        (f"sf5x_frozen_{_t}", ["--exact"]),
+        (f"sf5x_replan_{_t}", ["--exact", "--osa-extra", REPLAN]),
+        (f"sf5_lf_{_t}", ["--method", "lightforcing"]),
     ]:
         JOBS.append(
             {
                 "tag": _tag,
                 "args": [
                     *_extra,
-                    "--seconds", "20",
+                    "--seconds", "5",
                     "--density", _d,
                     "--tag", _tag,
                     "--port-base", str(_port),
@@ -44,6 +55,19 @@ for _d in ("0.2", "0.1"):
             }
         )
         _port += 5
+for _d in ("0.2", "0.1"):
+    _t = _d.replace("0.", "d0")
+    JOBS.append(
+        {
+            "tag": f"sf20t_lfconst_{_t}",
+            "args": [
+                "--no-hook", "--method", "lightforcing",
+                "--seconds", "20", "--density", _d,
+                "--tag", f"sf20t_lfconst_{_t}", "--port-base", str(_port),
+            ],
+        }
+    )
+    _port += 5
 COMMON = ["--model", "self_forcing", "--density", "0.3", "--seconds", "10"]
 MAX_ATTEMPTS = 3
 
