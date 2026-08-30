@@ -59,6 +59,12 @@ def method_flags(method: str, *, seconds: int = 5) -> list[str]:
             "taxonomy_path": TAXONOMY,
             "content_density": {"msa25": 0.25, "msa10": 0.1}.get(method, 0.2),
         }
+        if "turbo" in method or "mild" in method:
+            # turbo/mild ride on the schedule at the density-parity means.
+            config["content_density"] = 0.22 if "22" in method else 0.14
+            method = "msasched" + ("22" if "22" in method else "14") + (
+                "turbo" if "turbo" in method else "mild"
+            )
         if "sched" in method:
             config.update(
                 content_schedule="flops_matched",
@@ -74,6 +80,13 @@ def method_flags(method: str, *, seconds: int = 5) -> list[str]:
             config["content_density"] = 0.22
         if method.endswith("r2"):
             config["replan_interval"] = 2
+        if "turbo" in method:
+            # Step-aware density: late denoise steps read a shrinking prefix
+            # of the chunk's ranked blocks (attention concentrates through
+            # denoising, so the same mass needs fewer blocks).
+            config["step_density_scale"] = (1.0, 0.85, 0.65, 0.45)
+        elif "mild" in method:
+            config["step_density_scale"] = (1.0, 0.9, 0.75, 0.6)
         method = "msa"
     elif method in ("lightforcing", "lf10"):
         tier = "0.1" if method == "lf10" else "0.2"

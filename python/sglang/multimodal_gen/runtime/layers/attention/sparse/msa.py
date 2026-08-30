@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.layers.attention.sparse.lightforcing import (
     frame_aligned_block_bounds,
     lightforcing_block_mask,
     mean_pool_blocks,
+    select_middle_frames,
 )
 from sglang.multimodal_gen.runtime.layers.attention.sparse.msa_kernel import (
     msa_content_attention,
@@ -95,6 +96,15 @@ class MsaConfig(msgspec.Struct, frozen=True):
     # 2: calls 0/2/4 of the 4 denoise + 1 refresh) buys back most of the
     # staleness at a fraction of LightForcing's per-call planning.
     replan_interval: int = 0
+    # Per-denoising-step multiplier on the content heads' block budget
+    # (empty = every step at 1.0). Attention concentrates as denoising
+    # proceeds (the chunk-0 study measured 90%-mass coverage shrinking
+    # 11.6% -> 1.6% by the last step), so late steps capture the same mass
+    # from a smaller top-k. The chunk's single ranked scoring pass is sliced
+    # into per-step prefix plans, so a schedule adds no planning cost; the
+    # cache-refresh forward uses the largest (step-0) plan since its output
+    # feeds every later chunk's KV.
+    step_density_scale: tuple[float, ...] = ()
     # Chunk-level density schedule of the content heads. "constant" keeps
     # ``content_density`` per call; "flops_matched" front-loads it (OSA's
     # ``floor + beta / sqrt(kv frames)`` solve) so late chunks thin out and
@@ -342,13 +352,18 @@ class MixedSparseAttention(SparseAttentionBackend):
         index = min(max(int(layout.query_chunk_index), 0), len(self._schedule) - 1)
         return self._schedule[index]
 
-    def _content_mask(
+    def _content_lut(
         self,
         call: SparseAttentionCall,
         layout: VisibleLayout,
         content: list[int],
     ) -> tuple[torch.Tensor, int, int]:
-        """Kept-block mask for the content heads + (topk, kv_blocks)."""
+        """Ranked kept-block indices for the content heads + (topk, kv_blocks).
+
+        Same scoring as :func:`lightforcing_block_mask` (two-stage eligibility
+        included) but returning the ranked top-``topk`` block ids, so a
+        step-density schedule can slice prefix plans from one scoring pass.
+        """
         config = self._config
         frame_seqlen = layout.frame_seqlen
         blocks_per_frame = -(-frame_seqlen // config.block_k)
@@ -386,17 +401,35 @@ class MixedSparseAttention(SparseAttentionBackend):
         pooled_key = torch.cat([pooled_history, pooled_own], dim=0)
 
         index = torch.tensor(content, device=query.device)
-        mask = lightforcing_block_mask(
-            pooled_query=pooled_query.index_select(1, index).permute(1, 0, 2),
-            pooled_key=pooled_key.index_select(1, index).permute(1, 0, 2),
-            blocks_per_frame=blocks_per_frame,
-            past_frames=layout.num_frames - layout.query_frames,
-            keep_frames=config.keep_frames,
-            keep_sink=config.keep_sink,
-            keep_near=config.keep_near,
-            topk=topk,
-        )
-        return mask, topk, kv_blocks
+        pq = pooled_query.index_select(1, index).permute(1, 0, 2)
+        pk = pooled_key.index_select(1, index).permute(1, 0, 2)
+        heads_c, q_blocks, _ = pq.shape
+        scores = pq @ pk.transpose(-1, -2)
+        if past_frames > config.keep_frames:
+            pooled_frames = pk.view(
+                heads_c, layout.num_frames, blocks_per_frame, -1
+            ).mean(dim=2)
+            kept_middle = select_middle_frames(
+                pooled_query=pq,
+                pooled_frames=pooled_frames,
+                past_frames=past_frames,
+                keep_frames=config.keep_frames,
+                keep_sink=config.keep_sink,
+                keep_near=config.keep_near,
+            )
+            bias = scores.new_full(
+                (heads_c, q_blocks, layout.num_frames), float("-inf")
+            )
+            bias.scatter_(-1, kept_middle, 0.0)
+            bias[..., : config.keep_sink] = 0.0
+            bias[..., past_frames - config.keep_near : past_frames] = 0.0
+            bias[..., past_frames:] = 0.0
+            scores = (
+                scores.view(heads_c, q_blocks, layout.num_frames, blocks_per_frame)
+                + bias[..., None]
+            ).view(heads_c, q_blocks, kv_blocks)
+        lut = torch.topk(scores, topk, dim=-1, sorted=True).indices
+        return lut, topk, kv_blocks
 
     def attend(self, call: SparseAttentionCall) -> torch.Tensor | None:
         layout = self._layout(call)
@@ -455,34 +488,58 @@ class MixedSparseAttention(SparseAttentionBackend):
             signature = (call.key_segments, kv_len)
             hit, cached = self._content_cache.get(call.layer_index, signature)
             if hit:
-                content_plan, topk, kv_blocks, calls = cached
+                step_plans, step_topks, kv_blocks, calls = cached
                 interval = self._config.replan_interval
                 replan = self._config.replan_each_step or (
                     interval > 0 and calls % interval == 0
                 )
             else:
                 calls, replan = 0, True
-            if not replan:
-                self._content_cache.put(
-                    call.layer_index, signature, (content_plan, topk, kv_blocks, calls + 1)
-                )
-            else:
-                mask, topk, kv_blocks = self._content_mask(call, layout, content)
+            if replan:
+                lut, topk, kv_blocks = self._content_lut(call, layout, content)
                 block_lo, block_hi = frame_aligned_block_bounds(
                     num_frames=layout.num_frames,
                     frame_seqlen=layout.frame_seqlen,
                     block=self._config.block_k,
                     device=query.device,
                 )
-                content_plan = plan_from_segment_mask(
-                    mask,
-                    segment_starts=block_lo,
-                    segment_ends=block_hi,
-                    block_m=self._config.block_q,
+                scales = self._config.step_density_scale or (1.0,)
+                # Never scale below the chunk schedule's floor: late chunks
+                # already sit near it, and a stale step-0 ranking cut that
+                # thin loses the moved late-step peaks (measured: -0.5 dB at
+                # 20 s without this clamp).
+                floor_blocks = max(
+                    1, round(self._config.schedule_floor_density * kv_blocks)
                 )
-                self._content_cache.put(
-                    call.layer_index, signature, (content_plan, topk, kv_blocks, calls + 1)
+                step_topks = tuple(
+                    min(topk, max(floor_blocks, round(topk * scale)))
+                    for scale in scales
                 )
+                step_plans = []
+                for step_topk in step_topks:
+                    mask = torch.zeros(
+                        lut.shape[0], lut.shape[1], kv_blocks,
+                        dtype=torch.bool, device=lut.device,
+                    )
+                    mask.scatter_(-1, lut[..., :step_topk], True)
+                    step_plans.append(
+                        plan_from_segment_mask(
+                            mask,
+                            segment_starts=block_lo,
+                            segment_ends=block_hi,
+                            block_m=self._config.block_q,
+                        )
+                    )
+                step_plans = tuple(step_plans)
+            self._content_cache.put(
+                call.layer_index, signature,
+                (step_plans, step_topks, kv_blocks, calls + 1),
+            )
+            # The cache refresh reuses the fullest plan; denoise call i takes
+            # schedule entry i (clamped to the last).
+            step = 0 if self.in_cache_update else min(calls, len(step_plans) - 1)
+            content_plan = step_plans[step]
+            topk = step_topks[step]
             ids_key = (call.layer_index, call.head_start)
             content_ids = self._content_ids.get(ids_key)
             if content_ids is None:

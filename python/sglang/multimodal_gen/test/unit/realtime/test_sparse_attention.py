@@ -1323,7 +1323,11 @@ def _msa_expected_mask(backend, call, layout):
     )
     for frame in kept_frames:
         mask[2, :, frame * frame_seqlen : (frame + 1) * frame_seqlen] = True
-    content_mask, _, _ = backend._content_mask(call, layout, [3])
+    lut, _, kv_blocks = backend._content_lut(call, layout, [3])
+    content_mask = torch.zeros(
+        lut.shape[0], lut.shape[1], kv_blocks, dtype=torch.bool, device=device
+    )
+    content_mask.scatter_(-1, lut, True)
     block_lo, block_hi = frame_aligned_block_bounds(
         num_frames=num_frames,
         frame_seqlen=frame_seqlen,
@@ -1459,7 +1463,7 @@ def test_msa_content_schedule_thins_late_chunks(tmp_path):
             geometry=_geometry(chunk_index),
             query_tokens=call.query.shape[1],
         )
-        _, topk, kv_blocks = backend._content_mask(call, layout, [3])
+        _, topk, kv_blocks = backend._content_lut(call, layout, [3])
         topks[chunk_index] = (topk, kv_blocks)
     # Early chunk denser than the knob, late chunk sparser.
     assert topks[1][0] / topks[1][1] > 0.3
@@ -1475,3 +1479,30 @@ def test_msa_content_schedule_thins_late_chunks(tmp_path):
     kv = list(range(6, 22, 3))
     mean = sum(d * k for d, k in zip(schedule[1:], kv)) / sum(kv)
     assert abs(mean - 0.3) < 1e-6
+
+
+@requires_cuda
+def test_msa_step_density_scale_shrinks_late_steps(tmp_path):
+    """Per-step prefix plans: later denoise calls read fewer keys; the cache
+    refresh reuses the fullest plan; all plans slice one ranked scoring."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    backend = _msa_backend(tmp_path, step_density_scale=(1.0, 0.5))
+    call = _self_forcing_call(device, chunk_index=4)
+    backend.begin_forward(_geometry(4))
+
+    def kept_tokens():
+        assert backend.attend(call) is not None
+        plans, topks, _, _ = backend._content_cache._entries[0][1]
+        return topks
+
+    topks = kept_tokens()
+    assert len(topks) == 2 and topks[1] == max(1, round(topks[0] * 0.5))
+    plans, topks, _, calls = backend._content_cache._entries[0][1]
+    kept0 = int(plans[0].kept_tokens().sum())
+    kept1 = int(plans[1].kept_tokens().sum())
+    assert kept1 < kept0
+    # Second call (step 1) must use the smaller plan; cache refresh the full.
+    backend.attend(call)
+    with backend.cache_update_scope():
+        assert backend.attend(call) is not None

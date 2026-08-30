@@ -32,6 +32,8 @@ METHOD_LABELS = {
     "msaschedr2": "MSA-sched + 每 2 调用重规划",
     "msasched13": "MSA-sched（均值 0.13）",
     "msasched14": "MSA-sched（均值 0.14）",
+    "msaturbo22": "MSA-sched 0.22 + 步进 (1,.85,.65,.45)",
+    "msamild22": "MSA-sched 0.22 + 步进 (1,.9,.75,.6)",
     "lightforcing": "LightForcing（0.2 档）",
     "lf10": "LightForcing（0.1 档）",
 }
@@ -418,6 +420,61 @@ def parity_xml() -> str:
     )
 
 
+def stepschedule_xml() -> str:
+    results_20s = json.loads((ROOT / "results_20s.json").read_text())
+
+    def cell(method):
+        record = results_20s[f"b1_{method}_20s"]
+        return (
+            f"{record['denoise_s']:.2f} s / 密度 {record.get('density')}"
+            f" / PSNR {record.get('psnr')}"
+        )
+
+    return (
+        "<h3>更激进的尝试：去噪步级密度调度（负结果，含机理）</h3>"
+        "<p>动机：chunk 0 形成过程的测量显示注意力随去噪收紧（90% 质量所需 "
+        "key 从 11.6% 收到 1.6%），而 LightForcing 与 MSA 每一步花同样的密度。"
+        "实现 <code>step_density_scale</code>：chunk 的一次打分改为返回<b>排序的</b> "
+        "top-k，各步取其前缀作为各自的计划（零额外打分成本；cache 刷新用最全的 "
+        "step-0 计划；步进值钳制在 chunk 调度的 floor 之上）。测试两档：激进 "
+        "(1, 0.85, 0.65, 0.45) 与温和 (1, 0.9, 0.75, 0.6)。</p>"
+        f"{tier_table(('msasched22', 'msaturbo22', 'msamild22', 'lightforcing'))}"
+        f"<p>20 秒（b1）：激进 {cell('msaturbo')}；温和 {cell('msamild')}；"
+        f"对照 MSA-sched 0.13 为 {cell('msasched13')}、LightForcing "
+        f"{cell('lightforcing')}。</p>"
+        "<p><b>结论：被数据否决。</b>5 秒档几乎不省时间却掉 0.6–1.1 dB；"
+        "20 秒档虽快 5%（27.55 s）但 17.34 dB 低于直接把均值降到 0.13 的 "
+        "28.28 s / 17.80——<b>在所有测过的工作点上，按 chunk 均值降密度都优于"
+        "按步降密度</b>。机理与此前测量吻合：各步的前缀共享 step-0 的排序，而"
+        "中间层的注意力在步间移动（s0↔s3 帧对图余弦仅 0.11–0.27）——足额预算"
+        "能吸收这种移动，删薄的前缀恰好丢掉移动后的峰；逐步新鲜重打分能修复"
+        "陈旧性但成本（每步每层 ~1.3 ms 的重打分）超过省下的 FLOPs。"
+        "“注意力收紧”的正确用法是 OSA 式<b>末步校准</b>（在最集中的一步测图案），"
+        "而不是在陈旧排序上删预算。功能保留为默认关闭的配置项；推荐配置不变："
+        "MSA-sched 均值 0.22（5 秒）/ 0.13–0.14（20 秒）。</p>"
+        '<pre lang="bash" caption="复现命令"><code>'
+        + escape(
+            "cd scripts/investigation/msa_bench\n"
+            "python run_bench.py --methods msaturbo22,msamild22\n"
+            "python run_bench.py --methods msaturbo,msamild --seconds 20 --prompts b1\n"
+            "python doc_update.py --stage stepschedule"
+        )
+        + "</code></pre>"
+    )
+
+
+def stage_stepschedule() -> None:
+    data = cli("docs", "+fetch", "--doc", DOC)
+    if "去噪步级密度调度" in data["document"]["content"]:
+        print("[msa-doc] step-schedule subsection already present")
+        return
+    cli(
+        "docs", "+update", "--doc", DOC, "--command", "append",
+        "--content", stepschedule_xml(),
+    )
+    print("[msa-doc] step-schedule subsection appended")
+
+
 def stage_parity() -> None:
     data = cli("docs", "+fetch", "--doc", DOC)
     if "密度对齐的最终对比" in data["document"]["content"]:
@@ -469,7 +526,9 @@ def main() -> None:
     parser.add_argument(
         "--stage",
         default="section",
-        choices=["section", "videos", "profiling", "schedule", "parity"],
+        choices=[
+            "section", "videos", "profiling", "schedule", "parity", "stepschedule",
+        ],
     )
     args = parser.parse_args()
     if args.stage == "videos":
@@ -483,6 +542,9 @@ def main() -> None:
         return
     if args.stage == "parity":
         stage_parity()
+        return
+    if args.stage == "stepschedule":
+        stage_stepschedule()
         return
     data = cli("docs", "+fetch", "--doc", DOC)
     if "MSA：混合稀疏注意力" in data["document"]["content"]:
