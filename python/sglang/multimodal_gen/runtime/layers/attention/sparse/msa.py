@@ -89,6 +89,12 @@ class MsaConfig(msgspec.Struct, frozen=True):
     # barely moves within a chunk, so this amortizes most of MSA's remaining
     # planning cost. Set True to replan per call (LightForcing parity).
     replan_each_step: bool = False
+    # Replan every n-th call of a (layer, chunk) instead of only the first
+    # (0 = plan once). The first-step query is the noisiest and mid-layer
+    # patterns tighten through denoising, so one mid-chunk refresh (interval
+    # 2: calls 0/2/4 of the 4 denoise + 1 refresh) buys back most of the
+    # staleness at a fraction of LightForcing's per-call planning.
+    replan_interval: int = 0
     # Chunk-level density schedule of the content heads. "constant" keeps
     # ``content_density`` per call; "flops_matched" front-loads it (OSA's
     # ``floor + beta / sqrt(kv frames)`` solve) so late chunks thin out and
@@ -349,6 +355,19 @@ class MixedSparseAttention(SparseAttentionBackend):
         kv_blocks = layout.num_frames * blocks_per_frame
         topk = min(kv_blocks, max(1, int(self._call_density(layout) * kv_blocks)))
 
+        past_frames = layout.num_frames - layout.query_frames
+        if past_frames > config.keep_frames:
+            # Two-stage eligibility caps how many blocks stage 2 can actually
+            # score: keeping more than that would fill the plan with arbitrary
+            # -inf blocks — density spent on nothing.
+            eligible_frames = (
+                config.keep_frames
+                + config.keep_sink
+                + config.keep_near
+                + layout.query_frames
+            )
+            topk = min(topk, eligible_frames * blocks_per_frame)
+
         query = call.query.mean(dim=0) if call.query.shape[0] > 1 else call.query[0]
         key = call.key.mean(dim=0) if call.key.shape[0] > 1 else call.key[0]
         pooled_query = mean_pool_blocks(query, block=config.block_q)
@@ -435,8 +454,18 @@ class MixedSparseAttention(SparseAttentionBackend):
         if content:
             signature = (call.key_segments, kv_len)
             hit, cached = self._content_cache.get(call.layer_index, signature)
-            if hit and not self._config.replan_each_step:
-                content_plan, topk, kv_blocks = cached
+            if hit:
+                content_plan, topk, kv_blocks, calls = cached
+                interval = self._config.replan_interval
+                replan = self._config.replan_each_step or (
+                    interval > 0 and calls % interval == 0
+                )
+            else:
+                calls, replan = 0, True
+            if not replan:
+                self._content_cache.put(
+                    call.layer_index, signature, (content_plan, topk, kv_blocks, calls + 1)
+                )
             else:
                 mask, topk, kv_blocks = self._content_mask(call, layout, content)
                 block_lo, block_hi = frame_aligned_block_bounds(
@@ -452,7 +481,7 @@ class MixedSparseAttention(SparseAttentionBackend):
                     block_m=self._config.block_q,
                 )
                 self._content_cache.put(
-                    call.layer_index, signature, (content_plan, topk, kv_blocks)
+                    call.layer_index, signature, (content_plan, topk, kv_blocks, calls + 1)
                 )
             ids_key = (call.layer_index, call.head_start)
             content_ids = self._content_ids.get(ids_key)

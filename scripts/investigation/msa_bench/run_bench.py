@@ -54,18 +54,26 @@ TAXONOMY = str(HERE.parent / "qk_map_similarity" / "msa_taxonomy_self_forcing.js
 def method_flags(method: str, *, seconds: int = 5) -> list[str]:
     if method == "dense":
         return []
-    if method in ("msa", "msa25", "msa10", "msasched", "msasched15"):
+    if method.startswith("msa"):
         config = {
             "taxonomy_path": TAXONOMY,
-            "content_density": {"msa25": 0.25, "msa10": 0.1, "msasched15": 0.15}.get(
-                method, 0.2
-            ),
+            "content_density": {"msa25": 0.25, "msa10": 0.1}.get(method, 0.2),
         }
-        if method.startswith("msasched"):
+        if "sched" in method:
             config.update(
                 content_schedule="flops_matched",
                 schedule_num_frames=(MODELS[MODEL]["frames"][seconds] + 3) // 4,
             )
+        if "15" in method:
+            config["content_density"] = 0.15
+        elif "14" in method:
+            config["content_density"] = 0.14
+        elif "13" in method:
+            config["content_density"] = 0.13
+        elif "22" in method:
+            config["content_density"] = 0.22
+        if method.endswith("r2"):
+            config["replan_interval"] = 2
         method = "msa"
     elif method in ("lightforcing", "lf10"):
         tier = "0.1" if method == "lf10" else "0.2"

@@ -28,6 +28,10 @@ METHOD_LABELS = {
     "msa10": "MSA（content 0.10）",
     "msasched": "MSA-sched（均值 0.20）",
     "msasched15": "MSA-sched（均值 0.15）",
+    "msasched22": "MSA-sched（均值 0.22）",
+    "msaschedr2": "MSA-sched + 每 2 调用重规划",
+    "msasched13": "MSA-sched（均值 0.13）",
+    "msasched14": "MSA-sched（均值 0.14）",
     "lightforcing": "LightForcing（0.2 档）",
     "lf10": "LightForcing（0.1 档）",
 }
@@ -360,6 +364,72 @@ def schedule_xml() -> str:
     )
 
 
+def parity_xml() -> str:
+    results_20s = json.loads((ROOT / "results_20s.json").read_text())
+
+    def row_20s(method: str) -> str:
+        record = results_20s[f"b1_{method}_20s"]
+        return (
+            f"<tr><td><p>{METHOD_LABELS[method]}</p></td>"
+            f"<td>{record['denoise_s']:.2f} s</td>"
+            f"<td>{record.get('density', 1.0)}</td>"
+            f"<td>{record.get('psnr', '—')}</td></tr>"
+        )
+
+    table_20s = (
+        '<table><colgroup><col width="210"/><col span="3" width="140"/></colgroup>'
+        "<thead><tr><th></th><th>去噪耗时（b1）</th><th>实际累计密度</th>"
+        "<th>PSNR vs dense</th></tr></thead><tbody>"
+        + "".join(
+            row_20s(m)
+            for m in ("lightforcing", "msasched15", "msasched14", "msasched13")
+        )
+        + "</tbody></table>"
+    )
+    return (
+        "<h3>密度对齐的最终对比：两个时长上同时超越</h3>"
+        "<p>目标：在与 LightForcing 相同的密度下达到相同质量、更低时延。本轮"
+        "试了三个优化：<b>一</b>，两阶段资格钳制（top-k 不再超出 stage-1 资格"
+        "集合、把密度花在任意 -inf 块上——已并入 backend，长上下文高密度档的"
+        "保护）；<b>二</b>，chunk 内中途重规划（replan_interval=2）——被数据"
+        "否决：5 秒 +0.09 dB 但 +0.37 s，20 秒反而掉质量（18.05 → 16.81），"
+        "首步计划复用不是质量瓶颈；<b>三</b>，kernel tile 扫描（BLOCK_N 128 / "
+        "warp / stage 组合）——现行 64/8/3 已是最优。真正起效的是把调度买到的"
+        "质量余量精确兑换到 LightForcing 的密度工作点上：</p>"
+        f"{tier_table(('msasched22', 'lightforcing'))}"
+        "<p>5 秒、密度对齐（0.359 vs 0.357）：<b>PSNR 18.08 vs 17.86（+0.22 dB，"
+        "5 个 prompt 无一低于 LF），时延 8.81 vs 9.00 s（快 2.1%）</b>。</p>"
+        f"{table_20s}"
+        "<p>20 秒：均值 0.13 档在<b>更低</b>的密度（0.187 vs 0.2）下 PSNR 17.80 "
+        "vs 17.71，时延 <b>28.28 vs 29.02 s（快 2.6%）</b>；0.14 档为等密度点"
+        "（0.196），质量 +0.17 dB、时延持平。<b>结论：MSA-sched 在两个时长上"
+        "都以不高于 LightForcing 的密度同时取得更高 PSNR 与更低时延</b>——"
+        "推荐配置：5 秒档均值 0.22、20 秒档均值 0.13–0.14（与 LF 每档按视频"
+        "长度标定 sparsity 的做法对等）。遗留的诚实注脚：首 2 秒 PSNR 仍略低于 "
+        "LF（22.29 vs 22.92），差距来自早期 chunk 的选择质量而非预算。</p>"
+        '<pre lang="bash" caption="复现命令"><code>'
+        + escape(
+            "cd scripts/investigation/msa_bench\n"
+            "python run_bench.py --methods msasched22                       # 5s 密度对齐点\n"
+            "python run_bench.py --methods msasched13,msasched14 --seconds 20 --prompts b1\n"
+            "python doc_update.py --stage parity"
+        )
+        + "</code></pre>"
+    )
+
+
+def stage_parity() -> None:
+    data = cli("docs", "+fetch", "--doc", DOC)
+    if "密度对齐的最终对比" in data["document"]["content"]:
+        print("[msa-doc] parity subsection already present")
+        return
+    cli(
+        "docs", "+update", "--doc", DOC, "--command", "append",
+        "--content", parity_xml(),
+    )
+    print("[msa-doc] parity subsection appended")
+
+
 def stage_schedule() -> None:
     data = cli("docs", "+fetch", "--doc", DOC)
     if "调度修复的验证" in data["document"]["content"]:
@@ -399,7 +469,7 @@ def main() -> None:
     parser.add_argument(
         "--stage",
         default="section",
-        choices=["section", "videos", "profiling", "schedule"],
+        choices=["section", "videos", "profiling", "schedule", "parity"],
     )
     args = parser.parse_args()
     if args.stage == "videos":
@@ -410,6 +480,9 @@ def main() -> None:
         return
     if args.stage == "schedule":
         stage_schedule()
+        return
+    if args.stage == "parity":
+        stage_parity()
         return
     data = cli("docs", "+fetch", "--doc", DOC)
     if "MSA：混合稀疏注意力" in data["document"]["content"]:
