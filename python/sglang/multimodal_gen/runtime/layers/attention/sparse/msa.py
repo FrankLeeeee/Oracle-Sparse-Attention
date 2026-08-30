@@ -54,6 +54,9 @@ from sglang.multimodal_gen.runtime.layers.attention.sparse.msa_kernel import (
     msa_content_attention,
     msa_static_attention,
 )
+from sglang.multimodal_gen.runtime.layers.attention.sparse.osa import (
+    flops_matched_densities,
+)
 
 STATIC_FAMILIES = ("local", "shortwin", "diffuse")
 _MAX_STATIC_RANGES = 8
@@ -86,6 +89,17 @@ class MsaConfig(msgspec.Struct, frozen=True):
     # barely moves within a chunk, so this amortizes most of MSA's remaining
     # planning cost. Set True to replan per call (LightForcing parity).
     replan_each_step: bool = False
+    # Chunk-level density schedule of the content heads. "constant" keeps
+    # ``content_density`` per call; "flops_matched" front-loads it (OSA's
+    # ``floor + beta / sqrt(kv frames)`` solve) so late chunks thin out and
+    # the kv-weighted mean over the video equals ``content_density`` — the
+    # profiling round showed the 20-second gap to LightForcing is exactly
+    # this scheduling, not kernel quality. Needs ``schedule_num_frames``
+    # (the video's latent frames), which the launcher fills from the run
+    # length. Static heads are naturally flat-cost and stay unscheduled.
+    content_schedule: str = "constant"
+    schedule_num_frames: int | None = None
+    schedule_floor_density: float = 0.05
 
 
 class HeadSpec(msgspec.Struct, frozen=True):
@@ -184,6 +198,17 @@ class MixedSparseAttention(SparseAttentionBackend):
         self._pooled_history = LayoutCache()
         self._content_cache = LayoutCache()
         self._content_ids: dict[tuple[int, int], torch.Tensor] = {}
+        if config.content_schedule not in ("constant", "flops_matched"):
+            raise ValueError(
+                f"unknown content_schedule {config.content_schedule!r} "
+                "(use 'constant' or 'flops_matched')"
+            )
+        if config.content_schedule == "flops_matched" and not config.schedule_num_frames:
+            raise ValueError(
+                "content_schedule='flops_matched' needs schedule_num_frames"
+            )
+        # chunk index -> per-call content density, solved on first use.
+        self._schedule: list[float] | None = None
         # layer -> (static [(local head, spec)], content local-head ids); the
         # split depends only on the taxonomy, resolved per layer on first use.
         self._layer_split: dict[tuple[int, int, int], tuple[list, list[int]]] = {}
@@ -295,6 +320,22 @@ class MixedSparseAttention(SparseAttentionBackend):
         self._static_cache.put(layer_index, signature, plan)
         return plan
 
+    def _call_density(self, layout: VisibleLayout) -> float:
+        """The content heads' density for this chunk: the knob or its schedule."""
+        config = self._config
+        if config.content_schedule == "constant":
+            return config.content_density
+        if self._schedule is None:
+            self._schedule = flops_matched_densities(
+                num_frames=config.schedule_num_frames,
+                frames_per_block=layout.frames_per_block,
+                window_frames=-1,
+                mean_density=config.content_density,
+                floor_density=config.schedule_floor_density,
+            )
+        index = min(max(int(layout.query_chunk_index), 0), len(self._schedule) - 1)
+        return self._schedule[index]
+
     def _content_mask(
         self,
         call: SparseAttentionCall,
@@ -306,7 +347,7 @@ class MixedSparseAttention(SparseAttentionBackend):
         frame_seqlen = layout.frame_seqlen
         blocks_per_frame = -(-frame_seqlen // config.block_k)
         kv_blocks = layout.num_frames * blocks_per_frame
-        topk = min(kv_blocks, max(1, int(config.content_density * kv_blocks)))
+        topk = min(kv_blocks, max(1, int(self._call_density(layout) * kv_blocks)))
 
         query = call.query.mean(dim=0) if call.query.shape[0] > 1 else call.query[0]
         key = call.key.mean(dim=0) if call.key.shape[0] > 1 else call.key[0]

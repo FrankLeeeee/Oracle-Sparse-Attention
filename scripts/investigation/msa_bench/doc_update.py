@@ -26,6 +26,8 @@ METHOD_LABELS = {
     "msa": "MSA（content 0.20）",
     "msa25": "MSA（content 0.25）",
     "msa10": "MSA（content 0.10）",
+    "msasched": "MSA-sched（均值 0.20）",
+    "msasched15": "MSA-sched（均值 0.15）",
     "lightforcing": "LightForcing（0.2 档）",
     "lf10": "LightForcing（0.1 档）",
 }
@@ -321,6 +323,55 @@ def profiling_xml() -> str:
     )
 
 
+def schedule_xml() -> str:
+    results_20s = json.loads((ROOT / "results_20s.json").read_text())
+
+    def cell_20s(method: str) -> str:
+        record = results_20s[f"b1_{method}_20s"]
+        return f"{record['denoise_s']:.2f} s（密度 {record.get('density', 1.0)}）"
+
+    return (
+        "<h3>调度修复的验证：content 头的 chunk 级密度调度</h3>"
+        "<p>按剖析的结论落地：<code>content_schedule=\"flops_matched\"</code> 给 "
+        "content 头按 OSA 的 <latex>\\mathrm{floor} + \\beta/\\sqrt{kv}</latex> "
+        "前置递减调度（β 解至 kv 加权均值恰等于 content_density，静态头本就"
+        "平坦不参与），计划缓存按 (层, chunk) 不变。两个预期都得到验证，"
+        "外加一个当初没想到的教训。</p>"
+        f"{tier_table(('msa', 'msasched', 'msasched15', 'lightforcing'))}"
+        "<p><b>一，同 FLOPs 下调度只买质量不买速度</b>——flops_matched 保持 kv "
+        "加权均值不变，20 秒耗时纹丝不动（33.27 vs 33.18 s）；这修正了剖析节"
+        "结论的表述：调度本身不省时间，省时间靠“调度买到的质量余量换更低的"
+        "均值”。<b>二，质量增益实打实</b>：均值 0.20 不变，PSNR 17.01 → 17.72，"
+        "追平 LightForcing（17.86）且更快（8.81 vs 9.00 s）。<b>三，兑现为"
+        "速度</b>：均值降到 0.15 后质量仍高于未调度的 0.20（17.15 vs 17.01），"
+        f"5 秒 8.48 s（比 LF 快 6%），20 秒 {cell_20s('msasched15')}——与 "
+        f"LightForcing 的 {cell_20s('lightforcing')} 差距从 14% 收敛到 2%。"
+        "MSA-sched 0.15 现在是推荐配置：全时长不慢于 LightForcing，5 秒档"
+        "更快，质量介于 LF 0.2 档与 0.1 档之间、显著优于同速的 LF 档位。</p>"
+        '<pre lang="bash" caption="复现命令"><code>'
+        + escape(
+            "cd scripts/investigation/msa_bench\n"
+            "python run_bench.py --methods msasched            # 均值 0.2，质量验证\n"
+            "python run_bench.py --methods msasched15          # 均值 0.15，速度验证\n"
+            "python run_bench.py --methods msasched15 --seconds 20 --prompts b1\n"
+            "python doc_update.py --stage schedule"
+        )
+        + "</code></pre>"
+    )
+
+
+def stage_schedule() -> None:
+    data = cli("docs", "+fetch", "--doc", DOC)
+    if "调度修复的验证" in data["document"]["content"]:
+        print("[msa-doc] schedule subsection already present")
+        return
+    cli(
+        "docs", "+update", "--doc", DOC, "--command", "append",
+        "--content", schedule_xml(),
+    )
+    print("[msa-doc] schedule subsection appended")
+
+
 def stage_profiling() -> None:
     data = cli("docs", "+fetch", "--doc", DOC, "--detail", "with-ids")
     content = data["document"]["content"]
@@ -346,7 +397,9 @@ def stage_profiling() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--stage", default="section", choices=["section", "videos", "profiling"]
+        "--stage",
+        default="section",
+        choices=["section", "videos", "profiling", "schedule"],
     )
     args = parser.parse_args()
     if args.stage == "videos":
@@ -354,6 +407,9 @@ def main() -> None:
         return
     if args.stage == "profiling":
         stage_profiling()
+        return
+    if args.stage == "schedule":
+        stage_schedule()
         return
     data = cli("docs", "+fetch", "--doc", DOC)
     if "MSA：混合稀疏注意力" in data["document"]["content"]:

@@ -1433,3 +1433,45 @@ def test_msa_diffuse_frame_step_matches_density():
     assert diffuse_frame_step(0.10) == 10
     assert diffuse_frame_step(0.5) == 2
     assert diffuse_frame_step(1.0) == 1
+
+
+@requires_cuda
+def test_msa_content_schedule_thins_late_chunks(tmp_path):
+    """flops_matched: later chunks keep fewer content blocks, mean preserved."""
+    from sglang.multimodal_gen.runtime.layers.attention.sparse.osa import (
+        flops_matched_densities,
+    )
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    backend = _msa_backend(
+        tmp_path,
+        content_schedule="flops_matched",
+        schedule_num_frames=21,
+        schedule_floor_density=0.05,
+    )
+    topks = {}
+    for chunk_index in (1, 6):
+        call = _self_forcing_call(device, chunk_index=chunk_index)
+        backend.begin_forward(_geometry(chunk_index))
+        layout = visible_layout(
+            call.key_segments,
+            geometry=_geometry(chunk_index),
+            query_tokens=call.query.shape[1],
+        )
+        _, topk, kv_blocks = backend._content_mask(call, layout, [3])
+        topks[chunk_index] = (topk, kv_blocks)
+    # Early chunk denser than the knob, late chunk sparser.
+    assert topks[1][0] / topks[1][1] > 0.3
+    assert topks[6][0] / topks[6][1] < 0.3
+    # The schedule's kv-weighted mean equals the knob.
+    schedule = flops_matched_densities(
+        num_frames=21,
+        frames_per_block=3,
+        window_frames=-1,
+        mean_density=0.3,
+        floor_density=0.05,
+    )
+    kv = list(range(6, 22, 3))
+    mean = sum(d * k for d, k in zip(schedule[1:], kv)) / sum(kv)
+    assert abs(mean - 0.3) < 1e-6

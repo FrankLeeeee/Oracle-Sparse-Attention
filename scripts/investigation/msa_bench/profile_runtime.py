@@ -69,7 +69,7 @@ def probed_run(*, method: str, seconds: int, gpu: int, port_base: int) -> None:
         "--master-port", str(port_base),
         "--scheduler-port", str(port_base + 1),
         "--port", str(port_base + 2),
-    ] + method_flags(method)
+    ] + method_flags(method, seconds=seconds)
     env = base_env(gpu, {"SGLANG_DIFFUSION_CHUNK_TIMING_DIR": str(timing_dir)})
     with open(out_dir / "run.log", "w") as handle:
         proc = subprocess.Popen(

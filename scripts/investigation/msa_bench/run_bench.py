@@ -51,14 +51,21 @@ RES = "720p"
 TAXONOMY = str(HERE.parent / "qk_map_similarity" / "msa_taxonomy_self_forcing.json")
 
 
-def method_flags(method: str) -> list[str]:
+def method_flags(method: str, *, seconds: int = 5) -> list[str]:
     if method == "dense":
         return []
-    if method in ("msa", "msa25", "msa10"):
+    if method in ("msa", "msa25", "msa10", "msasched", "msasched15"):
         config = {
             "taxonomy_path": TAXONOMY,
-            "content_density": {"msa": 0.2, "msa25": 0.25, "msa10": 0.1}[method],
+            "content_density": {"msa25": 0.25, "msa10": 0.1, "msasched15": 0.15}.get(
+                method, 0.2
+            ),
         }
+        if method.startswith("msasched"):
+            config.update(
+                content_schedule="flops_matched",
+                schedule_num_frames=(MODELS[MODEL]["frames"][seconds] + 3) // 4,
+            )
         method = "msa"
     elif method in ("lightforcing", "lf10"):
         tier = "0.1" if method == "lf10" else "0.2"
@@ -90,7 +97,7 @@ def run_one(
         "--master-port", str(port_base),
         "--scheduler-port", str(port_base + 1),
         "--port", str(port_base + 2),
-    ] + method_flags(method)
+    ] + method_flags(method, seconds=seconds)
     log = out_dir / "run.log"
     started = time.time()
     parked = compute_pids(gpu)
