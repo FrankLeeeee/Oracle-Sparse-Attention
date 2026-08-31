@@ -36,6 +36,8 @@ METHOD_LABELS = {
     "msamild22": "MSA-sched 0.22 + 步进 (1,.9,.75,.6)",
     "lightforcing": "LightForcing（0.2 档）",
     "lf10": "LightForcing（0.1 档）",
+    "lfofficialdense": "官方 LF 权重 · dense",
+    "lfofficial": "官方 LF 权重 · LF 稀疏（0.2 档）",
 }
 # The video gallery, per prompt, in presentation order.
 VIDEO_METHODS = ("dense", "msa", "msa10", "lightforcing", "lf10")
@@ -463,6 +465,104 @@ def stepschedule_xml() -> str:
     )
 
 
+def official_xml() -> str:
+    results = json.loads((ROOT / "results_5s.json").read_text())
+    import statistics as _st
+
+    def mean(method, field):
+        return _st.mean(
+            results[f"b{i}_{method}_5s"][field] for i in range(1, 6)
+        )
+
+    videos = "".join(
+        f"<p><b>{pid} · {escape(PROMPTS[pid]['label'])}</b></p>"
+        + "".join(
+            f"<p>{METHOD_LABELS[m]}</p><p>[[video:{pid}_{m}]]</p>"
+            for m in ("lfofficialdense", "lfofficial")
+        )
+        for pid in PROMPTS
+    )
+    return (
+        "<h3>官方微调 Light-Forcing 权重的对照</h3>"
+        "<p>此前所有 LightForcing 对比都是把它的 mask 以 training-free 方式跑在"
+        "基础 Self-Forcing 权重上（同权重控制变量）。本节补上官方微调权重："
+        "<code>mack-williams/Light-Forcing</code> 的 short_video_gen.pt 经 "
+        "<code>convert_forcing_to_diffusers.py --preset light-forcing</code> 转档，"
+        "跑 dense 与 LF 稀疏（同一 0.2 档标定配置）各 5 个基准 prompt。"
+        "<b>跨权重的 PSNR 不可直接比</b>（各自对自己的 dense），下表给出各自"
+        "口径的数字，原始视频附后供直接目检。</p>"
+        '<table><colgroup><col width="230"/><col span="4" width="130"/></colgroup>'
+        "<thead><tr><th></th><th>去噪耗时（均值）</th><th>实际累计密度</th>"
+        "<th>PSNR vs <b>各自</b> dense</th><th>前 2 秒</th></tr></thead><tbody>"
+        f"<tr><td><p>官方 LF 权重 · dense</p></td><td>{mean('lfofficialdense', 'denoise_s'):.2f} s</td>"
+        "<td>1.0</td><td>—</td><td>—</td></tr>"
+        f"<tr><td><p>官方 LF 权重 · LF 稀疏</p></td><td>{mean('lfofficial', 'denoise_s'):.2f} s</td>"
+        f"<td>{results['b2_lfofficial_5s']['density']}</td>"
+        f"<td>{mean('lfofficial', 'psnr'):.2f}</td>"
+        f"<td>{mean('lfofficial', 'psnr_first'):.2f}</td></tr>"
+        f"<tr><td><p>SF 权重 · LF 稀疏（training-free）</p></td><td>{mean('lightforcing', 'denoise_s'):.2f} s</td>"
+        f"<td>{results['b2_lightforcing_5s']['density']}</td>"
+        f"<td>{mean('lightforcing', 'psnr'):.2f}</td>"
+        f"<td>{mean('lightforcing', 'psnr_first'):.2f}</td></tr>"
+        f"<tr><td><p>SF 权重 · MSA-sched 0.22</p></td><td>{mean('msasched22', 'denoise_s'):.2f} s</td>"
+        f"<td>{results['b2_msasched22_5s']['density']}</td>"
+        f"<td>{mean('msasched22', 'psnr'):.2f}</td>"
+        f"<td>{mean('msasched22', 'psnr_first'):.2f}</td></tr>"
+        "</tbody></table>"
+        "<p><b>读数：</b>一，速度与权重无关（同架构同 mask）：官方权重稀疏 "
+        "9.15 s ≈ SF 权重上的 9.00 s（运行方差内），dense 亦同（10.74 ≈ "
+        "10.63）——<b>MSA-sched 0.22（8.81 s）仍是最快</b>，微调不改变时延结论。"
+        "二，在同一 0.2 档密度下，微调权重的稀疏输出对其自身 dense 的 PSNR"
+        "（17.19）并不高于 training-free（17.86）——按此保真口径，微调并未让 "
+        "0.2 档 mask 变得更便宜；其训练收益应主要体现在官方发布的更高稀疏度"
+        "工作点上（本节未复现其原生前置递减 schedule，是为与全文的匹配密度"
+        "口径一致）。三，目检（帧对照与附后视频）：微调权重的内容轨迹与 SF "
+        "不同（构图、人群、浪形各异）但同样干净无伪影，其稀疏输出对自身 dense "
+        "的偏离表现为细节轨迹分歧而非画质损伤——与 SF 侧结论一致。"
+        "<b>结论不变但口径更完整</b>：MSA 的对比对象是「同权重上的 LF mask」，"
+        "对「官方微调系统」的时延优势同样成立（架构相同），质量对比则因权重"
+        "不同只能以各自保真度与目检衡量。</p>"
+        f"{videos}"
+        '<pre lang="bash" caption="复现命令"><code>'
+        + escape(
+            "# 转档官方权重（HF: mack-williams/Light-Forcing, short_video_gen.pt）\n"
+            "PYTHONPATH=python python python/sglang/multimodal_gen/tools/convert_forcing_to_diffusers.py \\\n"
+            "  --preset light-forcing --checkpoint /data/projects/vision-gen/Light-Forcing/short_video_gen.pt \\\n"
+            "  --output-path /data/projects/vision-gen/models/LightForcing-Wan2.1-T2V-1.3B-Diffusers\n"
+            "cd scripts/investigation/msa_bench\n"
+            "python run_bench.py --methods lfofficialdense,lfofficial\n"
+            "python doc_update.py --stage official"
+        )
+        + "</code></pre>"
+    )
+
+
+def stage_official() -> None:
+    data = cli("docs", "+fetch", "--doc", DOC, "--detail", "with-ids")
+    content = data["document"]["content"]
+    if "官方微调 Light-Forcing" not in content:
+        cli(
+            "docs", "+update", "--doc", DOC, "--command", "append",
+            "--content", official_xml(),
+        )
+        data = cli("docs", "+fetch", "--doc", DOC, "--detail", "with-ids")
+        content = data["document"]["content"]
+    placeholders = dict(
+        re.findall(r'<p id="([^"]+)"[^>]*>\[\[video:([\w.]+)\]\]</p>', content)
+    )
+    placeholders = {name: block for block, name in placeholders.items()}
+    for pid in PROMPTS:
+        for method in ("lfofficialdense", "lfofficial"):
+            key = f"{pid}_{method}"
+            if key not in placeholders:
+                continue
+            source = newest_mp4(f"{key}_5s")
+            named = source.parent / f"lightforcing_official_720p_5s_{key}.mp4"
+            shutil.copyfile(source, named)
+            replace_media(DOC, placeholders[key], str(named), media_type="file")
+    print("[msa-doc] official-checkpoint subsection + videos published")
+
+
 def stage_stepschedule() -> None:
     data = cli("docs", "+fetch", "--doc", DOC)
     if "去噪步级密度调度" in data["document"]["content"]:
@@ -527,7 +627,8 @@ def main() -> None:
         "--stage",
         default="section",
         choices=[
-            "section", "videos", "profiling", "schedule", "parity", "stepschedule",
+            "section", "videos", "profiling", "schedule", "parity",
+            "stepschedule", "official",
         ],
     )
     args = parser.parse_args()
@@ -545,6 +646,9 @@ def main() -> None:
         return
     if args.stage == "stepschedule":
         stage_stepschedule()
+        return
+    if args.stage == "official":
+        stage_official()
         return
     data = cli("docs", "+fetch", "--doc", DOC)
     if "MSA：混合稀疏注意力" in data["document"]["content"]:

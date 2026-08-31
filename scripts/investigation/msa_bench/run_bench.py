@@ -49,6 +49,12 @@ PROMPTS = json.loads((HERE / "bench_prompts.json").read_text())
 MODEL = "self_forcing"
 RES = "720p"
 TAXONOMY = str(HERE.parent / "qk_map_similarity" / "msa_taxonomy_self_forcing.json")
+# The official fine-tuned Light-Forcing checkpoint (retrained WITH its sparse
+# attention; converted upload of mack-williams/Light-Forcing). Same 5s
+# inference geometry as Self-Forcing. Quality for these rows must be scored
+# against THIS model's own dense output, never the Self-Forcing dense.
+LF_CHECKPOINT = "/data/projects/vision-gen/models/LightForcing-Wan2.1-T2V-1.3B-Diffusers"
+METHOD_MODEL_PATH = {"lfofficial": LF_CHECKPOINT, "lfofficialdense": LF_CHECKPOINT}
 
 
 def method_flags(method: str, *, seconds: int = 5) -> list[str]:
@@ -88,8 +94,12 @@ def method_flags(method: str, *, seconds: int = 5) -> list[str]:
         elif "mild" in method:
             config["step_density_scale"] = (1.0, 0.9, 0.75, 0.6)
         method = "msa"
-    elif method in ("lightforcing", "lf10"):
+    elif method == "lfofficialdense":
+        return []
+    elif method in ("lightforcing", "lf10", "lfofficial"):
         tier = "0.1" if method == "lf10" else "0.2"
+        if method == "lfofficial":
+            method = "lightforcing"
         config = json.loads((SPARSE_ROOT / "configs.json").read_text())[MODEL][
             "lightforcing"
         ][tier]["config"]
@@ -108,7 +118,7 @@ def run_one(
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         "sglang", "generate",
-        "--model-path", spec["path"],
+        "--model-path", METHOD_MODEL_PATH.get(method, spec["path"]),
         "--prompt", prompt,
         "--width", str(width),
         "--height", str(height),
@@ -198,10 +208,15 @@ def main() -> None:
     # PSNR of every sparse run against its prompt's dense output.
     fps = MODELS[MODEL]["fps"]
     for prompt_id in args.prompts.split(","):
-        dense_dir = ROOT / "runs" / f"{prompt_id}_dense_{args.seconds}s"
         for method in args.methods.split(","):
-            if method == "dense":
+            if method in ("dense", "lfofficialdense"):
                 continue
+            # Official-checkpoint rows score against that checkpoint's own
+            # dense; everything else against the base model's dense.
+            reference = (
+                "lfofficialdense" if method.startswith("lfofficial") else "dense"
+            )
+            dense_dir = ROOT / "runs" / f"{prompt_id}_{reference}_{args.seconds}s"
             tag = f"{prompt_id}_{method}_{args.seconds}s"
             quality = psnr_vs_dense(
                 dense_dir, ROOT / "runs" / tag, first_seconds=2, fps=fps
