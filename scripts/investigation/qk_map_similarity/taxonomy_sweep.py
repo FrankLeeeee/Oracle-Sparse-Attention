@@ -50,6 +50,9 @@ ROOT = results_dir("qk_map_similarity")
 RADII = (1, 2, 4, 9)
 LAST_M = (3, 4, 5)
 REF_CHUNK, DEPLOY_CHUNK, STEP = 0, 6, 3
+# A rolling-window forward carries query_frames > 3; the shortwin execution
+# then keeps max(m, query_frames) newest frames, so candidate m values are
+# generated relative to the dump's actual query width at classify time.
 FAMILIES = ("local", "shortwin", "frozen", "diffuse", "content")
 FAMILY_COLORS = {
     "local": "#4c72b0",
@@ -61,8 +64,8 @@ FAMILY_COLORS = {
 CONTENT_BUDGET = 0.20
 
 
-def load_layer(run_dir: pathlib.Path, layer: int, chunk: int) -> dict:
-    data = np.load(run_dir / "qk" / f"qk_L{layer:02d}_c{chunk}_s{STEP}.npz")
+def load_layer(run_dir: pathlib.Path, layer: int, chunk: int, step: int = STEP) -> dict:
+    data = np.load(run_dir / "qk" / f"qk_L{layer:02d}_c{chunk}_s{step}.npz")
     return {
         "query": torch.from_numpy(data["query"]).float(),  # [Sq, 12, d]
         "key": torch.from_numpy(data["key"]).float(),
@@ -73,13 +76,21 @@ def load_layer(run_dir: pathlib.Path, layer: int, chunk: int) -> dict:
 
 @torch.no_grad()
 def self_topk(q: torch.Tensor, k: torch.Tensor, t: int, fraction: float) -> list:
-    """Per-query top positions of each query frame's self map -> 3 x [T, k]."""
+    """Per-query top positions of each query frame's self map -> qf x [T, k].
+
+    The query occupies the newest ``q.shape[0] // t`` frames of the visible
+    cache (3 for chunkwise models, the whole joint-denoise window for the
+    rolling pipelines), so query frame i's self key frame is
+    ``num_frames - query_frames + i``.
+    """
     scale = q.shape[-1] ** -0.5
     frames = k.shape[0] // t
+    q_frames = q.shape[0] // t
     out = []
-    for i in range(3):
+    for i in range(q_frames):
         q_frame = q[i * t : (i + 1) * t]
-        k_frame = k[(frames - 3 + i) * t : (frames - 2 + i) * t]
+        j = frames - q_frames + i
+        k_frame = k[j * t : (j + 1) * t]
         probs = torch.softmax((q_frame @ k_frame.T) * scale, dim=-1)
         out.append(probs.topk(round(fraction * t), dim=1).indices)
     return out
@@ -93,6 +104,7 @@ def head_metrics(
     scale = q6.shape[-1] ** -0.5
     height, width = grid
     frames = k6.shape[0] // t
+    q_frames = q6.shape[0] // t
     own_topk = {f: self_topk(q6, k6, t, f) for f in (0.10, 0.20)}
     offsets = torch.arange(frames, device=device)[None, :, None] * t
     frame_dist = torch.zeros(frames, device=device)
@@ -101,7 +113,7 @@ def head_metrics(
     y = torch.arange(t, device=device) // width
     x = torch.arange(t, device=device) % width
     rows = torch.arange(t, device=device)
-    for i in range(3):
+    for i in range(q_frames):
         probs = torch.softmax(
             (q6[i * t : (i + 1) * t] @ k6.T) * scale, dim=-1
         )  # [T, kv]
@@ -120,29 +132,39 @@ def head_metrics(
                 ).mean()
             )
         for name, topk in (
-            ("frozen10", ref_topk[i]),
+            ("frozen10", ref_topk[min(i, len(ref_topk) - 1)]),
             ("own10", own_topk[0.10][i]),
             ("own20", own_topk[0.20][i]),
         ):
             index = (topk[:, None, :] + offsets).reshape(t, -1)
             gathered[name] += float(probs.gather(1, index).sum(1).mean())
-    frame_dist /= 3 * t
+    frame_dist /= q_frames * t
+    # Window queries can never keep fewer than their own frames, so the
+    # shortwin candidates start at the query width there.
+    last_m = (
+        [q_frames, q_frames + 2, q_frames + 4] if q_frames > 3 else list(LAST_M)
+    )
     return {
-        **{f"local_r{r}": round(v / 3, 4) for r, v in window.items()},
-        **{f"lastm{m}": round(float(frame_dist[-m:].sum()), 4) for m in LAST_M},
-        **{name: round(v / 3, 4) for name, v in gathered.items()},
+        "q_frames": q_frames,
+        **{f"local_r{r}": round(v / q_frames, 4) for r, v in window.items()},
+        **{f"lastm{m}": round(float(frame_dist[-min(m, frames):].sum()), 4) for m in last_m},
+        **{name: round(v / q_frames, 4) for name, v in gathered.items()},
     }
 
 
 def classify(per_run: dict[str, dict], tau: float) -> tuple[str, dict]:
     """Family + policy params; a head qualifies only on EVERY prompt."""
     everywhere = lambda metric, low: all(  # noqa: E731
-        m[metric] >= low for m in per_run.values()
+        m.get(metric, 0.0) >= low for m in per_run.values()
     )
     for r in (1, 2, 4):
         if everywhere(f"local_r{r}", tau):
             return "local", {"r": r, "density": min((2 * r + 1) ** 2, 3600) / 3600}
-    for m in LAST_M:
+    m_candidates = sorted(
+        {m for run in per_run.values() for m in
+         [int(k[5:]) for k in run if k.startswith("lastm")]}
+    )
+    for m in m_candidates:
         if everywhere(f"lastm{m}", tau):
             return "shortwin", {"m": m, "density": m / 21}
     if everywhere("local_r9", tau):
@@ -208,6 +230,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runs", default="p1_sweep,p4_sweep")
     parser.add_argument("--tau", type=float, default=0.85)
+    parser.add_argument("--ref-chunk", type=int, default=REF_CHUNK)
+    parser.add_argument("--deploy-chunk", type=int, default=DEPLOY_CHUNK)
+    parser.add_argument("--step", type=int, default=STEP)
+    parser.add_argument(
+        "--out-name", default="taxonomy",
+        help="basename for deep_dive/<out-name>.json and plots/<out-name>_map.png",
+    )
     parser.add_argument(
         "--export",
         default="",
@@ -225,8 +254,8 @@ def main() -> None:
         per_head_runs: dict[int, dict[str, dict]] = {h: {} for h in range(NUM_HEADS)}
         for run in runs:
             run_dir = ROOT / "runs" / run
-            ref = load_layer(run_dir, layer, REF_CHUNK)
-            deploy = load_layer(run_dir, layer, DEPLOY_CHUNK)
+            ref = load_layer(run_dir, layer, args.ref_chunk, step=args.step)
+            deploy = load_layer(run_dir, layer, args.deploy_chunk, step=args.step)
             for head in range(NUM_HEADS):
                 q0 = ref["query"][:, head].to(args.device)
                 k0 = ref["key"][:, head].to(args.device)
@@ -268,9 +297,9 @@ def main() -> None:
         "mean_density": round(mean_density, 4),
         "mean_policy_recall": {k: round(v, 4) for k, v in mean_recall.items()},
     }
-    out = ROOT / "deep_dive" / "taxonomy.json"
+    out = ROOT / "deep_dive" / f"{args.out_name}.json"
     out.write_text(json.dumps({"summary": summary, "heads": records}, indent=2))
-    plot(records, ROOT / "plots" / "taxonomy_map.png")
+    plot(records, ROOT / "plots" / f"{args.out_name}_map.png")
     print(json.dumps(summary, indent=2))
     print(f"[tax] wrote {out}")
     if args.export:
@@ -291,6 +320,13 @@ def main() -> None:
                 entry["family"] == "local"
                 and (2 * entry["r"] + 2) / grid_height >= CONTENT_BUDGET
             ):
+                entry = {"family": "content"}
+            # Window models classify shortwin at m >= the joint-denoise query
+            # width (15+ of 21 visible frames) — a "static" policy denser
+            # than the content budget is strictly worse than runtime
+            # selection (this made MSA slower than dense on Rolling Forcing
+            # before the gate).
+            if entry["family"] == "shortwin" and entry["m"] / 21 > 0.25:
                 entry = {"family": "content"}
             # Diffuse heads also ship as content: executing them as a frame
             # subsample is either statistically crude (few frames at short

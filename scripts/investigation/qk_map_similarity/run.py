@@ -41,8 +41,8 @@ from common import (  # noqa: E402
 ROOT = results_dir("qk_map_similarity")
 PROMPTS = json.loads((HERE.parent / "prompts.json").read_text())
 
-MODEL = "self_forcing"
-DURATION_S = 5
+MODEL = "self_forcing"  # default; --model switches (same 30x12 Wan geometry)
+DURATION_S = 5  # default; --seconds overrides (CF-long calibrates at 20s)
 RES = "720p"
 # The study's (layer, head) picks: heads 0/1 in layer 0, head 2 in the middle
 # layer, head 3 in the last layer (Self-Forcing 1.3B: 30 layers, 12 heads).
@@ -107,13 +107,17 @@ def run_one(
     spec_set: str = "main",
     chunks: tuple[int, ...] = tuple(CHUNK_IDS),
     steps: tuple[int, ...] = STEP_IDS,
+    model: str = MODEL,
+    duration_s: int = DURATION_S,
 ) -> dict:
-    spec = MODELS[MODEL]
+    spec = MODELS[model]
     width, height = spec["resolutions"][RES]
     # Non-main capture rounds run in a scratch dir (their video is a bitwise
     # re-generation of the main run's) but dump into the shared qk/ dir, so
     # the analysis scripts read one place per prompt.
     suffix = "" if spec_set == "main" else f"_{spec_set}"
+    if model != "self_forcing":
+        suffix = f"_{model}{suffix}"
     out_dir = ROOT / "runs" / f"{prompt_id}{suffix}"
     out_dir.mkdir(parents=True, exist_ok=True)
     qk_dir = (
@@ -131,7 +135,7 @@ def run_one(
         "--height",
         str(height),
         "--num-frames",
-        str(spec["frames"][DURATION_S]),
+        str(spec["frames"][duration_s]),
         "--seed",
         str(SEED),
         "--save-output",
@@ -207,6 +211,8 @@ def main() -> None:
     parser.add_argument("--chunks", default=",".join(str(c) for c in CHUNK_IDS))
     parser.add_argument("--steps", default=",".join(str(s) for s in STEP_IDS))
     parser.add_argument("--port-base", type=int, default=29800)
+    parser.add_argument("--model", default=MODEL, choices=sorted(MODELS))
+    parser.add_argument("--seconds", type=int, default=DURATION_S)
     args = parser.parse_args()
 
     chunks = tuple(int(c) for c in args.chunks.split(","))
@@ -234,6 +240,8 @@ def main() -> None:
                     spec_set=args.spec,
                     chunks=chunks,
                     steps=steps,
+                    model=args.model,
+                    duration_s=args.seconds,
                 )
             finally:
                 pool.release(gpu)
@@ -247,9 +255,12 @@ def main() -> None:
             print(log_tail, flush=True)
             raise SystemExit(f"{prompt_id} failed rc={result['returncode']}")
         if not args.no_capture and result["dumps"] != expected:
-            raise SystemExit(
+            message = (
                 f"{prompt_id}: expected {expected} Q/K dumps, got {result['dumps']}"
             )
+            if args.model == "self_forcing":
+                raise SystemExit(message)
+            print(f"[warn] {message} (window models key dumps per window)")
     suffix = "" if args.spec == "main" else f"_{args.spec}"
     (ROOT / "runs" / f"summary{suffix}.json").write_text(json.dumps(results, indent=2))
     print(f"[done] {len(results)} runs -> {ROOT / 'runs'}")

@@ -46,9 +46,14 @@ from common import ROOT as SPARSE_ROOT  # noqa: E402
 
 ROOT = results_dir("msa_bench")
 PROMPTS = json.loads((HERE / "bench_prompts.json").read_text())
-MODEL = "self_forcing"
+MODEL = "self_forcing"  # default; --model switches (CF / RF / CF-long share
+# the 30x12 Wan geometry, each with its own calibrated taxonomy + LF tier)
 RES = "720p"
 TAXONOMY = str(HERE.parent / "qk_map_similarity" / "msa_taxonomy_self_forcing.json")
+
+
+def model_taxonomy(model: str) -> str:
+    return str(HERE.parent / "qk_map_similarity" / f"msa_taxonomy_{model}.json")
 # The official fine-tuned Light-Forcing checkpoint (retrained WITH its sparse
 # attention; converted upload of mack-williams/Light-Forcing). Same 5s
 # inference geometry as Self-Forcing. Quality for these rows must be scored
@@ -57,14 +62,25 @@ LF_CHECKPOINT = "/data/projects/vision-gen/models/LightForcing-Wan2.1-T2V-1.3B-D
 METHOD_MODEL_PATH = {"lfofficial": LF_CHECKPOINT, "lfofficialdense": LF_CHECKPOINT}
 
 
-def method_flags(method: str, *, seconds: int = 5) -> list[str]:
+def method_flags(method: str, *, seconds: int = 5, model: str = MODEL) -> list[str]:
     if method == "dense":
         return []
+    lf_tiers = json.loads((SPARSE_ROOT / "configs.json").read_text())[model][
+        "lightforcing"
+    ]
     if method.startswith("msa"):
         config = {
-            "taxonomy_path": TAXONOMY,
+            "taxonomy_path": model_taxonomy(model),
             "content_density": {"msa25": 0.25, "msa10": 0.1}.get(method, 0.2),
         }
+        # The content stage's two-stage keeps are per-model (pinned sinks,
+        # window sizes) — take them from the model's calibrated LF config.
+        lf_config = lf_tiers["0.2"]["config"]
+        config.update(
+            keep_sink=lf_config["keep_sink"],
+            keep_near=lf_config["keep_near"],
+            keep_frames=lf_config["keep_frames"],
+        )
         if "turbo" in method or "mild" in method:
             # turbo/mild ride on the schedule at the density-parity means.
             config["content_density"] = 0.22 if "22" in method else 0.14
@@ -74,7 +90,8 @@ def method_flags(method: str, *, seconds: int = 5) -> list[str]:
         if "sched" in method:
             config.update(
                 content_schedule="flops_matched",
-                schedule_num_frames=(MODELS[MODEL]["frames"][seconds] + 3) // 4,
+                schedule_num_frames=(MODELS[model]["frames"][seconds] + 3) // 4,
+                schedule_window_frames=MODELS[model]["window_frames"],
             )
         if "15" in method:
             config["content_density"] = 0.15
@@ -98,11 +115,10 @@ def method_flags(method: str, *, seconds: int = 5) -> list[str]:
         return []
     elif method in ("lightforcing", "lf10", "lfofficial"):
         tier = "0.1" if method == "lf10" else "0.2"
-        if method == "lfofficial":
-            method = "lightforcing"
-        config = json.loads((SPARSE_ROOT / "configs.json").read_text())[MODEL][
-            "lightforcing"
-        ][tier]["config"]
+        config = dict(lf_tiers[tier]["config"])
+        if seconds != 5 and "num_output_frames" in config:
+            # LF's schedule solve needs the run's actual video length.
+            config["num_output_frames"] = MODELS[model]["frames"][seconds]
         method = "lightforcing"
     else:
         raise ValueError(method)
@@ -110,9 +126,10 @@ def method_flags(method: str, *, seconds: int = 5) -> list[str]:
 
 
 def run_one(
-    *, tag: str, prompt: str, method: str, gpu: int, port_base: int, seconds: int
+    *, tag: str, prompt: str, method: str, gpu: int, port_base: int, seconds: int,
+    model: str = MODEL,
 ) -> dict:
-    spec = MODELS[MODEL]
+    spec = MODELS[model]
     width, height = spec["resolutions"][RES]
     out_dir = ROOT / "runs" / tag
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -128,7 +145,7 @@ def run_one(
         "--master-port", str(port_base),
         "--scheduler-port", str(port_base + 1),
         "--port", str(port_base + 2),
-    ] + method_flags(method, seconds=seconds)
+    ] + method_flags(method, seconds=seconds, model=model)
     log = out_dir / "run.log"
     started = time.time()
     parked = compute_pids(gpu)
@@ -165,18 +182,20 @@ def main() -> None:
     parser.add_argument("--methods", default="dense,msa,lightforcing")
     parser.add_argument("--prompts", default=",".join(PROMPTS))
     parser.add_argument("--seconds", type=int, default=5)
+    parser.add_argument("--model", default=MODEL, choices=sorted(MODELS))
     parser.add_argument("--port-base", type=int, default=29960)
     args = parser.parse_args()
 
     pool = GpuPool([int(g) for g in args.gpus.split(",")])
-    results_path = ROOT / f"results_{args.seconds}s.json"
+    prefix = "" if args.model == MODEL else f"{args.model}_"
+    results_path = ROOT / f"results_{prefix}{args.seconds}s.json"
     results: dict = (
         json.loads(results_path.read_text()) if results_path.exists() else {}
     )
     index = 0
     for prompt_id in args.prompts.split(","):
         for method in args.methods.split(","):
-            tag = f"{prompt_id}_{method}_{args.seconds}s"
+            tag = f"{prefix}{prompt_id}_{method}_{args.seconds}s"
             if results.get(tag, {}).get("returncode") == 0:
                 print(f"skip {tag} (already done)", flush=True)
                 continue
@@ -191,6 +210,7 @@ def main() -> None:
                         gpu=gpu,
                         port_base=args.port_base + 10 * (index % 8),
                         seconds=args.seconds,
+                        model=args.model,
                     )
                 finally:
                     pool.release(gpu)
@@ -206,7 +226,7 @@ def main() -> None:
                 raise SystemExit(f"{tag} failed")
 
     # PSNR of every sparse run against its prompt's dense output.
-    fps = MODELS[MODEL]["fps"]
+    fps = MODELS[args.model]["fps"]
     for prompt_id in args.prompts.split(","):
         for method in args.methods.split(","):
             if method in ("dense", "lfofficialdense"):
@@ -216,8 +236,8 @@ def main() -> None:
             reference = (
                 "lfofficialdense" if method.startswith("lfofficial") else "dense"
             )
-            dense_dir = ROOT / "runs" / f"{prompt_id}_{reference}_{args.seconds}s"
-            tag = f"{prompt_id}_{method}_{args.seconds}s"
+            dense_dir = ROOT / "runs" / f"{prefix}{prompt_id}_{reference}_{args.seconds}s"
+            tag = f"{prefix}{prompt_id}_{method}_{args.seconds}s"
             quality = psnr_vs_dense(
                 dense_dir, ROOT / "runs" / tag, first_seconds=2, fps=fps
             )

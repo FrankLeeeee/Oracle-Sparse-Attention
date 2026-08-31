@@ -116,6 +116,10 @@ class MsaConfig(msgspec.Struct, frozen=True):
     content_schedule: str = "constant"
     schedule_num_frames: int | None = None
     schedule_floor_density: float = 0.05
+    # Attention window cap in latent frames (-1 = full context); the
+    # flops_matched solve weighs chunks by their true kv length, which a
+    # rolling/capped-window model bounds at this value.
+    schedule_window_frames: int = -1
 
 
 class HeadSpec(msgspec.Struct, frozen=True):
@@ -289,7 +293,14 @@ class MixedSparseAttention(SparseAttentionBackend):
             head_ids[group] = local_head
             kept_per_frame = 0.0
             if spec.family == "shortwin":
-                frame_lo[group] = max(0, num_frames - spec.m)
+                # A rolling-window forward carries several query chunks at
+                # once (query_frames > frames_per_block); the newest-m window
+                # must never exclude any query chunk's own frames, or the
+                # oldest chunks of the window lose their bidirectional
+                # within-chunk attention (the corruption mode of the
+                # tile-window baselines on Rolling Forcing).
+                keep = max(spec.m, layout.query_frames)
+                frame_lo[group] = max(0, num_frames - keep)
                 head_ranges = {
                     q_block: [(0, frame_seqlen)] for q_block in range(q_blocks)
                 }
@@ -345,7 +356,7 @@ class MixedSparseAttention(SparseAttentionBackend):
             self._schedule = flops_matched_densities(
                 num_frames=config.schedule_num_frames,
                 frames_per_block=layout.frames_per_block,
-                window_frames=-1,
+                window_frames=config.schedule_window_frames,
                 mean_density=config.content_density,
                 floor_density=config.schedule_floor_density,
             )
