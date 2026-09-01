@@ -87,7 +87,24 @@ def method_flags(method: str, *, seconds: int = 5, model: str = MODEL) -> list[s
             method = "msasched" + ("22" if "22" in method else "14") + (
                 "turbo" if "turbo" in method else "mild"
             )
-        if "sched" in method:
+        if method.startswith("msalf"):
+            # Content heads on LightForcing's own calibrated front-loaded
+            # schedule — the capped-window models' large LF latency lead is
+            # this schedule shape, which flops_matched cannot express there.
+            lf = dict(lf_tiers["0.2"]["config"])
+            config.update(
+                content_schedule="lightforcing",
+                lf_sparsity=lf["sparsity"],
+                lf_sparsity_base=lf.get("sparsity_base", 0.98),
+                lf_num_output_frames=MODELS[model]["frames"][seconds],
+                lf_local_attn_size=lf.get("local_attn_size", -1),
+            )
+            if method == "msalf3":
+                # Late-window density ~2.2x LightForcing's (0.013 -> 0.028):
+                # those calls are planning-bound, so the extra keys cost
+                # almost nothing while buying back fidelity.
+                config["lf_sparsity"] = 0.972
+        elif "sched" in method:
             config.update(
                 content_schedule="flops_matched",
                 schedule_num_frames=(MODELS[model]["frames"][seconds] + 3) // 4,

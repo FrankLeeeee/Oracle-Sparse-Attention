@@ -46,6 +46,7 @@ from sglang.multimodal_gen.runtime.layers.attention.sparse.kernel import (
     plan_from_segment_mask,
 )
 from sglang.multimodal_gen.runtime.layers.attention.sparse.lightforcing import (
+    calculate_chunk_sparsities,
     frame_aligned_block_bounds,
     lightforcing_block_mask,
     mean_pool_blocks,
@@ -120,6 +121,18 @@ class MsaConfig(msgspec.Struct, frozen=True):
     # flops_matched solve weighs chunks by their true kv length, which a
     # rolling/capped-window model bounds at this value.
     schedule_window_frames: int = -1
+    # content_schedule="lightforcing": drive the content heads with
+    # LightForcing's own front-loaded sparsity schedule
+    # (calculate_chunk_sparsities under the model's calibrated knobs) instead
+    # of the flops_matched solve. On capped-window models every chunk weighs
+    # the same, so flops_matched degenerates to near-flat per-call density —
+    # while LF's calibrated schedule runs dense early and ~1-2% late, which
+    # is where its large latency lead on those models comes from. Entries
+    # with sparsity <= 0 read the full window (early chunks).
+    lf_sparsity: float = 0.0
+    lf_sparsity_base: float = 0.98
+    lf_num_output_frames: int = 0
+    lf_local_attn_size: int = -1
 
 
 class HeadSpec(msgspec.Struct, frozen=True):
@@ -218,7 +231,9 @@ class MixedSparseAttention(SparseAttentionBackend):
         self._pooled_history = LayoutCache()
         self._content_cache = LayoutCache()
         self._content_ids: dict[tuple[int, int], torch.Tensor] = {}
-        if config.content_schedule not in ("constant", "flops_matched"):
+        if config.content_schedule not in (
+            "constant", "flops_matched", "lightforcing"
+        ):
             raise ValueError(
                 f"unknown content_schedule {config.content_schedule!r} "
                 "(use 'constant' or 'flops_matched')"
@@ -226,6 +241,13 @@ class MixedSparseAttention(SparseAttentionBackend):
         if config.content_schedule == "flops_matched" and not config.schedule_num_frames:
             raise ValueError(
                 "content_schedule='flops_matched' needs schedule_num_frames"
+            )
+        if config.content_schedule == "lightforcing" and not (
+            config.lf_sparsity and config.lf_num_output_frames
+        ):
+            raise ValueError(
+                "content_schedule='lightforcing' needs lf_sparsity and "
+                "lf_num_output_frames"
             )
         # chunk index -> per-call content density, solved on first use.
         self._schedule: list[float] | None = None
@@ -352,6 +374,26 @@ class MixedSparseAttention(SparseAttentionBackend):
         config = self._config
         if config.content_schedule == "constant":
             return config.content_density
+        if config.content_schedule == "lightforcing":
+            if self._schedule is None:
+                sparsities = calculate_chunk_sparsities(
+                    num_output_frames=config.lf_num_output_frames,
+                    frames_per_block=layout.frames_per_block,
+                    local_attn_size=config.lf_local_attn_size,
+                    sparsity=config.lf_sparsity,
+                    sparsity_base=config.lf_sparsity_base,
+                )
+                # sparsity <= 0 means "keep everything" (LightForcing goes
+                # dense there); density 1.0 makes the content top-k the full
+                # window, one merged range.
+                self._schedule = [
+                    1.0 if sparsity <= 0.0 else max(0.0, 1.0 - sparsity)
+                    for sparsity in sparsities
+                ]
+            index = min(
+                max(int(layout.query_chunk_index), 0), len(self._schedule) - 1
+            )
+            return self._schedule[index]
         if self._schedule is None:
             self._schedule = flops_matched_densities(
                 num_frames=config.schedule_num_frames,
@@ -455,6 +497,15 @@ class MixedSparseAttention(SparseAttentionBackend):
         geometry = self.geometry
         if geometry.grid_height * geometry.grid_width != layout.frame_seqlen:
             self.warn_dense_once("latent grid does not match the frame length")
+            self._record_density(None, kv_len=kv_len)
+            return None
+        # Full-density chunks of the lightforcing schedule go dense outright
+    # (SDPA beats a sparse kernel told to read everything) — the same
+        # fallback LightForcing takes on those chunks.
+        if (
+            self._config.content_schedule == "lightforcing"
+            and self._call_density(layout) >= 1.0
+        ):
             self._record_density(None, kv_len=kv_len)
             return None
         static, content = self._split_heads(
