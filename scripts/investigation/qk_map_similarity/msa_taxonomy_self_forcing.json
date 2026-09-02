@@ -27,17 +27,20 @@
   },
   "heads": {
     "L00_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L00_h1": {
       "family": "local",
       "r": 2
     },
     "L00_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L00_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L00_h4": {
       "family": "local",
@@ -52,16 +55,20 @@
       "m": 3
     },
     "L00_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L00_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L00_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L00_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L00_h11": {
       "family": "local",
@@ -84,16 +91,20 @@
       "m": 5
     },
     "L01_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L01_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.575
     },
     "L01_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L01_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L01_h8": {
       "family": "shortwin",
@@ -103,20 +114,24 @@
       "family": "frozen"
     },
     "L01_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.612
     },
     "L01_h11": {
       "family": "shortwin",
       "m": 3
     },
     "L02_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L02_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.187
     },
     "L02_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L02_h3": {
       "family": "local",
@@ -127,10 +142,12 @@
       "m": 5
     },
     "L02_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L02_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.856
     },
     "L02_h7": {
       "family": "local",
@@ -141,10 +158,12 @@
       "m": 3
     },
     "L02_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.189
     },
     "L02_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.96
     },
     "L02_h11": {
       "family": "local",
@@ -155,47 +174,56 @@
       "r": 1
     },
     "L03_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L03_h2": {
       "family": "shortwin",
       "m": 4
     },
     "L03_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.334
     },
     "L03_h4": {
       "family": "shortwin",
       "m": 3
     },
     "L03_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L03_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L03_h7": {
       "family": "local",
       "r": 1
     },
     "L03_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L03_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L03_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.82
     },
     "L03_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L04_h0": {
       "family": "shortwin",
       "m": 4
     },
     "L04_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L04_h2": {
       "family": "shortwin",
@@ -214,25 +242,32 @@
       "r": 2
     },
     "L04_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.225
     },
     "L04_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L04_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.602
     },
     "L04_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L04_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L04_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L05_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L05_h1": {
       "family": "local",
@@ -243,14 +278,16 @@
       "m": 3
     },
     "L05_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L05_h4": {
       "family": "shortwin",
       "m": 3
     },
     "L05_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.318
     },
     "L05_h6": {
       "family": "shortwin",
@@ -261,10 +298,12 @@
       "m": 5
     },
     "L05_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.849
     },
     "L05_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L05_h10": {
       "family": "shortwin",
@@ -275,79 +314,99 @@
       "m": 3
     },
     "L06_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L06_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.82
     },
     "L06_h2": {
       "family": "frozen"
     },
     "L06_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.733
     },
     "L06_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L06_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L06_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L06_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.878
     },
     "L06_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.592
     },
     "L06_h9": {
       "family": "shortwin",
       "m": 5
     },
     "L06_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.538
     },
     "L06_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L07_h0": {
       "family": "shortwin",
       "m": 3
     },
     "L07_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L07_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L07_h3": {
       "family": "local",
       "r": 2
     },
     "L07_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.028
     },
     "L07_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.569
     },
     "L07_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.42
     },
     "L07_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L07_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.516
     },
     "L07_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L07_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.719
     },
     "L07_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L08_h0": {
       "family": "shortwin",
@@ -358,33 +417,40 @@
       "m": 4
     },
     "L08_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L08_h3": {
       "family": "shortwin",
       "m": 4
     },
     "L08_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L08_h5": {
       "family": "shortwin",
       "m": 3
     },
     "L08_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.599
     },
     "L08_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.99
     },
     "L08_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L08_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.763
     },
     "L08_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L08_h11": {
       "family": "shortwin",
@@ -394,83 +460,107 @@
       "family": "frozen"
     },
     "L09_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.761
     },
     "L09_h2": {
       "family": "frozen"
     },
     "L09_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L09_h4": {
       "family": "shortwin",
       "m": 3
     },
     "L09_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.732
     },
     "L09_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L09_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.746
     },
     "L09_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.928
     },
     "L09_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L09_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L09_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.751
     },
     "L10_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L10_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.546
     },
     "L10_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.887
     },
     "L10_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L10_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L10_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L10_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.418
     },
     "L10_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.79
     },
     "L10_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L10_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L10_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L10_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L11_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.842
     },
     "L11_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L11_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L11_h3": {
       "family": "shortwin",
@@ -480,112 +570,143 @@
       "family": "frozen"
     },
     "L11_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.576
     },
     "L11_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L11_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L11_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L11_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L11_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.326
     },
     "L11_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.123
     },
     "L12_h0": {
       "family": "frozen"
     },
     "L12_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.597
     },
     "L12_h2": {
       "family": "local",
       "r": 2
     },
     "L12_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.851
     },
     "L12_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.465
     },
     "L12_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.962
     },
     "L12_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L12_h7": {
       "family": "shortwin",
       "m": 4
     },
     "L12_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L12_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L12_h10": {
       "family": "shortwin",
       "m": 4
     },
     "L12_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L13_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L13_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.53
     },
     "L13_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.886
     },
     "L13_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.412
     },
     "L13_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.899
     },
     "L13_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L13_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.761
     },
     "L13_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L13_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.512
     },
     "L13_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L13_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.913
     },
     "L13_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L14_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L14_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.652
     },
     "L14_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.997
     },
     "L14_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L14_h4": {
       "family": "frozen"
@@ -595,213 +716,271 @@
       "m": 4
     },
     "L14_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.882
     },
     "L14_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.767
     },
     "L14_h8": {
       "family": "shortwin",
       "m": 4
     },
     "L14_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.301
     },
     "L14_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.905
     },
     "L14_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.539
     },
     "L15_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.157
     },
     "L15_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L15_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.707
     },
     "L15_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.452
     },
     "L15_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L15_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.659
     },
     "L15_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.422
     },
     "L15_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.812
     },
     "L15_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.442
     },
     "L15_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.095
     },
     "L15_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.336
     },
     "L15_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.911
     },
     "L16_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L16_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L16_h2": {
       "family": "shortwin",
       "m": 3
     },
     "L16_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.127
     },
     "L16_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L16_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.544
     },
     "L16_h6": {
       "family": "shortwin",
       "m": 5
     },
     "L16_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.189
     },
     "L16_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.116
     },
     "L16_h9": {
       "family": "shortwin",
       "m": 4
     },
     "L16_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.083
     },
     "L16_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L17_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.981
     },
     "L17_h1": {
       "family": "shortwin",
       "m": 5
     },
     "L17_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.948
     },
     "L17_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L17_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L17_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L17_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.828
     },
     "L17_h7": {
       "family": "frozen"
     },
     "L17_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L17_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L17_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L17_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L18_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L18_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.451
     },
     "L18_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.625
     },
     "L18_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.657
     },
     "L18_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L18_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.718
     },
     "L18_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.567
     },
     "L18_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.88
     },
     "L18_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.266
     },
     "L18_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L18_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.923
     },
     "L18_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.171
     },
     "L19_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L19_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L19_h2": {
       "family": "local",
       "r": 2
     },
     "L19_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.878
     },
     "L19_h4": {
       "family": "local",
       "r": 2
     },
     "L19_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L19_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.09
     },
     "L19_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L19_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L19_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.538
     },
     "L19_h10": {
       "family": "shortwin",
       "m": 4
     },
     "L19_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L20_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.886
     },
     "L20_h1": {
       "family": "local",
@@ -816,14 +995,16 @@
       "r": 1
     },
     "L20_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.657
     },
     "L20_h5": {
       "family": "local",
       "r": 1
     },
     "L20_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L20_h7": {
       "family": "shortwin",
@@ -834,10 +1015,12 @@
       "m": 4
     },
     "L20_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.585
     },
     "L20_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.637
     },
     "L20_h11": {
       "family": "local",
@@ -848,26 +1031,32 @@
       "m": 3
     },
     "L21_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.235
     },
     "L21_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.968
     },
     "L21_h3": {
       "family": "local",
       "r": 1
     },
     "L21_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.412
     },
     "L21_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L21_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.735
     },
     "L21_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L21_h8": {
       "family": "shortwin",
@@ -886,162 +1075,211 @@
       "m": 3
     },
     "L22_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L22_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.61
     },
     "L22_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L22_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.757
     },
     "L22_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.908
     },
     "L22_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.529
     },
     "L22_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.679
     },
     "L22_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L22_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L22_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L22_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.006
     },
     "L22_h11": {
       "family": "shortwin",
       "m": 4
     },
     "L23_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.077
     },
     "L23_h1": {
       "family": "frozen"
     },
     "L23_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L23_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.723
     },
     "L23_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L23_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.859
     },
     "L23_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.768
     },
     "L23_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L23_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.785
     },
     "L23_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L23_h10": {
       "family": "shortwin",
       "m": 4
     },
     "L23_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L24_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.249
     },
     "L24_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.271
     },
     "L24_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.02
     },
     "L24_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.107
     },
     "L24_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.607
     },
     "L24_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.058
     },
     "L24_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.125
     },
     "L24_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.507
     },
     "L24_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.948
     },
     "L24_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.67
     },
     "L24_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L24_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.621
     },
     "L25_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L25_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.241
     },
     "L25_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.943
     },
     "L25_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.732
     },
     "L25_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.62
     },
     "L25_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.378
     },
     "L25_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L25_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.909
     },
     "L25_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L25_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.227
     },
     "L25_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.512
     },
     "L25_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L26_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.849
     },
     "L26_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L26_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L26_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.731
     },
     "L26_h4": {
       "family": "shortwin",
@@ -1052,42 +1290,52 @@
       "m": 4
     },
     "L26_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L26_h7": {
       "family": "shortwin",
       "m": 4
     },
     "L26_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.506
     },
     "L26_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L26_h10": {
       "family": "local",
       "r": 1
     },
     "L26_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L27_h0": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L27_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L27_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L27_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L27_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.881
     },
     "L27_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.209
     },
     "L27_h6": {
       "family": "shortwin",
@@ -1098,14 +1346,16 @@
       "r": 2
     },
     "L27_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L27_h9": {
       "family": "local",
       "r": 1
     },
     "L27_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.612
     },
     "L27_h11": {
       "family": "local",
@@ -1120,30 +1370,36 @@
       "r": 2
     },
     "L28_h2": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L28_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.738
     },
     "L28_h4": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L28_h5": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.991
     },
     "L28_h6": {
       "family": "local",
       "r": 1
     },
     "L28_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L28_h8": {
       "family": "local",
       "r": 1
     },
     "L28_h9": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L28_h10": {
       "family": "shortwin",
@@ -1158,14 +1414,16 @@
       "r": 1
     },
     "L29_h1": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.345
     },
     "L29_h2": {
       "family": "local",
       "r": 1
     },
     "L29_h3": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.11
     },
     "L29_h4": {
       "family": "shortwin",
@@ -1175,23 +1433,28 @@
       "family": "frozen"
     },
     "L29_h6": {
-      "family": "content"
+      "family": "content",
+      "budget": 1.299
     },
     "L29_h7": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L29_h8": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     },
     "L29_h9": {
       "family": "local",
       "r": 1
     },
     "L29_h10": {
-      "family": "content"
+      "family": "content",
+      "budget": 2.0
     },
     "L29_h11": {
-      "family": "content"
+      "family": "content",
+      "budget": 0.5
     }
   }
 }

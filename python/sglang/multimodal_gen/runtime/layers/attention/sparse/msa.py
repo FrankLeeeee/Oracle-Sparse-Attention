@@ -133,12 +133,28 @@ class MsaConfig(msgspec.Struct, frozen=True):
     lf_sparsity_base: float = 0.98
     lf_num_output_frames: int = 0
     lf_local_attn_size: int = -1
+    # Content selection granularity. "block" picks 128-token key blocks
+    # (LightForcing semantics); "frame" picks whole latent frames by their
+    # mean pooled score, with the query's own frames always kept. Whole
+    # frames merge into a handful of contiguous ranges, which the range
+    # kernel executes ~1.5-2x faster than the same density scattered over
+    # blocks — the fragmentation cost measured in the two-stage-vs-global
+    # top-k comparison. The trade is coarser selection.
+    content_granularity: str = "block"
+    # Per-head budget reallocation for the content heads: head h's top-k is
+    # scaled by the taxonomy's ``budget`` weight (measured hardness — heads
+    # whose refreshed top-20% recall is low need more blocks, near-saturated
+    # heads need fewer), normalized to mean 1 so the call's total keys stay
+    # at the configured density. The same total FLOPs buys more captured
+    # mass, which the density knob then converts into speed.
+    need_weighted: bool = False
 
 
 class HeadSpec(msgspec.Struct, frozen=True):
     family: str
     r: int = 0  # local: Chebyshev radius in grid rows/cols
     m: int = 0  # shortwin: newest visible frames kept
+    budget: float = 1.0  # content: relative top-k weight (mean 1 over heads)
 
 
 class MsaStaticPlan(msgspec.Struct, frozen=True):
@@ -169,6 +185,7 @@ def load_taxonomy(path: str) -> dict[str, HeadSpec]:
             family=family,
             r=int(record.get("r", 0)),
             m=int(record.get("m", 0)),
+            budget=float(record.get("budget", 1.0)),
         )
     return out
 
@@ -248,6 +265,10 @@ class MixedSparseAttention(SparseAttentionBackend):
             raise ValueError(
                 "content_schedule='lightforcing' needs lf_sparsity and "
                 "lf_num_output_frames"
+            )
+        if config.content_granularity not in ("block", "frame"):
+            raise ValueError(
+                f"unknown content_granularity {config.content_granularity!r}"
             )
         # chunk index -> per-call content density, solved on first use.
         self._schedule: list[float] | None = None
@@ -457,6 +478,23 @@ class MixedSparseAttention(SparseAttentionBackend):
         pq = pooled_query.index_select(1, index).permute(1, 0, 2)
         pk = pooled_key.index_select(1, index).permute(1, 0, 2)
         heads_c, q_blocks, _ = pq.shape
+        if config.content_granularity == "frame":
+            # Score whole frames (mean of their pooled key blocks), always
+            # keep the query's own frames (bidirectional within-chunk
+            # attention must survive, the window-safety rule), and rank the
+            # rest. ``topk`` arrives in blocks; convert to frames.
+            pooled_frames = pk.view(
+                heads_c, layout.num_frames, blocks_per_frame, -1
+            ).mean(dim=2)
+            frame_scores = pq @ pooled_frames.transpose(-1, -2)
+            own_lo = layout.num_frames - layout.query_frames
+            frame_scores[..., own_lo:] = float("inf")
+            top_frames = min(
+                layout.num_frames,
+                max(layout.query_frames, round(topk / blocks_per_frame)),
+            )
+            lut = torch.topk(frame_scores, top_frames, dim=-1, sorted=True).indices
+            return lut, top_frames, layout.num_frames
         scores = pq @ pk.transpose(-1, -2)
         if past_frames > config.keep_frames:
             pooled_frames = pk.view(
@@ -481,7 +519,11 @@ class MixedSparseAttention(SparseAttentionBackend):
                 scores.view(heads_c, q_blocks, layout.num_frames, blocks_per_frame)
                 + bias[..., None]
             ).view(heads_c, q_blocks, kv_blocks)
-        lut = torch.topk(scores, topk, dim=-1, sorted=True).indices
+        lut_k = topk
+        if self._config.need_weighted:
+            # the widest per-head prefix needs a longer ranked list
+            lut_k = min(kv_blocks, max(1, int(topk * 2.0)))
+        lut = torch.topk(scores, lut_k, dim=-1, sorted=True).indices
         return lut, topk, kv_blocks
 
     def attend(self, call: SparseAttentionCall) -> torch.Tensor | None:
@@ -559,12 +601,35 @@ class MixedSparseAttention(SparseAttentionBackend):
                 calls, replan = 0, True
             if replan:
                 lut, topk, kv_blocks = self._content_lut(call, layout, content)
-                block_lo, block_hi = frame_aligned_block_bounds(
-                    num_frames=layout.num_frames,
-                    frame_seqlen=layout.frame_seqlen,
-                    block=self._config.block_k,
-                    device=query.device,
-                )
+                if self._config.content_granularity == "frame":
+                    frame_ids = torch.arange(
+                        layout.num_frames, device=query.device, dtype=torch.int32
+                    )
+                    block_lo = frame_ids * layout.frame_seqlen
+                    block_hi = block_lo + layout.frame_seqlen
+                else:
+                    block_lo, block_hi = frame_aligned_block_bounds(
+                        num_frames=layout.num_frames,
+                        frame_seqlen=layout.frame_seqlen,
+                        block=self._config.block_k,
+                        device=query.device,
+                    )
+                if self._config.need_weighted:
+                    weights = torch.tensor(
+                        [
+                            self._taxonomy[
+                                f"L{call.layer_index:02d}_h{call.head_start + h}"
+                            ].budget
+                            for h in content
+                        ],
+                        device=lut.device,
+                    )
+                    weights = weights / weights.mean()
+                    head_topk = (
+                        (topk * weights).round().clamp(1, lut.shape[-1]).long()
+                    )
+                else:
+                    head_topk = None
                 scales = self._config.step_density_scale or (1.0,)
                 # Never scale below the chunk schedule's floor: late chunks
                 # already sit near it, and a stale step-0 ranking cut that
@@ -583,7 +648,18 @@ class MixedSparseAttention(SparseAttentionBackend):
                         lut.shape[0], lut.shape[1], kv_blocks,
                         dtype=torch.bool, device=lut.device,
                     )
-                    mask.scatter_(-1, lut[..., :step_topk], True)
+                    if head_topk is not None:
+                        keep = (
+                            torch.arange(lut.shape[-1], device=lut.device)[None, :]
+                            < (head_topk * step_topk / max(topk, 1)).round().clamp(
+                                min=1
+                            )[:, None]
+                        )
+                        mask.scatter_(
+                            -1, lut, keep[:, None, :].expand_as(lut).contiguous()
+                        )
+                    else:
+                        mask.scatter_(-1, lut[..., :step_topk], True)
                     step_plans.append(
                         plan_from_segment_mask(
                             mask,

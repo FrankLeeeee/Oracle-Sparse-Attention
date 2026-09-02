@@ -1506,3 +1506,47 @@ def test_msa_step_density_scale_shrinks_late_steps(tmp_path):
     backend.attend(call)
     with backend.cache_update_scope():
         assert backend.attend(call) is not None
+
+
+@requires_cuda
+def test_msa_frame_granular_content_matches_reference(tmp_path):
+    """Frame-granular content: whole-frame ranges, own frames always kept."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    backend = _msa_backend(tmp_path, content_granularity="frame")
+    call = _self_forcing_call(device, chunk_index=5)
+    backend.begin_forward(_geometry(5))
+    layout = visible_layout(
+        call.key_segments, geometry=_geometry(5), query_tokens=call.query.shape[1]
+    )
+    out = backend.attend(call)
+    assert out is not None
+    plans, topks, kv_blocks, _ = backend._content_cache._entries[0][1]
+    assert kv_blocks == layout.num_frames  # frame-granular accounting
+    lut = backend._content_lut(call, layout, [3])[0]
+    # own frames (the newest 3) rank first via the +inf force
+    own = set(range(layout.num_frames - 3, layout.num_frames))
+    assert set(lut[0, 0, :3].tolist()) == own
+    # the plan's kept keys are whole frames: every range spans multiples of T
+    plan = plans[0]
+    starts = plan.range_starts[0, 0, : plan.range_counts[0, 0]]
+    ends = plan.range_ends[0, 0, : plan.range_counts[0, 0]]
+    assert all(int(s) % FRAME_SEQLEN == 0 for s in starts)
+    assert all(int(e) % FRAME_SEQLEN == 0 for e in ends)
+    # exactness vs masked SDPA on the plan's own mask
+    from sglang.multimodal_gen.runtime.layers.attention.sparse.kernel import (
+        plan_key_mask,
+    )
+    key_mask = plan_key_mask(plan, kv_len=call.key.shape[1])
+    # content head 3 only: compare its rows
+    reference = masked_reference(
+        call.query[:, :, 3:4],
+        call.key[:, :, 3:4],
+        call.value[:, :, 3:4],
+        key_mask,
+        block_m=backend._config.block_q,
+        softmax_scale=call.softmax_scale,
+    )
+    torch.testing.assert_close(
+        out[:, :, 3:4].float(), reference.float(), atol=3e-2, rtol=3e-2
+    )

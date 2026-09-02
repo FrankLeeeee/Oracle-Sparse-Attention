@@ -110,7 +110,9 @@ def method_flags(method: str, *, seconds: int = 5, model: str = MODEL) -> list[s
                 schedule_num_frames=(MODELS[model]["frames"][seconds] + 3) // 4,
                 schedule_window_frames=MODELS[model]["window_frames"],
             )
-        if "15" in method:
+        if "16" in method:
+            config["content_density"] = 0.16
+        elif "15" in method:
             config["content_density"] = 0.15
         elif "14" in method:
             config["content_density"] = 0.14
@@ -120,6 +122,10 @@ def method_flags(method: str, *, seconds: int = 5, model: str = MODEL) -> list[s
             config["content_density"] = 0.22
         if method.endswith("r2"):
             config["replan_interval"] = 2
+        if "frame" in method:
+            config["content_granularity"] = "frame"
+        if "need" in method:
+            config["need_weighted"] = True
         if "turbo" in method:
             # Step-aware density: late denoise steps read a shrinking prefix
             # of the chunk's ranked blocks (attention concentrates through
@@ -133,8 +139,12 @@ def method_flags(method: str, *, seconds: int = 5, model: str = MODEL) -> list[s
     elif method in ("lightforcing", "lf10", "lfofficial"):
         tier = "0.1" if method == "lf10" else "0.2"
         config = dict(lf_tiers[tier]["config"])
-        if seconds != 5 and "num_output_frames" in config:
-            # LF's schedule solve needs the run's actual video length.
+        # The calibrated tiers (and every published LF number) run with the
+        # STORED num_output_frames — overriding it to the true video length
+        # re-solves the schedule and shifts both density and speed (measured:
+        # SF 20s 29.0s@0.20 with 81 vs 42.3s@0.336 with 321). CF-long is the
+        # exception: its published rows ran with the true length.
+        if model == "causal_forcing_long" and seconds != 5:
             config["num_output_frames"] = MODELS[model]["frames"][seconds]
         method = "lightforcing"
     else:
